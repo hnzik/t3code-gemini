@@ -192,6 +192,9 @@ function runtimeEventToActivities(
             ...(requestKind ? { requestKind } : {}),
             requestType: event.payload.requestType,
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
+            ...(requestKind === "file-change" && event.payload.args !== undefined
+              ? { args: event.payload.args }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -452,6 +455,11 @@ function runtimeEventToActivities(
     }
 
     case "item.completed": {
+      if (event.payload.itemType === "reasoning") {
+        // Reasoning completed — no work log entry needed (the "started"
+        // entry is sufficient); return empty to avoid noise.
+        return [];
+      }
       if (!isToolLifecycleItemType(event.payload.itemType)) {
         return [];
       }
@@ -473,6 +481,22 @@ function runtimeEventToActivities(
     }
 
     case "item.started": {
+      if (event.payload.itemType === "reasoning") {
+        return [
+          {
+            id: event.eventId,
+            createdAt: event.createdAt,
+            tone: "thinking" as const,
+            kind: "reasoning.started",
+            summary: event.payload.title ?? "Reasoning",
+            payload: {
+              itemType: event.payload.itemType,
+            },
+            turnId: toTurnId(event.turnId) ?? null,
+            ...maybeSequence,
+          },
+        ];
+      }
       if (!isToolLifecycleItemType(event.payload.itemType)) {
         return [];
       }

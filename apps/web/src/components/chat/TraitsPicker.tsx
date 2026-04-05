@@ -1,6 +1,7 @@
 import {
   type ClaudeModelOptions,
   type CodexModelOptions,
+  type GeminiModelOptions,
   type ProviderKind,
   type ProviderModelOptions,
   type ServerProviderModel,
@@ -52,6 +53,9 @@ function getRawEffort(
   if (provider === "codex") {
     return trimOrNull((modelOptions as CodexModelOptions | undefined)?.reasoningEffort);
   }
+  if (provider === "geminiAcp") {
+    return null;
+  }
   return trimOrNull((modelOptions as ClaudeModelOptions | undefined)?.effort);
 }
 
@@ -72,6 +76,9 @@ function buildNextOptions(
 ): ProviderOptions {
   if (provider === "codex") {
     return { ...(modelOptions as CodexModelOptions | undefined), ...patch } as CodexModelOptions;
+  }
+  if (provider === "geminiAcp") {
+    return { ...(modelOptions as GeminiModelOptions | undefined), ...patch } as GeminiModelOptions;
   }
   return { ...(modelOptions as ClaudeModelOptions | undefined), ...patch } as ClaudeModelOptions;
 }
@@ -124,6 +131,9 @@ function getSelectedTraits(
   const ultrathinkInBodyText =
     ultrathinkPromptControlled && isClaudeUltrathinkPrompt(prompt.replace(/^Ultrathink:\s*/i, ""));
 
+  // Mode — disabled for Gemini ACP; modes are handled via the Plan/Chat toggle
+  const mode = null;
+
   return {
     caps,
     effort,
@@ -135,6 +145,7 @@ function getSelectedTraits(
     defaultContextWindow,
     ultrathinkPromptControlled,
     ultrathinkInBodyText,
+    mode,
   };
 }
 
@@ -182,6 +193,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     defaultContextWindow,
     ultrathinkPromptControlled,
     ultrathinkInBodyText,
+    mode,
   } = getSelectedTraits(provider, models, model, prompt, modelOptions, allowPromptInjectedEffort);
   const defaultEffort = getDefaultEffort(caps);
 
@@ -221,12 +233,35 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
     ],
   );
 
-  if (effort === null && thinkingEnabled === null && contextWindowOptions.length <= 1) {
+  if (
+    effort === null &&
+    thinkingEnabled === null &&
+    mode === null &&
+    contextWindowOptions.length <= 1
+  ) {
     return null;
   }
 
   return (
     <>
+      {mode !== null ? (
+        <>
+          <MenuGroup>
+            <div className="px-2 pt-1.5 pb-1 font-medium text-muted-foreground text-xs">Mode</div>
+            <MenuRadioGroup
+              value={mode}
+              onValueChange={(value) => {
+                updateModelOptions(buildNextOptions(provider, modelOptions, { mode: value }));
+              }}
+            >
+              <MenuRadioItem value="default">Default</MenuRadioItem>
+              <MenuRadioItem value="autoEdit">Auto Edit</MenuRadioItem>
+              <MenuRadioItem value="plan">Plan</MenuRadioItem>
+            </MenuRadioGroup>
+          </MenuGroup>
+          <MenuDivider />
+        </>
+      ) : null}
       {effort ? (
         <>
           <MenuGroup>
@@ -342,6 +377,7 @@ export const TraitsPicker = memo(function TraitsPicker({
     contextWindow,
     defaultContextWindow,
     ultrathinkPromptControlled,
+    mode,
   } = getSelectedTraits(provider, models, model, prompt, modelOptions, allowPromptInjectedEffort);
 
   const effortLabel = effort
@@ -351,6 +387,7 @@ export const TraitsPicker = memo(function TraitsPicker({
     contextWindowOptions.length > 1 && contextWindow !== defaultContextWindow
       ? (contextWindowOptions.find((o) => o.value === contextWindow)?.label ?? null)
       : null;
+  const modeLabel = mode ? `Mode: ${mode}` : null;
   const triggerLabel = [
     ultrathinkPromptControlled
       ? "Ultrathink"
@@ -359,6 +396,7 @@ export const TraitsPicker = memo(function TraitsPicker({
         : thinkingEnabled === null
           ? null
           : `Thinking ${thinkingEnabled ? "On" : "Off"}`,
+    ...(modeLabel ? [modeLabel] : []),
     ...(caps.supportsFastMode && fastModeEnabled ? ["Fast"] : []),
     ...(contextWindowLabel ? [contextWindowLabel] : []),
   ]

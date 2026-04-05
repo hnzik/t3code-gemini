@@ -29,6 +29,7 @@ export const PROVIDER_OPTIONS: Array<{
 }> = [
   { value: "codex", label: "Codex", available: true },
   { value: "claudeAgent", label: "Claude", available: true },
+  { value: "geminiAcp", label: "Gemini", available: true },
   { value: "cursor", label: "Cursor", available: false },
 ];
 
@@ -55,6 +56,8 @@ export interface PendingApproval {
   requestKind: "command" | "file-read" | "file-change";
   createdAt: string;
   detail?: string;
+  /** Raw approval args from the provider (shape varies by provider). */
+  args?: Record<string, unknown>;
 }
 
 export interface PendingUserInput {
@@ -175,7 +178,8 @@ function isStalePendingRequestFailureDetail(detail: string | undefined): boolean
     normalized.includes("stale pending user-input request") ||
     normalized.includes("unknown pending approval request") ||
     normalized.includes("unknown pending permission request") ||
-    normalized.includes("unknown pending user-input request")
+    normalized.includes("unknown pending user-input request") ||
+    normalized.includes("no active provider session")
   );
 }
 
@@ -204,6 +208,10 @@ export function derivePendingApprovals(
           ? requestKindFromRequestType(payload.requestType)
           : null;
     const detail = payload && typeof payload.detail === "string" ? payload.detail : undefined;
+    const args =
+      payload && typeof payload.args === "object" && payload.args !== null
+        ? (payload.args as Record<string, unknown>)
+        : undefined;
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {
       openByRequestId.set(requestId, {
@@ -211,6 +219,7 @@ export function derivePendingApprovals(
         requestKind,
         createdAt: activity.createdAt,
         ...(detail ? { detail } : {}),
+        ...(args && requestKind === "file-change" ? { args } : {}),
       });
       continue;
     }

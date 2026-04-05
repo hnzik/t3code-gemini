@@ -1022,11 +1022,12 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const selectedPromptEffort = composerProviderState.promptEffort;
   const selectedModelOptionsForDispatch = composerProviderState.modelOptionsForDispatch;
   const selectedModelSelection = useMemo<ModelSelection>(
-    () => ({
-      provider: selectedProvider,
-      model: selectedModel,
-      ...(selectedModelOptionsForDispatch ? { options: selectedModelOptionsForDispatch } : {}),
-    }),
+    () =>
+      ({
+        provider: selectedProvider,
+        model: selectedModel,
+        ...(selectedModelOptionsForDispatch ? { options: selectedModelOptionsForDispatch } : {}),
+      }) as ModelSelection,
     [selectedModel, selectedModelOptionsForDispatch, selectedProvider],
   );
   const selectedModelForPicker = selectedModel;
@@ -1407,6 +1408,8 @@ export default function ChatView({ threadId }: ChatViewProps) {
       codex: providerStatuses.find((provider) => provider.provider === "codex")?.models ?? [],
       claudeAgent:
         providerStatuses.find((provider) => provider.provider === "claudeAgent")?.models ?? [],
+      geminiAcp:
+        providerStatuses.find((provider) => provider.provider === "geminiAcp")?.models ?? [],
     }),
     [providerStatuses],
   );
@@ -1421,7 +1424,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       AVAILABLE_PROVIDER_OPTIONS.filter(
         (option) => lockedProvider === null || option.value === lockedProvider,
       ).flatMap((option) =>
-        modelOptionsByProvider[option.value].map(({ slug, name }) => ({
+        modelOptionsByProvider[option.value as ProviderKind].map(({ slug, name }) => ({
           provider: option.value,
           providerLabel: option.label,
           slug,
@@ -1988,14 +1991,17 @@ export default function ChatView({ threadId }: ChatViewProps) {
       threadId,
     ],
   );
+  const hasPendingApproval = pendingApprovals.length > 0;
   const toggleInteractionMode = useCallback(() => {
+    if (hasPendingApproval) return;
     handleInteractionModeChange(interactionMode === "plan" ? "default" : "plan");
-  }, [handleInteractionModeChange, interactionMode]);
+  }, [handleInteractionModeChange, hasPendingApproval, interactionMode]);
   const toggleRuntimeMode = useCallback(() => {
+    if (hasPendingApproval) return;
     void handleRuntimeModeChange(
       runtimeMode === "full-access" ? "approval-required" : "full-access",
     );
-  }, [handleRuntimeModeChange, runtimeMode]);
+  }, [handleRuntimeModeChange, hasPendingApproval, runtimeMode]);
   const togglePlanSidebar = useCallback(() => {
     setPlanSidebarOpen((open) => {
       if (open) {
@@ -3023,7 +3029,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           activeProject.defaultModelSelection?.model ||
           DEFAULT_MODEL_BY_PROVIDER.codex,
         ...(selectedModelSelection.options ? { options: selectedModelSelection.options } : {}),
-      };
+      } as ModelSelection;
 
       // Auto-title from first message
       if (isFirstMessage && isServerThread) {
@@ -4252,6 +4258,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
                               activePlan || sidebarProposedPlan || planSidebarOpen,
                             )}
                             interactionMode={interactionMode}
+                            modeChangeDisabled={hasPendingApproval}
                             planSidebarOpen={planSidebarOpen}
                             runtimeMode={runtimeMode}
                             traitsMenuContent={providerTraitsMenuContent}
@@ -4281,6 +4288,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
                               className="shrink-0 whitespace-nowrap px-2 text-muted-foreground/70 hover:text-foreground/80 sm:px-3"
                               size="sm"
                               type="button"
+                              disabled={hasPendingApproval}
                               onClick={toggleInteractionMode}
                               title={
                                 interactionMode === "plan"
@@ -4304,13 +4312,8 @@ export default function ChatView({ threadId }: ChatViewProps) {
                               className="shrink-0 whitespace-nowrap px-2 text-muted-foreground/70 hover:text-foreground/80 sm:px-3"
                               size="sm"
                               type="button"
-                              onClick={() =>
-                                void handleRuntimeModeChange(
-                                  runtimeMode === "full-access"
-                                    ? "approval-required"
-                                    : "full-access",
-                                )
-                              }
+                              disabled={hasPendingApproval}
+                              onClick={toggleRuntimeMode}
                               title={
                                 runtimeMode === "full-access"
                                   ? "Full access — click to require approvals"

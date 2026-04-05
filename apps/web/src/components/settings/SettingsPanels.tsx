@@ -16,6 +16,7 @@ import {
   type ProviderKind,
   type ServerProvider,
   type ServerProviderModel,
+  type ModelSelection,
   ThreadId,
 } from "@t3tools/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
@@ -111,6 +112,12 @@ const PROVIDER_SETTINGS: readonly InstallProviderSettings[] = [
     title: "Claude",
     binaryPlaceholder: "Claude binary path",
     binaryDescription: "Path to the Claude binary",
+  },
+  {
+    provider: "geminiAcp",
+    title: "Gemini",
+    binaryPlaceholder: "Gemini binary path",
+    binaryDescription: "Path to the Gemini CLI binary",
   },
 ] as const;
 
@@ -537,12 +544,18 @@ export function GeneralSettingsPanel() {
         DEFAULT_UNIFIED_SETTINGS.providers.claudeAgent.binaryPath ||
       settings.providers.claudeAgent.customModels.length > 0,
     ),
+    geminiAcp: Boolean(
+      settings.providers.geminiAcp.binaryPath !==
+        DEFAULT_UNIFIED_SETTINGS.providers.geminiAcp.binaryPath ||
+      settings.providers.geminiAcp.customModels.length > 0,
+    ),
   });
   const [customModelInputByProvider, setCustomModelInputByProvider] = useState<
     Record<ProviderKind, string>
   >({
     codex: "",
     claudeAgent: "",
+    geminiAcp: "",
   });
   const [customModelErrorByProvider, setCustomModelErrorByProvider] = useState<
     Partial<Record<ProviderKind, string | null>>
@@ -1058,7 +1071,7 @@ export function GeneralSettingsPanel() {
                           provider: textGenProvider,
                           model: textGenModel,
                           ...(nextOptions ? { options: nextOptions } : {}),
-                        },
+                        } as ModelSelection,
                       },
                       serverProviders,
                     ),

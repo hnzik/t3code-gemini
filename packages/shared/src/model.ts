@@ -4,6 +4,7 @@ import {
   type ClaudeCodeEffort,
   type ClaudeModelOptions,
   type CodexModelOptions,
+  type GeminiModelOptions,
   type ModelCapabilities,
   type ModelSelection,
   type ProviderKind,
@@ -113,6 +114,17 @@ export function normalizeClaudeModelOptionsWithCapabilities(
     ...(effort ? { effort: effort as ClaudeModelOptions["effort"] } : {}),
     ...(fastMode !== undefined ? { fastMode } : {}),
     ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+  return Object.keys(nextOptions).length > 0 ? nextOptions : undefined;
+}
+
+export function normalizeGeminiModelOptionsWithCapabilities(
+  caps: ModelCapabilities,
+  modelOptions: GeminiModelOptions | null | undefined,
+): GeminiModelOptions | undefined {
+  const mode = modelOptions?.mode;
+  const nextOptions: GeminiModelOptions = {
+    ...(mode !== undefined ? { mode } : {}),
   };
   return Object.keys(nextOptions).length > 0 ? nextOptions : undefined;
 }
