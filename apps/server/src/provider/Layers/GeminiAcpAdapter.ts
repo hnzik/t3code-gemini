@@ -1,15 +1,25 @@
+/**
+ * GeminiAcpAdapterLive — @google/gemini-cli-core based implementation.
+ *
+ * Uses GeminiClient.sendMessageStream() as the primary streaming interface.
+ * Tool execution is handled by the library's built-in Scheduler; confirmations
+ * are bridged to T3Code's approval flow via the library's MessageBus.
+ *
+ * @module GeminiAcpAdapterLive
+ */
 import type {
-  ProviderSession,
-  ProviderSessionStartInput,
-  ProviderSendTurnInput,
-  ThreadId,
   ApprovalRequestId,
-  ProviderApprovalDecision,
-  ProviderUserInputAnswers,
-  ProviderRuntimeEvent,
   CanonicalItemType,
   CanonicalRequestType,
+  ProviderApprovalDecision,
+  ProviderRuntimeEvent,
+  ProviderSendTurnInput,
+  ProviderSession,
+  ProviderSessionStartInput,
+  ProviderUserInputAnswers,
+  ThreadId,
   ThreadTokenUsageSnapshot,
+  TurnId,
 } from "@t3tools/contracts";
 import {
   EventId,
@@ -17,9 +27,9 @@ import {
   RuntimeRequestId,
   TurnId as TurnIdBrand,
 } from "@t3tools/contracts";
-import { Effect, Layer, Option, Queue, Stream } from "effect";
-import { GeminiAcpAdapter, type GeminiAcpAdapterShape } from "../Services/GeminiAcpAdapter";
-import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter";
+import { Effect, Layer, Queue, Stream } from "effect";
+
+import { ServerSettingsService } from "../../serverSettings";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -28,148 +38,210 @@ import {
   ProviderAdapterValidationError,
   type ProviderAdapterError,
 } from "../Errors";
-import { ServerSettingsService } from "../../serverSettings";
+import { GeminiAcpAdapter } from "../Services/GeminiAcpAdapter";
+import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter";
+
 import {
-  ClientSideConnection,
-  ndJsonStream,
-  type Client,
-  type SessionNotification,
-  type RequestPermissionRequest,
-  type RequestPermissionResponse,
-  type ToolKind,
-  PROTOCOL_VERSION,
-} from "@agentclientprotocol/sdk";
-import { spawn, type ChildProcess as NodeChildProcess } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { Readable, Writable } from "node:stream";
+  AuthType,
+  Config,
+  LegacyAgentSession,
+  MessageBusType,
+  ApprovalMode,
+  ROOT_SCHEDULER_ID,
+  Scheduler,
+  ToolConfirmationOutcome,
+  getAuthTypeFromEnv,
+  type AgentEvent,
+  type ContentPart,
+  type GeminiClient,
+  type MessageBus,
+  type ToolConfirmationRequest,
+} from "@google/gemini-cli-core";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const PROVIDER = "geminiAcp" as const;
 const DEFAULT_GEMINI_CONTEXT_WINDOW = 1_000_000;
+const PLAN_MODE_DENY_LIMIT = 2;
+
+// ---------------------------------------------------------------------------
+// Default mode prompt — teaches Gemini when to ask vs act
+// ---------------------------------------------------------------------------
+
+const GEMINI_DEFAULT_MODE_PROMPT = `<default_mode>
+# Default Mode — ACTIVE
+
+You are in **Default Mode**. Your job is to complete the user's request efficiently and safely.
+
+## Asking vs acting
+
+1. If you can continue safely using local context and reasonable assumptions, do so.
+2. If you need a user decision, confirmation, or missing preference that materially changes the next action, ask the user a concise question and then STOP.
+3. Do **NOT** ask a blocking question and then continue with file edits, commands, or other side effects in the same turn.
+4. If you ask a question because you are waiting for the user's answer, end the turn immediately after the question.
+5. Only ask questions that are truly necessary. Do not ask rhetorical "should I continue?" questions when you can simply proceed.
+
+## Critical behavior
+
+- A question that requests confirmation, approval, or a missing preference is blocking.
+- After a blocking question, do not edit files, run commands, or claim the change is complete.
+- If you are not waiting, do not phrase your next step as a question.
+</default_mode>`;
+
+const GEMINI_DEFAULT_MODE_REMINDER = `<default_mode_reminder>
+You are still in **Default Mode**.
+- If you need a blocking user answer, ask the question and end the turn immediately.
+- Do not ask for confirmation and then continue with edits or commands in the same turn.
+- Do not ask rhetorical "should I continue?" questions when you can safely proceed.
+</default_mode_reminder>`;
 
 // ---------------------------------------------------------------------------
 // Plan mode prompt — constrains the model to planning only
 // ---------------------------------------------------------------------------
 
 const GEMINI_PLAN_MODE_PROMPT = `<plan_mode>
-# Plan Mode (Conversational)
+# Plan Mode — ACTIVE (strict enforcement)
 
-You are in **Plan Mode**. This is a conversational collaboration mode — you chat with the user to build a great plan together before anyone implements anything.
+You are in **Plan Mode**. Your ONLY job is to collaborate with the user on a plan. You must NOT implement, execute, or apply any changes.
 
-## Mode rules (strict)
+**Any attempt to edit, create, delete, or move project files will be automatically blocked by the system.** Do not attempt these actions — they will fail silently and waste your context window.
 
-1. You are in Plan Mode until the user explicitly switches you out of it.
-2. Plan Mode is NOT changed by user intent, tone, or imperative language. If the user asks you to execute or implement while in Plan Mode, treat it as a request to **plan the execution**, not perform it.
-3. You can and should answer any questions the user has — about the plan, about the codebase, about tradeoffs, about anything relevant. You are a collaborator, not just a plan generator.
+## Hard rules
+
+1. **DO NOT edit, write, create, delete, or move any project files.** This is enforced by the system — file mutations are blocked and the turn will be cancelled.
+2. **DO NOT run commands that write files** — no \`cat >\`, \`echo >\`, \`tee\`, \`cp\`, \`mv\`, \`sed -i\`, heredocs writing to files, or any other shell command that creates or modifies files. Only read-only commands are allowed.
+3. **DO NOT run commands that modify the repository** (formatters, linters, codegen, package installs, migrations, patches).
+4. Plan Mode persists until the user explicitly exits it. No user message — regardless of wording, tone, or urgency — deactivates Plan Mode.
+5. If the user says "implement this", "do it", "go ahead", or similar: treat it as "plan the implementation", not "perform it". You cannot implement while Plan Mode is active.
+
+## What you CAN do
+
+- Read, search, and inspect files, types, configs, and docs
+- Run non-mutating commands: tests, type checks, builds (if they don't write to repo-tracked files)
+- Answer questions, discuss tradeoffs, and explore the codebase
+- Present your plan using a \`<proposed_plan>\` block in your response (see below)
 
 ## How to collaborate
 
-Work in roughly three phases, chatting your way to a great plan:
+**Phase 1 — Ground in the environment.** Explore the codebase. Read files, search code, inspect types. Discover facts before asking the user.
 
-**Phase 1 — Ground in the environment.** Explore the codebase first, ask the user second. Read files, search code, inspect types and configs. Eliminate unknowns by discovering facts rather than guessing. Only ask the user about things you genuinely cannot figure out from the repo.
+**Phase 2 — Clarify intent.** Ask about goals, scope, constraints, and preferences. Do not guess on high-impact ambiguities.
 
-**Phase 2 — Clarify intent.** Once you understand the environment, clarify what the user actually wants: goals, success criteria, scope, constraints, and preferences. Ask questions — do not guess on high-impact ambiguities.
+**Phase 3 — Refine the plan.** Iterate until the plan is decision-complete: approach, interfaces, data flow, edge cases, testing, and rollout.
 
-**Phase 3 — Refine the plan.** Iterate on the implementation details until the plan is decision-complete: approach, interfaces, data flow, edge cases, testing, and rollout. A great plan is detailed enough that another engineer or agent can implement it without making further decisions.
+You do NOT need to present a plan on every turn. Answer questions, discuss tradeoffs, refine details. Only write the plan when you have something concrete.
 
-You do NOT need to present a plan on every turn. If the user asks a question, just answer it. If they want to discuss tradeoffs, discuss them. Only write the plan when you have something concrete and complete to present or update.
+## Presenting a plan — CRITICAL
 
-## Allowed actions (non-mutating, plan-improving)
+**The ONLY way to present a plan is by including a \`<proposed_plan>\` block in your text response.** The client parses this block to render the plan in the UI. If you do not use this exact format, the plan will not be captured and the user will not see it as a plan.
 
-- Reading, searching, and inspecting files, configs, schemas, types, and docs
-- Static analysis, repo exploration, and inspection
-- Running tests, builds, or checks that do not edit repo-tracked files
+**DO NOT write the plan to a file.** DO NOT use \`write_file\`, \`cat >\`, heredocs, or any other mechanism to save the plan. The plan MUST be inline in your response text using the tags below.
 
-## Forbidden actions (mutating, plan-executing)
+Format rules:
+1. The opening \`<proposed_plan>\` tag must be on its own line.
+2. Start the plan content on the next line.
+3. The closing \`</proposed_plan>\` tag must be on its own line.
+4. Use Markdown inside the block.
+5. Keep the tags exactly as \`<proposed_plan>\` and \`</proposed_plan>\` — do not rename, translate, or omit them.
 
-- Editing, writing, or creating project files
-- Running formatters, linters, or codegen that rewrite files
-- Applying patches, migrations, or any changes to repo-tracked files
-- Any command whose purpose is to carry out the plan rather than refine it
+Example:
 
-When in doubt: if the action would be described as "doing the work" rather than "planning the work," do not do it.
+<proposed_plan>
+# Plan Title
 
-## Presenting a plan
+Brief summary of the approach.
 
-When your plan is ready (or meaningfully updated after refinement), write it to a markdown file. The plan should include:
+## Steps
+1. Step one — details
+2. Step two — details
 
-- A clear title
-- A brief summary
-- Implementation steps with enough detail to be actionable
-- Key files and changes involved
+## Key files
+- \`path/to/file.ts\` — what changes
+</proposed_plan>
 
-Do not ask "should I proceed?" — the user can switch out of Plan Mode to request implementation, or stay in Plan Mode to keep refining.
+Only produce at most one \`<proposed_plan>\` block per turn, and only when presenting a complete plan. Do not ask "should I proceed?" — the user controls when to exit Plan Mode.
+
+## Refinement turns
+
+When the user sends follow-up messages while Plan Mode is still active, they are asking you to **refine the plan** — not implement it. Read their feedback, update your understanding, and revise the plan if needed. Stay in planning mode.
 </plan_mode>`;
 
+const GEMINI_PLAN_MODE_REMINDER = `<plan_mode_reminder>
+You are still in **Plan Mode**. Reminders:
+- **DO NOT edit, write, or create any files.** No \`write_file\`, no \`cat >\`, no heredocs, no shell writes. File mutations are blocked and the turn will be cancelled.
+- **Present your plan ONLY using \`<proposed_plan>\` tags in your text response.** This is the only way the client captures the plan. Do not write the plan to a file.
+- If the user is asking a question or giving feedback, respond in text. Only output a \`<proposed_plan>\` block when you have a complete or updated plan to present.
+</plan_mode_reminder>`;
+
 // ---------------------------------------------------------------------------
-// Session context
+// Types
 // ---------------------------------------------------------------------------
+
+interface GeminiTurnState {
+  readonly turnId: string;
+  readonly startedAt: string;
+  reasoningItemEmitted: boolean;
+}
 
 interface PendingApproval {
   readonly requestType: CanonicalRequestType;
   readonly detail: string;
-  resolve: (response: RequestPermissionResponse) => void;
+  readonly correlationId: string;
+  resolve: (response: {
+    confirmed: boolean;
+    outcome: ToolConfirmationOutcome;
+  }) => void;
 }
 
-interface GeminiAcpSessionContext {
+interface ToolInFlight {
+  readonly itemId: string;
+  readonly itemType: CanonicalItemType;
+  readonly toolName: string;
+  readonly title: string;
+  readonly input: Record<string, unknown>;
+}
+
+type GeminiResumeHistory = Parameters<GeminiClient["resumeChat"]>[0];
+
+interface GeminiResumeState {
+  readonly history: GeminiResumeHistory;
+  readonly turnCount: number;
+}
+
+interface GeminiSessionContext {
   readonly session: ProviderSession;
-  readonly child: NodeChildProcess;
-  readonly connection: ClientSideConnection;
-  readonly acpSessionId: string;
+  readonly config: Config;
+  readonly geminiClient: GeminiClient;
+  abortController: AbortController;
+  readonly messageBusUnsubscribers: Array<() => void>;
+  turnState: GeminiTurnState | undefined;
+  stopped: boolean;
   readonly pendingApprovals: Map<string, PendingApproval>;
-  turnState:
+  // Plan mode
+  userRequestedMode: string;
+  planModePromptSent: boolean;
+  defaultModePromptSent: boolean;
+  planModeDeniedInTurn: number;
+  planModeTextSuppressed: boolean;
+  turnAssistantText: string;
+  emittedAssistantTextLength: number;
+  assistantMessageSegment: number;
+  // Token tracking
+  cumulativeInputTokens: number;
+  cumulativeOutputTokens: number;
+  cumulativeReasoningTokens: number;
+  lastKnownMaxTokens: number | undefined;
+  // Tool tracking
+  readonly inFlightTools: Map<string, ToolInFlight>;
+  readonly turns: Array<{ id: string; items: unknown[] }>;
+  activeStreamPromise: Promise<void> | undefined;
+  activeAgentSession:
     | {
-        turnId: string;
-        startedAt: string;
-        reasoningItemEmitted?: boolean;
+        abort: () => Promise<void>;
       }
     | undefined;
-  promptReject: ((err: Error) => void) | undefined;
-  stopped: boolean;
-  /** Current ACP mode — tracks whether we're in plan mode for event routing. */
-  currentAcpMode: string;
-  /**
-   * Incremented on each tool call boundary within a turn.
-   * Used to assign distinct itemIds to assistant text segments so that
-   * pre-tool and post-tool text become separate messages.
-   */
-  assistantMessageSegment: number;
-  /** Cumulative input tokens across all turns — used to approximate context window usage. */
-  cumulativeInputTokens: number;
-  /** Cumulative output tokens across all turns. */
-  cumulativeOutputTokens: number;
-  /** Cumulative reasoning/thought tokens across all turns. */
-  cumulativeReasoningTokens: number;
-  /** Last known context window size from a usage_update notification. */
-  lastKnownMaxTokens: number | undefined;
-  /** Tracks toolCallIds already seen, so tool_call_update can create segment boundaries for new tools. */
-  seenToolCallIds: Set<string>;
-  /** Set when a usage_update notification arrives during the current turn.
-   *  Prevents the prompt-response handler from double-counting tokens that
-   *  are already reflected in the absolute values reported by usage_update. */
-  turnReceivedUsageUpdate: boolean;
-  /** ACP messageIds from completed turns — used to skip replayed content.
-   *  The Gemini ACP re-sends all historical messages on each prompt() call;
-   *  we deduplicate by tracking messageIds that have already been streamed. */
-  completedMessageIds: Set<string>;
-  /** ACP messageIds seen in the current (active) turn. Moved to
-   *  completedMessageIds when the next turn starts. */
-  currentTurnMessageIds: Set<string>;
-  /** Set to true once the first non-replayed agent_message_chunk is processed
-   *  in the current turn. Until this is true, usage_update emissions are
-   *  deferred — replayed usage_update notifications carry stale values that
-   *  cause the context counter to flicker/reset. */
-  turnHasFreshContent: boolean;
-  /** Set to true when `user_message_chunk` is received during a turn.
-   *  This is a definitive replay signal — during normal turns the user's
-   *  message is sent via `prompt()`, never as a notification.  While active,
-   *  `agent_message_chunk` is suppressed until enough time passes after the
-   *  last `user_message_chunk` (indicating the replay finished and real
-   *  generation started). */
-  replayActive: boolean;
-  /** `Date.now()` of the most recent `user_message_chunk` notification.
-   *  Used together with `replayActive` to detect the replay→generation
-   *  boundary. */
-  lastReplaySignalTime: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,64 +254,283 @@ function nextEventId(): string {
 }
 
 function makeEventBase(
-  ctx: GeminiAcpSessionContext,
+  ctx: GeminiSessionContext,
 ): Omit<ProviderRuntimeEvent, "type" | "payload"> {
   return {
     eventId: EventId.makeUnsafe(nextEventId()),
     provider: PROVIDER,
     threadId: ctx.session.threadId,
     createdAt: new Date().toISOString(),
-    ...(ctx.turnState ? { turnId: TurnIdBrand.makeUnsafe(ctx.turnState.turnId) } : {}),
+    ...(ctx.turnState
+      ? { turnId: TurnIdBrand.makeUnsafe(ctx.turnState.turnId) }
+      : {}),
     providerRefs: {},
   };
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — ACP tool kind → canonical types
+// Helpers — tool classification by name
 // ---------------------------------------------------------------------------
 
-function mapToolKindToItemType(kind: ToolKind | undefined | null): CanonicalItemType {
-  switch (kind) {
-    case "read":
-    case "search":
-      return "file_change";
-    case "edit":
-    case "delete":
-    case "move":
-      return "file_change";
-    case "execute":
-      return "command_execution";
-    case "fetch":
-      return "web_search";
-    case "think":
-      return "reasoning";
+function classifyToolName(name: string): CanonicalItemType {
+  const lower = name.toLowerCase();
+  if (
+    lower.includes("read") ||
+    lower.includes("list") ||
+    lower.includes("glob") ||
+    lower.includes("grep") ||
+    lower.includes("search_file") ||
+    lower.includes("ls")
+  ) {
+    return "file_change";
+  }
+  if (
+    lower.includes("edit") ||
+    lower.includes("write") ||
+    lower.includes("patch") ||
+    lower.includes("replace") ||
+    lower.includes("delete_file") ||
+    lower.includes("move_file") ||
+    lower.includes("rename")
+  ) {
+    return "file_change";
+  }
+  if (
+    lower.includes("shell") ||
+    lower.includes("command") ||
+    lower.includes("exec") ||
+    lower.includes("bash") ||
+    lower.includes("terminal")
+  ) {
+    return "command_execution";
+  }
+  if (
+    lower.includes("web_search") ||
+    lower.includes("web_fetch") ||
+    lower.includes("fetch") ||
+    lower.includes("browse")
+  ) {
+    return "web_search";
+  }
+  if (lower.includes("think") || lower.includes("reason")) {
+    return "reasoning";
+  }
+  if (lower.includes("mcp") || lower.startsWith("mcp_")) {
+    return "mcp_tool_call";
+  }
+  if (lower.includes("agent") || lower.includes("subagent")) {
+    return "collab_agent_tool_call";
+  }
+  return "dynamic_tool_call";
+}
+
+function classifyRequestTypeForTool(name: string): CanonicalRequestType {
+  const type = classifyToolName(name);
+  switch (type) {
+    case "file_change":
+      return "file_change_approval";
+    case "command_execution":
+      return "exec_command_approval";
     default:
-      return "unknown";
+      return "command_execution_approval";
   }
 }
 
-function isFileModifyingKind(kind: ToolKind | undefined | null): boolean {
-  return kind === "edit" || kind === "delete" || kind === "move";
+function isFileModifyingTool(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower.includes("edit") ||
+    lower.includes("write") ||
+    lower.includes("delete") ||
+    lower.includes("move") ||
+    lower.includes("rename") ||
+    lower.includes("patch") ||
+    lower.includes("replace") ||
+    lower.includes("create_file")
+  );
+}
+
+function isShellWriteTool(
+  name: string,
+  args: Record<string, unknown>,
+): boolean {
+  if (!name.toLowerCase().includes("shell")) return false;
+  const cmd = String(args.command ?? args.cmd ?? "").toLowerCase();
+  return /\b(cat\s*>|echo\s*>|tee\s|cp\s|mv\s|sed\s+-i|rm\s|mkdir|touch)\b/.test(
+    cmd,
+  );
+}
+
+function titleForToolType(type: CanonicalItemType): string {
+  switch (type) {
+    case "file_change":
+      return "File operation";
+    case "command_execution":
+      return "Command execution";
+    case "web_search":
+      return "Web search";
+    case "mcp_tool_call":
+      return "MCP tool call";
+    case "collab_agent_tool_call":
+      return "Agent tool call";
+    case "reasoning":
+      return "Thinking";
+    default:
+      return "Tool call";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — proposed plan extraction (exported for tests)
+// ---------------------------------------------------------------------------
+
+const PROPOSED_PLAN_BLOCK_REGEX =
+  /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i;
+const PROPOSED_PLAN_OPEN_TAG = "<proposed_plan>";
+const PROPOSED_PLAN_CLOSE_TAG = "</proposed_plan>";
+
+function extractProposedPlanMarkdown(
+  text: string | undefined,
+): string | undefined {
+  const match = text ? PROPOSED_PLAN_BLOCK_REGEX.exec(text) : null;
+  const planMarkdown = match?.[1]?.trim();
+  return planMarkdown && planMarkdown.length > 0 ? planMarkdown : undefined;
+}
+
+function trailingTagPrefixLength(text: string, tag: string): number {
+  const maxLength = Math.min(text.length, tag.length - 1);
+  for (let length = maxLength; length > 0; length--) {
+    if (text.endsWith(tag.slice(0, length))) {
+      return length;
+    }
+  }
+  return 0;
+}
+
+export function extractVisibleAssistantText(rawText: string): string {
+  let visibleText = "";
+  let cursor = 0;
+
+  while (cursor < rawText.length) {
+    const openTagIndex = rawText.indexOf(PROPOSED_PLAN_OPEN_TAG, cursor);
+    if (openTagIndex === -1) {
+      const trailingText = rawText.slice(cursor);
+      const holdBackLength = trailingTagPrefixLength(
+        trailingText,
+        PROPOSED_PLAN_OPEN_TAG,
+      );
+      visibleText += trailingText.slice(
+        0,
+        trailingText.length - holdBackLength,
+      );
+      break;
+    }
+
+    visibleText += rawText.slice(cursor, openTagIndex);
+    const closeTagIndex = rawText.indexOf(
+      PROPOSED_PLAN_CLOSE_TAG,
+      openTagIndex + PROPOSED_PLAN_OPEN_TAG.length,
+    );
+    if (closeTagIndex === -1) {
+      break;
+    }
+    cursor = closeTagIndex + PROPOSED_PLAN_CLOSE_TAG.length;
+  }
+
+  return visibleText;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — prompt building (exported for tests)
+// ---------------------------------------------------------------------------
+
+interface GeminiPromptBlock {
+  readonly type: "text";
+  readonly text: string;
+}
+
+export function buildGeminiPromptBlocks(input: {
+  readonly interactionMode: string | undefined;
+  readonly userInput: string | undefined;
+  readonly planModePromptSent: boolean;
+  readonly defaultModePromptSent: boolean;
+}): {
+  readonly promptBlocks: ReadonlyArray<GeminiPromptBlock>;
+  readonly planModePromptSent: boolean;
+  readonly defaultModePromptSent: boolean;
+} {
+  const promptBlocks: GeminiPromptBlock[] = [];
+  let planModePromptSent = input.planModePromptSent;
+  let defaultModePromptSent = input.defaultModePromptSent;
+
+  if (input.interactionMode === "plan") {
+    if (planModePromptSent) {
+      promptBlocks.push({ type: "text", text: GEMINI_PLAN_MODE_REMINDER });
+    } else {
+      promptBlocks.push({ type: "text", text: GEMINI_PLAN_MODE_PROMPT });
+      planModePromptSent = true;
+    }
+  } else if (defaultModePromptSent) {
+    promptBlocks.push({ type: "text", text: GEMINI_DEFAULT_MODE_REMINDER });
+  } else {
+    promptBlocks.push({ type: "text", text: GEMINI_DEFAULT_MODE_PROMPT });
+    defaultModePromptSent = true;
+  }
+
+  if (input.userInput) {
+    promptBlocks.push({ type: "text", text: input.userInput });
+  }
+
+  return {
+    promptBlocks,
+    planModePromptSent,
+    defaultModePromptSent,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — token usage
+// ---------------------------------------------------------------------------
+
+export function shouldApplyUsageUpdate(
+  turnState: GeminiSessionContext["turnState"],
+  turnHasFreshContent: boolean,
+): boolean {
+  return !turnState || turnHasFreshContent;
+}
+
+export function formatAgentThoughtText(input: {
+  readonly thought: string;
+  readonly subject: string | undefined;
+}): string {
+  const thought = input.thought.trim();
+  if (!input.subject) return thought;
+  return thought.length > 0
+    ? `**${input.subject}** ${thought}`
+    : `**${input.subject}**`;
+}
+
+function isTextContentPart(
+  part: ContentPart,
+): part is Extract<ContentPart, { type: "text" }> {
+  return part.type === "text";
 }
 
 function buildTokenUsageSnapshot(
-  ctx: GeminiAcpSessionContext,
+  ctx: GeminiSessionContext,
   turnInputTokens?: number,
   turnOutputTokens?: number,
-  turnReasoningTokens?: number,
 ): ThreadTokenUsageSnapshot {
   const usedTokens = ctx.cumulativeInputTokens + ctx.cumulativeOutputTokens;
   const maxTokens = ctx.lastKnownMaxTokens ?? DEFAULT_GEMINI_CONTEXT_WINDOW;
-  const totalProcessedTokens =
-    ctx.cumulativeInputTokens + ctx.cumulativeOutputTokens + ctx.cumulativeReasoningTokens;
   return {
     usedTokens,
-    ...(totalProcessedTokens > usedTokens ? { totalProcessedTokens } : {}),
     maxTokens,
-    ...(turnInputTokens !== undefined ? { lastInputTokens: turnInputTokens } : {}),
-    ...(turnOutputTokens !== undefined ? { lastOutputTokens: turnOutputTokens } : {}),
-    ...(turnReasoningTokens !== undefined
-      ? { lastReasoningOutputTokens: turnReasoningTokens }
+    ...(turnInputTokens !== undefined
+      ? { lastInputTokens: turnInputTokens }
+      : {}),
+    ...(turnOutputTokens !== undefined
+      ? { lastOutputTokens: turnOutputTokens }
       : {}),
     ...(turnInputTokens !== undefined || turnOutputTokens !== undefined
       ? { lastUsedTokens: (turnInputTokens ?? 0) + (turnOutputTokens ?? 0) }
@@ -247,80 +538,13 @@ function buildTokenUsageSnapshot(
   } as ThreadTokenUsageSnapshot;
 }
 
-function mapToolKindToRequestType(kind: ToolKind | undefined | null): CanonicalRequestType {
-  switch (kind) {
-    case "read":
-    case "search":
-      return "file_read_approval";
-    case "edit":
-    case "delete":
-    case "move":
-      return "file_change_approval";
-    case "execute":
-      return "exec_command_approval";
-    default:
-      // Default to command approval so the UI renders interactive approve/deny buttons.
-      // ACP permission requests are always actionable — "unknown" would silently skip the UI.
-      return "command_execution_approval";
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Helpers — plan file detection
-// ---------------------------------------------------------------------------
-
-interface PlanFileSource {
-  /** Structured `locations` from `ToolCall` / `ToolCallUpdate`. */
-  locations?: ReadonlyArray<{ path: string }> | null | undefined;
-  /** Human-readable title (fallback when locations are unavailable). */
-  title?: string | null | undefined;
-}
-
-/** Regex that extracts a `.md` file path from an ACP tool title. */
-const PLAN_TITLE_RE = /(\S+\.md)\s*$/;
-
-/**
- * Try to read a plan markdown file referenced by a tool call.
- * Prefers the structured `locations` array; falls back to parsing the title.
- * Returns the trimmed file content, or `undefined` if nothing matched or
- * the file is unreadable / empty.
- */
-async function tryReadPlanFile(source: PlanFileSource): Promise<string | undefined> {
-  const candidates: string[] = [];
-  if (source.locations) {
-    for (const loc of source.locations) {
-      if (loc.path.endsWith(".md")) {
-        candidates.push(loc.path);
-      }
-    }
-  }
-  if (candidates.length === 0 && source.title) {
-    const match = source.title.match(PLAN_TITLE_RE);
-    if (match?.[1]) {
-      candidates.push(match[1]);
-    }
-  }
-
-  for (const candidate of candidates) {
-    try {
-      const content = await readFile(candidate, "utf-8");
-      const trimmed = content.trim();
-      if (trimmed.length > 0) return trimmed;
-    } catch {
-      // File unreadable — try next candidate.
-    }
-  }
-  return undefined;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers — error mapping
+// Helpers — errors
 // ---------------------------------------------------------------------------
 
 function toMessage(cause: unknown, fallback: string): string {
   if (cause instanceof Error) return cause.message;
   if (typeof cause === "string") return cause;
-  // ACP SDK rejects with JSON-RPC error objects ({ code, message, data })
   if (typeof cause === "object" && cause !== null) {
     const obj = cause as Record<string, unknown>;
     if (typeof obj.message === "string") return obj.message;
@@ -329,1031 +553,1063 @@ function toMessage(cause: unknown, fallback: string): string {
     try {
       return JSON.stringify(cause);
     } catch {
-      // fall through
+      /* fall through */
     }
   }
   return fallback;
 }
 
-function toRequestError(threadId: ThreadId, method: string, cause: unknown): ProviderAdapterError {
-  const message = toMessage(cause, "").toLowerCase();
-  if (message.includes("session not found") || message.includes("unknown session")) {
-    return new ProviderAdapterSessionNotFoundError({
-      provider: PROVIDER,
-      threadId,
-    });
+export function resolveGeminiAuthType(
+  authTypeFromEnv: AuthType | undefined = getAuthTypeFromEnv(),
+): AuthType {
+  return authTypeFromEnv ?? AuthType.LOGIN_WITH_GOOGLE;
+}
+
+export function readGeminiResumeState(
+  resumeCursor: unknown,
+): GeminiResumeState | undefined {
+  if (
+    !resumeCursor ||
+    typeof resumeCursor !== "object" ||
+    Array.isArray(resumeCursor)
+  ) {
+    return undefined;
   }
-  if (message.includes("session is closed") || message.includes("connection closed")) {
-    return new ProviderAdapterSessionClosedError({
-      provider: PROVIDER,
-      threadId,
-    });
+
+  const rawState = resumeCursor as {
+    history?: unknown;
+    turnCount?: unknown;
+  };
+  if (!Array.isArray(rawState.history)) {
+    return undefined;
   }
-  return new ProviderAdapterRequestError({
-    provider: PROVIDER,
-    method,
-    detail: toMessage(cause, `ACP ${method} request failed.`),
-    cause,
-  });
+
+  const turnCount =
+    typeof rawState.turnCount === "number" &&
+    Number.isSafeInteger(rawState.turnCount) &&
+    rawState.turnCount >= 0
+      ? rawState.turnCount
+      : 0;
+
+  return {
+    history: rawState.history as GeminiResumeHistory,
+    turnCount,
+  };
+}
+
+function createGeminiResumeState(ctx: GeminiSessionContext): GeminiResumeState {
+  return {
+    history: [...ctx.geminiClient.getHistory()],
+    turnCount: ctx.turns.length,
+  };
+}
+
+function updateResumeCursor(ctx: GeminiSessionContext): void {
+  (ctx.session as { resumeCursor?: unknown }).resumeCursor =
+    createGeminiResumeState(ctx);
+}
+
+function buildToolDetail(request: ToolConfirmationRequest): string {
+  const details = request.details;
+  if (!details) return request.toolCall?.name ?? "Unknown tool";
+
+  switch (details.type) {
+    case "edit":
+      return `Edit ${details.fileName}`;
+    case "exec":
+      return details.command ?? "Execute command";
+    case "mcp":
+      return `MCP: ${details.toolDisplayName ?? details.toolName}`;
+    case "ask_user":
+      return details.questions?.[0]?.question ?? "User input requested";
+    case "exit_plan_mode":
+      return "Exit plan mode";
+    default:
+      return request.toolCall?.name ?? "Tool operation";
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — cleanup a single session (internal, does not throw)
-// ---------------------------------------------------------------------------
-
-function stopSessionInternal(ctx: GeminiAcpSessionContext, emitExitEvent: boolean): void {
-  if (ctx.stopped) return;
-  ctx.stopped = true;
-
-  for (const [, pending] of ctx.pendingApprovals) {
-    pending.resolve({ outcome: { outcome: "cancelled" } });
-  }
-  ctx.pendingApprovals.clear();
-
-  try {
-    ctx.child.kill();
-  } catch {
-    // Process may already have exited
-  }
-
-  if (emitExitEvent) {
-    // Note: we cannot emit here because the queue may be shut down.
-    // Caller is responsible for emitting events when needed.
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Layer implementation
+// Adapter factory
 // ---------------------------------------------------------------------------
 
 const makeGeminiAcpAdapter = Effect.gen(function* () {
   const settingsService = yield* ServerSettingsService;
-
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
-  const sessions = new Map<string, GeminiAcpSessionContext>();
 
-  const emit = (...events: ReadonlyArray<ProviderRuntimeEvent>) =>
-    Queue.offerAll(runtimeEventQueue, events).pipe(Effect.runSync);
+  const sessions = new Map<string, GeminiSessionContext>();
 
-  // ------------------------------------------------------------------
-  // ACP Client handler factory — called per-session
-  // ------------------------------------------------------------------
+  // Emit events to the unbounded queue. We use unsafeOffer via runSync
+  // because events are emitted from both Effect fibers and plain JS callbacks
+  // (MessageBus handlers). For an unbounded queue, offer never blocks.
+  const emit = (event: ProviderRuntimeEvent): void => {
+    Effect.runSync(Queue.offer(runtimeEventQueue, event));
+  };
 
-  function makeAcpClient(ctx: GeminiAcpSessionContext): Client {
-    return {
-      async sessionUpdate(notification: SessionNotification): Promise<void> {
-        if (ctx.stopped) return;
-        const update = notification.update;
-        const base = makeEventBase(ctx);
+  const abortActiveTurn = (ctx: GeminiSessionContext): void => {
+    ctx.abortController.abort();
+    const activeAgentSession = ctx.activeAgentSession;
+    if (!activeAgentSession) return;
+    void activeAgentSession.abort().catch((error: unknown) => {
+      console.error("[gemini] Failed to abort active agent session:", error);
+    });
+  };
 
-        switch (update.sessionUpdate) {
-          case "agent_message_chunk": {
-            // ----- Replay deduplication (layered) -----
-            // The Gemini ACP replays the full conversation history as
-            // sessionUpdate notifications on each prompt() call.
-            //
-            // Layer 0 — no active turn:
-            // Between turns (after the previous turn's prompt resolved and
-            // before sendTurn sets the next turnState), any agent_message_chunk
-            // is either a late replay or a leftover from the previous prompt.
-            // Fresh model output can only arrive while a turn is active.
-            if (!ctx.turnState) {
-              break; // No active turn — definitively replay/leftover.
-            }
-            // Layer 1 — messageId (if available):
-            const chunkMessageId = (update as { messageId?: string | null }).messageId;
-            if (chunkMessageId && ctx.completedMessageIds.has(chunkMessageId)) {
-              break; // Known replay — skip.
-            }
-            // Layer 2 — user_message_chunk timing:
-            // user_message_chunk NEVER appears during normal turns (user
-            // input goes through prompt()).  If we've seen one recently,
-            // the ACP is replaying history.  Skip agent chunks that arrive
-            // within 2 s of the last user_message_chunk — real model
-            // generation always has a longer processing gap.
-            if (ctx.replayActive && Date.now() - ctx.lastReplaySignalTime < 2000) {
-              break; // Still within replay window — skip.
-            }
-            // If we passed both checks, replay is over.
-            ctx.replayActive = false;
+  // ---------------------------------------------------------------------------
+  // Session lookup
+  // ---------------------------------------------------------------------------
 
-            if (chunkMessageId) {
-              ctx.currentTurnMessageIds.add(chunkMessageId);
-            }
-            ctx.turnHasFreshContent = true;
+  const getSession = (
+    threadId: ThreadId,
+  ): Effect.Effect<GeminiSessionContext, ProviderAdapterError> => {
+    const ctx = sessions.get(threadId);
+    if (!ctx) {
+      return Effect.fail(
+        new ProviderAdapterSessionNotFoundError({
+          provider: PROVIDER,
+          threadId,
+        }),
+      );
+    }
+    if (ctx.stopped) {
+      return Effect.fail(
+        new ProviderAdapterSessionClosedError({ provider: PROVIDER, threadId }),
+      );
+    }
+    return Effect.succeed(ctx);
+  };
 
-            const text =
-              update.content && "text" in update.content ? update.content.text : undefined;
-            if (text) {
-              // agent_message_chunk is always the model's visible response.
-              // Reasoning/thinking is delivered via agent_thought_chunk instead.
-              // Use a segment-scoped itemId so that text before and after tool calls
-              // becomes separate assistant messages instead of being concatenated.
-              const segmentItemId = ctx.turnState
-                ? RuntimeItemId.makeUnsafe(
-                    `msg-seg-${ctx.turnState.turnId}-${ctx.assistantMessageSegment}`,
-                  )
-                : undefined;
-              emit({
-                ...base,
-                ...(segmentItemId ? { itemId: segmentItemId } : {}),
-                type: "content.delta",
-                payload: { streamKind: "assistant_text", delta: text },
-              } satisfies ProviderRuntimeEvent);
-            }
-            break;
-          }
-          case "agent_thought_chunk": {
-            // Gemini ACP sends agent_thought_chunk notifications that contain
-            // internal conversation recaps rather than genuine reasoning steps.
-            // Streaming these as visible reasoning_text causes the full
-            // conversation to be re-printed as a "Reasoning" work-log entry.
-            // Suppress until Gemini exposes opt-in thinking support.
-            break;
-          }
-          case "tool_call": {
-            if (!ctx.turnState) break; // No active turn — replay/leftover.
-            // Each tool call creates a boundary — assistant text after this
-            // point should be a separate message from text before it.
-            ctx.seenToolCallIds.add(update.toolCallId);
-            ctx.assistantMessageSegment++;
+  // ---------------------------------------------------------------------------
+  // MessageBus tool confirmation handler
+  // ---------------------------------------------------------------------------
 
-            const itemId = RuntimeItemId.makeUnsafe(update.toolCallId);
-            const itemType = mapToolKindToItemType(update.kind);
-            const title = update.title ?? undefined;
-            if (update.status === "completed" || update.status === "failed") {
-              emit({
-                ...base,
-                itemId,
-                type: "item.completed",
-                payload: { itemType, status: "completed", title },
-              } satisfies ProviderRuntimeEvent);
-              // Emit turn.diff.updated for file-modifying tools so that
-              // CheckpointReactor captures a git checkpoint (same as Codex).
-              if (update.status === "completed" && isFileModifyingKind(update.kind)) {
-                emit({
-                  ...base,
-                  itemId,
-                  type: "turn.diff.updated",
-                  payload: { unifiedDiff: "" },
-                } satisfies ProviderRuntimeEvent);
-              }
-              // In plan mode, detect completed plan file writes and emit a
-              // proposed plan.  This covers auto-approved tools that bypass
-              // requestPermission.  Gated to file-modifying kinds to avoid
-              // capturing reads of arbitrary .md files as plans.
-              if (
-                update.status === "completed" &&
-                ctx.currentAcpMode === "plan" &&
-                isFileModifyingKind(update.kind)
-              ) {
-                const planMarkdown = await tryReadPlanFile({ locations: update.locations, title });
-                if (planMarkdown) {
-                  emit({
-                    ...base,
-                    type: "turn.proposed.completed",
-                    payload: { planMarkdown },
-                  } satisfies ProviderRuntimeEvent);
-                }
-              }
-            } else {
-              emit({
-                ...base,
-                itemId,
-                type: "item.started",
-                payload: { itemType, status: "inProgress", title },
-              } satisfies ProviderRuntimeEvent);
-            }
-            break;
+  function setupMessageBusHandlers(
+    ctx: GeminiSessionContext,
+    messageBus: MessageBus,
+  ): void {
+    const handleConfirmation = (request: ToolConfirmationRequest): void => {
+      if (ctx.stopped || !ctx.turnState) return;
+
+      const toolName = request.toolCall?.name ?? "unknown";
+      const correlationId = request.correlationId;
+      const args = (request.toolCall?.args ?? {}) as Record<string, unknown>;
+
+      // Plan mode: auto-deny file-modifying tools, auto-approve read-only
+      if (ctx.userRequestedMode === "plan") {
+        if (isFileModifyingTool(toolName) || isShellWriteTool(toolName, args)) {
+          ctx.planModeDeniedInTurn++;
+          ctx.planModeTextSuppressed = true;
+
+          void messageBus.publish({
+            type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+            correlationId,
+            confirmed: false,
+            outcome: ToolConfirmationOutcome.Cancel,
+          });
+
+          if (ctx.planModeDeniedInTurn >= PLAN_MODE_DENY_LIMIT) {
+            abortActiveTurn(ctx);
           }
-          case "tool_call_update": {
-            if (!ctx.turnState) break; // No active turn — replay/leftover.
-            // If this is a tool call we haven't seen yet (i.e. no prior
-            // tool_call event), create a segment boundary so that pre-tool
-            // and post-tool assistant text become separate messages.
-            if (update.toolCallId && !ctx.seenToolCallIds.has(update.toolCallId)) {
-              ctx.seenToolCallIds.add(update.toolCallId);
-              ctx.assistantMessageSegment++;
-            }
-            const itemId = update.toolCallId
-              ? RuntimeItemId.makeUnsafe(update.toolCallId)
-              : undefined;
-            const title = update.title ?? undefined;
-            if (update.status === "completed" || update.status === "failed") {
-              emit({
-                ...base,
-                ...(itemId ? { itemId } : {}),
-                type: "item.completed",
-                payload: {
-                  itemType: mapToolKindToItemType(update.kind),
-                  status: "completed",
-                  title,
-                },
-              } satisfies ProviderRuntimeEvent);
-              // Emit turn.diff.updated for file-modifying tools so that
-              // CheckpointReactor captures a git checkpoint (same as Codex).
-              if (update.status === "completed" && isFileModifyingKind(update.kind)) {
-                emit({
-                  ...base,
-                  ...(itemId ? { itemId } : {}),
-                  type: "turn.diff.updated",
-                  payload: { unifiedDiff: "" },
-                } satisfies ProviderRuntimeEvent);
-              }
-              // In plan mode, detect completed plan file writes and emit a
-              // proposed plan (same as the tool_call handler above).
-              if (
-                update.status === "completed" &&
-                ctx.currentAcpMode === "plan" &&
-                isFileModifyingKind(update.kind)
-              ) {
-                const planMarkdown = await tryReadPlanFile({ locations: update.locations, title });
-                if (planMarkdown) {
-                  emit({
-                    ...base,
-                    type: "turn.proposed.completed",
-                    payload: { planMarkdown },
-                  } satisfies ProviderRuntimeEvent);
-                }
-              }
-            } else {
-              emit({
-                ...base,
-                ...(itemId ? { itemId } : {}),
-                type: "item.updated",
-                payload: {
-                  itemType: mapToolKindToItemType(update.kind),
-                  status: "inProgress",
-                  title,
-                },
-              } satisfies ProviderRuntimeEvent);
-            }
-            break;
-          }
-          case "plan": {
-            // Plan has `entries` array, emit a summary as plan_text
-            const entries = update.entries;
-            if (entries && entries.length > 0) {
-              const text = entries.map((e) => `- [${e.status}] ${e.content}`).join("\n");
-              emit({
-                ...base,
-                type: "content.delta",
-                payload: {
-                  streamKind: "plan_text",
-                  delta: text,
-                },
-              } satisfies ProviderRuntimeEvent);
-            }
-            break;
-          }
-          case "current_mode_update": {
-            // Track mode changes from the agent side
-            const modeId = (update as { currentModeId?: string }).currentModeId;
-            if (modeId) {
-              ctx.currentAcpMode = modeId;
-            }
-            break;
-          }
-          case "usage_update": {
-            // Context window update from the agent — has `size` (total) and `used` (in-context).
-            // These are absolute values that supersede any incremental accounting.
-            const usageUpdate = update as { size: number; used: number };
-            ctx.lastKnownMaxTokens = usageUpdate.size;
-            ctx.cumulativeInputTokens = usageUpdate.used;
-            ctx.cumulativeOutputTokens = 0;
-            ctx.cumulativeReasoningTokens = 0;
-            ctx.turnReceivedUsageUpdate = true;
-            // Only emit when replay is over (fresh content has been seen).
-            // During replay the ACP re-sends historical usage_update
-            // notifications with stale values that cause the counter to
-            // flicker/reset.  The prompt-response handler will emit final
-            // usage regardless, so nothing is lost.
-            if (ctx.turnHasFreshContent || !ctx.turnState) {
-              emit({
-                ...base,
-                type: "thread.token-usage.updated",
-                payload: {
-                  usage: {
-                    usedTokens: usageUpdate.used,
-                    maxTokens: usageUpdate.size,
-                  } as ThreadTokenUsageSnapshot,
-                },
-              } satisfies ProviderRuntimeEvent);
-            }
-            break;
-          }
-          case "user_message_chunk": {
-            // user_message_chunk during a turn is a definitive replay signal.
-            // Normal user messages go through prompt(), never as a
-            // notification.  Any user_message_chunk we see is the ACP
-            // replaying conversation history.
-            ctx.replayActive = true;
-            ctx.lastReplaySignalTime = Date.now();
-            const chunkMessageId = (update as { messageId?: string | null }).messageId;
-            if (chunkMessageId) {
-              ctx.currentTurnMessageIds.add(chunkMessageId);
-            }
-            break;
-          }
-          default:
-            // Ignore unknown session update types (available_commands_update, etc.)
-            break;
+          return;
         }
+        // Auto-approve read-only tools in plan mode
+        void messageBus.publish({
+          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+          correlationId,
+          confirmed: true,
+          outcome: ToolConfirmationOutcome.ProceedOnce,
+        });
+        return;
+      }
+
+      // Full-access mode: auto-approve everything
+      if (ctx.session.runtimeMode === "full-access") {
+        void messageBus.publish({
+          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+          correlationId,
+          confirmed: true,
+          outcome: ToolConfirmationOutcome.ProceedOnce,
+        });
+        return;
+      }
+
+      // Approval-required mode: emit request to UI
+      const requestType = classifyRequestTypeForTool(toolName);
+      const detail = buildToolDetail(request);
+      const requestId = `req-${correlationId}`;
+
+      ctx.pendingApprovals.set(requestId, {
+        requestType,
+        detail,
+        correlationId,
+        resolve: (response) => {
+          void messageBus.publish({
+            type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+            correlationId,
+            confirmed: response.confirmed,
+            outcome: response.outcome,
+          });
+        },
+      });
+
+      emit({
+        ...makeEventBase(ctx),
+        requestId: RuntimeRequestId.makeUnsafe(requestId),
+        type: "request.opened",
+        payload: {
+          requestType,
+          detail,
+          args,
+        },
+      } as ProviderRuntimeEvent);
+    };
+
+    messageBus.subscribe(
+      MessageBusType.TOOL_CONFIRMATION_REQUEST,
+      handleConfirmation as any,
+    );
+    ctx.messageBusUnsubscribers.push(() => {
+      messageBus.unsubscribe(
+        MessageBusType.TOOL_CONFIRMATION_REQUEST,
+        handleConfirmation as any,
+      );
+    });
+
+    // Handle ask_user requests
+    const handleAskUser = (request: any): void => {
+      if (ctx.stopped || !ctx.turnState) return;
+
+      const correlationId = request.correlationId as string;
+      const questions = (request.questions ?? []) as Array<{
+        question: string;
+        header?: string;
+      }>;
+      const requestId = `user-input-${correlationId}`;
+
+      ctx.pendingApprovals.set(requestId, {
+        requestType: "tool_user_input",
+        detail: questions[0]?.question ?? "User input requested",
+        correlationId,
+        resolve: (response) => {
+          void messageBus.publish({
+            type: MessageBusType.ASK_USER_RESPONSE,
+            correlationId,
+            confirmed: response.confirmed,
+            outcome: response.outcome,
+          } as never);
+        },
+      });
+
+      emit({
+        ...makeEventBase(ctx),
+        requestId: RuntimeRequestId.makeUnsafe(requestId),
+        type: "user-input.requested",
+        payload: {
+          questions: questions.map((q, i) => ({
+            id: `q-${i}`,
+            header: q.header ?? "Question",
+            question: q.question,
+            options: [],
+          })),
+        },
+      } as ProviderRuntimeEvent);
+    };
+
+    messageBus.subscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
+    ctx.messageBusUnsubscribers.push(() => {
+      messageBus.unsubscribe(
+        MessageBusType.ASK_USER_REQUEST,
+        handleAskUser as any,
+      );
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stream event processing
+  // ---------------------------------------------------------------------------
+
+  function emitAssistantText(ctx: GeminiSessionContext, text: string): void {
+    if (!ctx.turnState || ctx.planModeTextSuppressed) return;
+
+    ctx.turnAssistantText += text;
+
+    const fullVisible = extractVisibleAssistantText(ctx.turnAssistantText);
+    const newText = fullVisible.slice(ctx.emittedAssistantTextLength);
+    ctx.emittedAssistantTextLength = fullVisible.length;
+
+    if (newText.length === 0) return;
+
+    const itemId = `msg-${ctx.turnState.turnId}-${ctx.assistantMessageSegment}`;
+    emit({
+      ...makeEventBase(ctx),
+      itemId: RuntimeItemId.makeUnsafe(itemId),
+      type: "content.delta",
+      payload: {
+        streamKind: "assistant_text",
+        delta: newText,
       },
+    } as ProviderRuntimeEvent);
+  }
 
-      async requestPermission(
-        request: RequestPermissionRequest,
-      ): Promise<RequestPermissionResponse> {
-        const base = makeEventBase(ctx);
-        const toolCallUpdate = request.toolCall;
-        const requestType = mapToolKindToRequestType(toolCallUpdate?.kind);
-        const detail = toolCallUpdate?.title ?? "Tool approval requested";
+  function emitReasoningText(
+    ctx: GeminiSessionContext,
+    thoughtText: string,
+  ): void {
+    if (!ctx.turnState) return;
 
-        // Intercept plan approvals: if we are in plan mode and the tool
-        // references a .md file, read its content and emit it as a proposed
-        // plan (like Claude's ExitPlanMode) instead of showing a bare
-        // approval panel.  Only active in plan mode to avoid capturing
-        // regular .md file edits as plans.
-        const planMarkdown =
-          ctx.currentAcpMode === "plan"
-            ? await tryReadPlanFile({
-                locations: toolCallUpdate?.locations,
-                title: detail,
-              })
-            : undefined;
-        if (planMarkdown) {
-          emit({
-            ...base,
-            type: "turn.proposed.completed",
-            payload: { planMarkdown },
-          } satisfies ProviderRuntimeEvent);
+    if (!ctx.turnState.reasoningItemEmitted) {
+      ctx.turnState.reasoningItemEmitted = true;
+      const itemId = `reasoning-${ctx.turnState.turnId}`;
+      emit({
+        ...makeEventBase(ctx),
+        itemId: RuntimeItemId.makeUnsafe(itemId),
+        type: "item.started",
+        payload: {
+          itemType: "reasoning",
+          title: "Thinking",
+        },
+      } as ProviderRuntimeEvent);
+    }
 
-          // Approve the plan file write so the agent sees its plan as
-          // successfully presented.  Cancelling would tell the agent the
-          // plan was rejected, which breaks refinement on subsequent turns
-          // (the agent refuses to re-write or enters a degraded state).
-          const allowOption = request.options.find((opt) => opt.kind === "allow_once");
-          return {
-            outcome: {
-              outcome: "selected",
-              optionId: allowOption?.optionId ?? "proceed_once",
-            },
-          };
+    emit({
+      ...makeEventBase(ctx),
+      itemId: RuntimeItemId.makeUnsafe(`reasoning-${ctx.turnState.turnId}`),
+      type: "content.delta",
+      payload: {
+        streamKind: "reasoning_text",
+        delta: thoughtText,
+      },
+    } as ProviderRuntimeEvent);
+  }
+
+  function handleAgentEvent(
+    ctx: GeminiSessionContext,
+    event: AgentEvent,
+  ): void {
+    if (!ctx.turnState) return;
+
+    switch (event.type) {
+      case "message": {
+        if (event.role !== "agent") break;
+        if (event._meta?.citation === true) break;
+
+        for (const part of event.content) {
+          if (part.type === "text") {
+            emitAssistantText(ctx, part.text);
+            continue;
+          }
+          if (part.type === "thought") {
+            emitReasoningText(
+              ctx,
+              formatAgentThoughtText({
+                thought: part.thought,
+                subject:
+                  typeof event._meta?.subject === "string"
+                    ? event._meta.subject
+                    : undefined,
+              }),
+            );
+          }
         }
+        break;
+      }
 
-        const requestId = `gemini-perm-${Date.now()}-${++eventCounter}`;
+      case "tool_request": {
+        const itemType = classifyToolName(event.name);
+        const itemId = `tool-${event.requestId}`;
 
-        // Create the Promise first so `resolve` is captured before emitting
-        // the event (which may trigger respondToRequest synchronously).
-        const promise = new Promise<RequestPermissionResponse>((resolve) => {
-          ctx.pendingApprovals.set(requestId, { requestType, detail, resolve });
+        ctx.assistantMessageSegment++;
+        ctx.planModeTextSuppressed = false;
+
+        ctx.inFlightTools.set(event.requestId, {
+          itemId,
+          itemType,
+          toolName: event.name,
+          title: titleForToolType(itemType),
+          input: event.args ?? {},
         });
 
         emit({
-          ...base,
-          requestId: RuntimeRequestId.makeUnsafe(requestId),
-          type: "request.opened",
-          payload: { requestType, detail, args: request },
-        } satisfies ProviderRuntimeEvent);
-
-        return promise;
-      },
-    };
-  }
-
-  // ------------------------------------------------------------------
-  // Process spawning
-  // ------------------------------------------------------------------
-
-  function spawnAcpProcess(binaryPath: string): {
-    child: NodeChildProcess;
-    connection: ClientSideConnection;
-    clientRef: { value: Client | undefined };
-  } {
-    const child = spawn(binaryPath, ["--acp"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
-    });
-
-    const stdout = Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>;
-    const stdin = Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>;
-
-    const stream = ndJsonStream(stdin, stdout);
-    const clientRef: { value: Client | undefined } = { value: undefined };
-
-    const connection = new ClientSideConnection(() => {
-      const proxy: Client = {
-        sessionUpdate: (params) => clientRef.value?.sessionUpdate(params) ?? Promise.resolve(),
-        requestPermission: (params) => {
-          if (clientRef.value?.requestPermission) {
-            return clientRef.value.requestPermission(params);
-          }
-          return Promise.resolve({
-            outcome: { outcome: "cancelled" as const },
-          });
-        },
-      };
-      return proxy;
-    }, stream);
-
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) {
-        console.error(`[gemini-acp stderr] ${text}`);
+          ...makeEventBase(ctx),
+          itemId: RuntimeItemId.makeUnsafe(itemId),
+          type: "item.started",
+          payload: {
+            itemType,
+            title: titleForToolType(itemType),
+            detail: event.name,
+            data: event.args ?? {},
+          },
+        } as ProviderRuntimeEvent);
+        break;
       }
+
+      case "tool_response": {
+        const existingTool = ctx.inFlightTools.get(event.requestId);
+        const tool =
+          existingTool ??
+          ({
+            itemId: `tool-${event.requestId}`,
+            itemType: classifyToolName(event.name),
+            toolName: event.name,
+            title: titleForToolType(classifyToolName(event.name)),
+            input: {},
+          } satisfies ToolInFlight);
+
+        ctx.inFlightTools.delete(event.requestId);
+
+        const outputParts = (event.displayContent ?? event.content)?.filter(
+          (part): part is Extract<ContentPart, { type: "text" }> =>
+            isTextContentPart(part) && part.text.length > 0,
+        );
+        if (outputParts && outputParts.length > 0) {
+          const outputText = outputParts.map((part) => part.text).join("\n");
+          const streamKind =
+            tool.itemType === "command_execution"
+              ? "command_output"
+              : "file_change_output";
+          emit({
+            ...makeEventBase(ctx),
+            itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+            type: "content.delta",
+            payload: {
+              streamKind,
+              delta: outputText,
+            },
+          } as ProviderRuntimeEvent);
+        }
+
+        emit({
+          ...makeEventBase(ctx),
+          itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+          type: "item.completed",
+          payload: {
+            itemType: tool.itemType,
+            status: event.isError ? "failed" : "completed",
+          },
+        } as ProviderRuntimeEvent);
+        break;
+      }
+
+      case "usage": {
+        ctx.cumulativeInputTokens += event.inputTokens ?? 0;
+        ctx.cumulativeOutputTokens += event.outputTokens ?? 0;
+        break;
+      }
+
+      case "error": {
+        console.error(
+          "[gemini] Agent session error event:",
+          event.message,
+          event._meta,
+        );
+        break;
+      }
+
+      case "agent_end": {
+        const state =
+          event.reason === "aborted"
+            ? "interrupted"
+            : event.reason === "failed"
+              ? "failed"
+              : "completed";
+        const errorMessage =
+          state === "failed" && typeof event.data?.message === "string"
+            ? event.data.message
+            : undefined;
+        completeTurn(ctx, state, event.reason, errorMessage);
+        break;
+      }
+
+      case "initialize":
+      case "session_update":
+      case "agent_start":
+      case "tool_update":
+      case "elicitation_request":
+      case "elicitation_response":
+      case "custom":
+        break;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stream loop — background turn processing
+  // ---------------------------------------------------------------------------
+
+  async function runStreamLoop(
+    ctx: GeminiSessionContext,
+    promptText: string,
+  ): Promise<void> {
+    const promptId = `prompt-${Date.now()}`;
+    const scheduler = new Scheduler({
+      context: ctx.config,
+      messageBus: ctx.config.getMessageBus(),
+      getPreferredEditor: () => undefined,
+      schedulerId: ROOT_SCHEDULER_ID,
+    });
+    const agentSession = new LegacyAgentSession({
+      client: ctx.geminiClient,
+      scheduler,
+      config: ctx.config,
+      promptId,
+    });
+    ctx.activeAgentSession = agentSession;
+
+    const abortListener = (): void => {
+      void agentSession.abort().catch((error: unknown) => {
+        console.error("[gemini] Failed to abort agent session:", error);
+      });
+    };
+    ctx.abortController.signal.addEventListener("abort", abortListener, {
+      once: true,
     });
 
-    return { child, connection, clientRef };
-  }
+    try {
+      for await (const event of agentSession.sendStream({
+        message: [{ type: "text", text: promptText }],
+      })) {
+        if (ctx.stopped) break;
+        handleAgentEvent(ctx, event);
+        if (!ctx.turnState) break;
+      }
 
-  // ------------------------------------------------------------------
-  // Adapter method: startSession
-  // ------------------------------------------------------------------
-
-  // Helper: extract ACP session ID from a resumeCursor if present
-  function extractAcpSessionId(cursor: unknown): string | undefined {
-    if (
-      cursor &&
-      typeof cursor === "object" &&
-      "acpSessionId" in cursor &&
-      typeof (cursor as Record<string, unknown>).acpSessionId === "string"
-    ) {
-      return (cursor as Record<string, unknown>).acpSessionId as string;
+      if (ctx.turnState) {
+        completeTurn(
+          ctx,
+          ctx.abortController.signal.aborted ? "interrupted" : "completed",
+          ctx.abortController.signal.aborted ? "aborted" : "completed",
+        );
+      }
+    } catch (err: unknown) {
+      if (ctx.stopped) return;
+      if (ctx.abortController.signal.aborted) {
+        completeTurn(ctx, "interrupted", "interrupted");
+      } else {
+        console.error("[gemini] Stream error:", err);
+        completeTurn(ctx, "failed", "error", toMessage(err, "Stream error"));
+      }
+    } finally {
+      ctx.abortController.signal.removeEventListener("abort", abortListener);
+      ctx.activeAgentSession = undefined;
+      scheduler.dispose();
     }
-    return undefined;
   }
 
-  const startSession: GeminiAcpAdapterShape["startSession"] = (input: ProviderSessionStartInput) =>
+  // ---------------------------------------------------------------------------
+  // Turn completion
+  // ---------------------------------------------------------------------------
+
+  function completeTurn(
+    ctx: GeminiSessionContext,
+    state: "completed" | "failed" | "interrupted" | "cancelled",
+    stopReason: string,
+    errorMessage?: string,
+  ): void {
+    if (!ctx.turnState) return;
+
+    // Complete remaining in-flight tools
+    for (const [, tool] of ctx.inFlightTools) {
+      emit({
+        ...makeEventBase(ctx),
+        itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+        type: "item.completed",
+        payload: {
+          itemType: tool.itemType,
+          status: "failed",
+        },
+      } as ProviderRuntimeEvent);
+    }
+    ctx.inFlightTools.clear();
+
+    // Complete reasoning item if open
+    if (ctx.turnState.reasoningItemEmitted) {
+      emit({
+        ...makeEventBase(ctx),
+        itemId: RuntimeItemId.makeUnsafe(`reasoning-${ctx.turnState.turnId}`),
+        type: "item.completed",
+        payload: {
+          itemType: "reasoning",
+          status: "completed",
+        },
+      } as ProviderRuntimeEvent);
+    }
+
+    // Cancel pending approvals
+    for (const [, pending] of ctx.pendingApprovals) {
+      pending.resolve({
+        confirmed: false,
+        outcome: ToolConfirmationOutcome.Cancel,
+      });
+    }
+    ctx.pendingApprovals.clear();
+
+    // Extract proposed plan from assistant text
+    if (ctx.userRequestedMode === "plan") {
+      const plan = extractProposedPlanMarkdown(ctx.turnAssistantText);
+      if (plan) {
+        emit({
+          ...makeEventBase(ctx),
+          type: "turn.proposed.completed",
+          payload: {
+            planMarkdown: plan,
+          },
+        } as ProviderRuntimeEvent);
+      }
+    }
+
+    // Emit token usage
+    const tokenUsage = buildTokenUsageSnapshot(ctx);
+    emit({
+      ...makeEventBase(ctx),
+      type: "thread.token-usage.updated",
+      payload: {
+        usage: tokenUsage,
+      },
+    } as ProviderRuntimeEvent);
+
+    // Store turn
+    const turnId = ctx.turnState.turnId;
+    ctx.turns.push({ id: turnId, items: [] });
+    updateResumeCursor(ctx);
+
+    emit({
+      ...makeEventBase(ctx),
+      type: "turn.completed",
+      payload: {
+        state,
+        stopReason,
+        usage: tokenUsage,
+        ...(errorMessage ? { errorMessage } : {}),
+      },
+    } as ProviderRuntimeEvent);
+
+    ctx.turnState = undefined;
+
+    // Return to ready state
+    emit({
+      ...makeEventBase(ctx),
+      type: "session.state.changed",
+      payload: { state: "ready" },
+    } as ProviderRuntimeEvent);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Adapter methods
+  // ---------------------------------------------------------------------------
+
+  const startSession = (
+    input: ProviderSessionStartInput,
+  ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
     Effect.gen(function* () {
-      if (input.provider !== undefined && input.provider !== PROVIDER) {
+      if (input.provider && input.provider !== PROVIDER) {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
           operation: "startSession",
-          issue: `Expected provider "${PROVIDER}", got "${input.provider}".`,
+          issue: `Expected provider "${PROVIDER}", got "${input.provider}"`,
         });
       }
 
-      const geminiSettings = yield* settingsService.getSettings.pipe(
-        Effect.map((settings) => settings.providers.geminiAcp),
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-              detail: "Failed to read Gemini ACP settings.",
-              cause,
-            }),
-        ),
+      yield* settingsService.getSettings.pipe(
+        Effect.map((s) => s.providers.geminiAcp),
+        Effect.orDie,
       );
 
-      const { child, connection, clientRef } = yield* Effect.try({
-        try: () => spawnAcpProcess(geminiSettings.binaryPath),
-        catch: (cause) =>
-          new ProviderAdapterProcessError({
-            provider: PROVIDER,
-            threadId: input.threadId,
-            detail: toMessage(cause, "Failed to spawn gemini process."),
-            cause,
-          }),
-      });
-
-      // Initialize the ACP connection
-      const initResponse = yield* Effect.tryPromise({
-        try: () =>
-          connection.initialize({
-            protocolVersion: PROTOCOL_VERSION,
-            clientCapabilities: {},
-            clientInfo: {
-              name: "t3code",
-              version: "0.1.0",
-            },
-          }),
-        catch: (cause) =>
-          new ProviderAdapterProcessError({
-            provider: PROVIDER,
-            threadId: input.threadId,
-            detail: toMessage(cause, "ACP initialize failed."),
-            cause,
-          }),
-      });
-
-      // Authenticate — use the first available auth method
-      const authMethods = initResponse.authMethods ?? [];
-      const firstAuth = authMethods[0];
-      if (firstAuth) {
-        yield* Effect.tryPromise({
-          try: () =>
-            connection.authenticate({
-              methodId: firstAuth.id,
-            }),
-          catch: (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-              detail: toMessage(
-                cause,
-                'Gemini authentication failed. Run "gemini login" and try again.',
-              ),
-              cause,
-            }),
-        });
-      }
-
-      // Try to resume an existing ACP session if we have a resumeCursor,
-      // otherwise create a new one.
-      const previousAcpSessionId = extractAcpSessionId(input.resumeCursor);
-      let acpSessionId: string;
-
-      if (previousAcpSessionId) {
-        // Attempt session/load to resume the previous conversation
-        const loadResult = yield* Effect.tryPromise(() =>
-          connection.loadSession({
-            sessionId: previousAcpSessionId,
-            cwd: input.cwd ?? process.cwd(),
-            mcpServers: [],
-          }),
-        ).pipe(Effect.option);
-
-        if (Option.isSome(loadResult)) {
-          acpSessionId = previousAcpSessionId;
-        } else {
-          // loadSession failed (session expired or not found) — create fresh
-          const newSessionResponse = yield* Effect.tryPromise({
-            try: () =>
-              connection.newSession({
-                cwd: input.cwd ?? process.cwd(),
-                mcpServers: [],
-              }),
-            catch: (cause) =>
-              new ProviderAdapterProcessError({
-                provider: PROVIDER,
-                threadId: input.threadId,
-                detail: toMessage(cause, "Failed to create ACP session."),
-                cause,
-              }),
-          });
-          acpSessionId = newSessionResponse.sessionId;
-        }
-      } else {
-        const newSessionResponse = yield* Effect.tryPromise({
-          try: () =>
-            connection.newSession({
-              cwd: input.cwd ?? process.cwd(),
-              mcpServers: [],
-            }),
-          catch: (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-              detail: toMessage(cause, "Failed to create ACP session."),
-              cause,
-            }),
-        });
-        acpSessionId = newSessionResponse.sessionId;
-      }
-
+      const threadId = input.threadId;
+      const modelId = input.modelSelection?.model ?? "gemini-2.5-pro";
       const now = new Date().toISOString();
-      const providerSession: ProviderSession = {
+      const runtimeMode = input.runtimeMode ?? "full-access";
+      const resumeState = readGeminiResumeState(input.resumeCursor);
+
+      // Create and initialize Config
+      const workDir = (input.cwd as string | undefined) ?? process.cwd();
+      const config = new Config({
+        sessionId: threadId as string,
+        targetDir: workDir,
+        cwd: workDir,
+        model: modelId,
+        clientVersion: "0.36.0",
+        debugMode: false,
+        approvalMode:
+          runtimeMode === "full-access"
+            ? ApprovalMode.AUTO_EDIT
+            : ApprovalMode.DEFAULT,
+        interactive: true,
+        ptyInfo: "node-pty",
+        acpMode: true,
+      });
+
+      yield* Effect.tryPromise({
+        try: () => config.initialize(),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: `Failed to initialize Gemini config: ${toMessage(cause, "unknown error")}`,
+            cause,
+          }),
+      });
+
+      yield* Effect.tryPromise({
+        try: () => config.refreshAuth(resolveGeminiAuthType()),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: `Failed to authenticate Gemini session: ${toMessage(cause, "unknown error")}`,
+            cause,
+          }),
+      });
+
+      // Create and initialize GeminiClient
+      const geminiClient = config.getGeminiClient();
+
+      yield* Effect.tryPromise({
+        try: () =>
+          resumeState
+            ? geminiClient.resumeChat([...resumeState.history])
+            : Promise.resolve(),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: `Failed to resume Gemini chat: ${toMessage(cause, "unknown error")}`,
+            cause,
+          }),
+      });
+
+      const session: ProviderSession = {
         provider: PROVIDER,
-        status: "ready" as const,
-        runtimeMode: input.runtimeMode,
-        threadId: input.threadId,
-        resumeCursor: { threadId: input.threadId, acpSessionId },
+        status: "ready",
+        runtimeMode,
+        cwd: input.cwd,
+        model: modelId,
+        threadId,
         createdAt: now,
         updatedAt: now,
       };
 
-      const ctx: GeminiAcpSessionContext = {
-        session: providerSession,
-        child,
-        connection,
-        acpSessionId,
-        pendingApprovals: new Map(),
+      const ctx: GeminiSessionContext = {
+        session,
+        config,
+        geminiClient,
+        abortController: new AbortController(),
+        messageBusUnsubscribers: [],
         turnState: undefined,
-        promptReject: undefined,
         stopped: false,
-        currentAcpMode: "default",
+        pendingApprovals: new Map(),
+        userRequestedMode: "default",
+        planModePromptSent: false,
+        defaultModePromptSent: false,
+        planModeDeniedInTurn: 0,
+        planModeTextSuppressed: false,
+        turnAssistantText: "",
+        emittedAssistantTextLength: 0,
         assistantMessageSegment: 0,
-        seenToolCallIds: new Set(),
         cumulativeInputTokens: 0,
         cumulativeOutputTokens: 0,
         cumulativeReasoningTokens: 0,
         lastKnownMaxTokens: undefined,
-        turnReceivedUsageUpdate: false,
-        completedMessageIds: new Set(),
-        currentTurnMessageIds: new Set(),
-        turnHasFreshContent: false,
-        replayActive: false,
-        lastReplaySignalTime: 0,
+        inFlightTools: new Map(),
+        turns: [],
+        activeStreamPromise: undefined,
+        activeAgentSession: undefined,
       };
+      updateResumeCursor(ctx);
 
-      // Wire the ACP Client callbacks to this session context
-      clientRef.value = makeAcpClient(ctx);
+      // Wire up MessageBus for tool confirmations
+      const messageBus = config.getMessageBus();
+      setupMessageBusHandlers(ctx, messageBus);
 
-      // Handle process exit
-      child.on("exit", (code, signal) => {
-        if (!ctx.stopped) {
-          ctx.stopped = true;
-          emit({
-            ...makeEventBase(ctx),
-            type: "session.exited",
-            payload: {
-              reason: signal ? `Process killed by ${signal}` : `Process exited with code ${code}`,
-              recoverable: false,
-              exitKind: code === 0 ? "graceful" : "error",
-            },
-          } satisfies ProviderRuntimeEvent);
+      sessions.set(threadId, ctx);
 
-          ctx.promptReject?.(new Error("Gemini ACP process exited unexpectedly."));
-        }
-      });
-
-      sessions.set(input.threadId, ctx);
-
-      // Sync ACP approval mode based on runtimeMode
-      const initialAcpMode = resolveAcpModeId(undefined, input.runtimeMode);
-      if (initialAcpMode !== ctx.currentAcpMode) {
-        const modeResult = yield* Effect.tryPromise(() =>
-          connection.setSessionMode({
-            sessionId: acpSessionId,
-            modeId: initialAcpMode,
-          }),
-        ).pipe(Effect.option);
-        if (Option.isSome(modeResult)) {
-          ctx.currentAcpMode = initialAcpMode;
-        }
-      }
-
+      // Emit session lifecycle events
       emit({
         ...makeEventBase(ctx),
         type: "session.started",
         payload: {},
-      } satisfies ProviderRuntimeEvent);
+      } as ProviderRuntimeEvent);
+      emit({
+        ...makeEventBase(ctx),
+        type: "session.configured",
+        payload: { config: { model: modelId } },
+      } as ProviderRuntimeEvent);
+      emit({
+        ...makeEventBase(ctx),
+        type: "session.state.changed",
+        payload: { state: "ready" },
+      } as ProviderRuntimeEvent);
 
-      return providerSession;
+      return session;
     });
 
-  // ------------------------------------------------------------------
-  // Adapter method: sendTurn
-  // ------------------------------------------------------------------
-
-  // Resolve the desired ACP session mode from T3Code's interactionMode and runtimeMode.
-  // Plan mode overrides everything; otherwise runtimeMode determines approval behavior.
-  function resolveAcpModeId(interactionMode: string | undefined, runtimeMode: string): string {
-    if (interactionMode === "plan") return "plan";
-    if (runtimeMode === "full-access") return "autoEdit";
-    return "default";
-  }
-
-  const sendTurn: GeminiAcpAdapterShape["sendTurn"] = (input: ProviderSendTurnInput) =>
+  const sendTurn = (
+    input: ProviderSendTurnInput,
+  ): Effect.Effect<
+    { threadId: ThreadId; turnId: TurnId; resumeCursor?: unknown },
+    ProviderAdapterError
+  > =>
     Effect.gen(function* () {
-      const ctx = sessions.get(input.threadId);
-      if (!ctx) {
-        return yield* new ProviderAdapterSessionNotFoundError({
-          provider: PROVIDER,
-          threadId: input.threadId,
-        });
-      }
-      if (ctx.stopped) {
-        return yield* new ProviderAdapterSessionClosedError({
-          provider: PROVIDER,
-          threadId: input.threadId,
-        });
-      }
+      const ctx = yield* getSession(input.threadId);
 
-      // Sync interaction mode + runtime mode to ACP session mode before sending the turn
-      const desiredAcpMode = resolveAcpModeId(input.interactionMode, ctx.session.runtimeMode);
-      if (desiredAcpMode !== ctx.currentAcpMode) {
-        const result = yield* Effect.tryPromise(() =>
-          ctx.connection.setSessionMode({
-            sessionId: ctx.acpSessionId,
-            modeId: desiredAcpMode,
-          }),
-        ).pipe(Effect.option);
-        if (Option.isSome(result)) {
-          ctx.currentAcpMode = desiredAcpMode;
-        }
-      }
+      const interactionMode = input.interactionMode ?? ctx.userRequestedMode;
+      ctx.userRequestedMode = interactionMode;
 
-      const turnId = `turn-${Date.now()}-${++eventCounter}`;
       const now = new Date().toISOString();
-      ctx.turnState = { turnId, startedAt: now };
+      const turnId = `turn-${Date.now()}-${ctx.turns.length}`;
+
+      // Reset turn state
+      ctx.turnState = {
+        turnId,
+        startedAt: now,
+        reasoningItemEmitted: false,
+      };
+      ctx.planModeDeniedInTurn = 0;
+      ctx.planModeTextSuppressed = false;
+      ctx.turnAssistantText = "";
+      ctx.emittedAssistantTextLength = 0;
       ctx.assistantMessageSegment = 0;
-      ctx.seenToolCallIds.clear();
-      ctx.turnReceivedUsageUpdate = false;
+      ctx.inFlightTools.clear();
+      ctx.abortController = new AbortController();
 
-      // Finalize previous turn's messageIds so replayed content is skipped.
-      for (const id of ctx.currentTurnMessageIds) {
-        ctx.completedMessageIds.add(id);
-      }
-      ctx.currentTurnMessageIds.clear();
-      ctx.turnHasFreshContent = false;
-      ctx.replayActive = false;
-      ctx.lastReplaySignalTime = 0;
+      // Build prompt
+      const { promptBlocks, planModePromptSent, defaultModePromptSent } =
+        buildGeminiPromptBlocks({
+          interactionMode,
+          userInput: input.input?.trim(),
+          planModePromptSent: ctx.planModePromptSent,
+          defaultModePromptSent: ctx.defaultModePromptSent,
+        });
+      ctx.planModePromptSent = planModePromptSent;
+      ctx.defaultModePromptSent = defaultModePromptSent;
 
+      const promptText = promptBlocks.map((b) => b.text).join("\n\n");
+
+      // Update session status (cast to mutable for internal tracking)
+      (ctx.session as { status: string }).status = "running";
+      (ctx.session as { activeTurnId?: TurnId }).activeTurnId =
+        TurnIdBrand.makeUnsafe(turnId);
+      (ctx.session as { updatedAt: string }).updatedAt = now;
+
+      // Emit turn started
       emit({
         ...makeEventBase(ctx),
         type: "turn.started",
-        payload: {},
-      } satisfies ProviderRuntimeEvent);
+        payload: { model: ctx.session.model },
+      } as ProviderRuntimeEvent);
+      emit({
+        ...makeEventBase(ctx),
+        type: "session.state.changed",
+        payload: { state: "running" },
+      } as ProviderRuntimeEvent);
 
-      // Build ACP prompt content blocks
-      const promptBlocks: Array<{ type: "text"; text: string }> = [];
-
-      // In plan mode, prepend instructions that constrain the model to planning
-      // only.  The ACP session mode controls tool *approval* policy but does not
-      // instruct the model itself — without this the model will eventually start
-      // executing changes even while the session is in plan mode.
-      if (desiredAcpMode === "plan") {
-        promptBlocks.push({ type: "text", text: GEMINI_PLAN_MODE_PROMPT });
-      }
-
-      if (input.input) {
-        promptBlocks.push({ type: "text", text: input.input });
-      }
-
-      // Fire the ACP prompt in the background — it returns when the turn completes
-      const promptPromise = ctx.connection
-        .prompt({
-          sessionId: ctx.acpSessionId,
-          prompt: promptBlocks.length > 0 ? promptBlocks : [{ type: "text", text: "" }],
-        })
-        .then((response) => {
-          const state =
-            response.stopReason === "cancelled" ? ("cancelled" as const) : ("completed" as const);
-
-          // Extract token usage from the prompt response.
-          // Gemini CLI returns usage in _meta.quota.token_count; the ACP SDK
-          // also defines a standard `usage` field — we check both.
-          const acpUsage = response.usage as
-            | {
-                inputTokens?: number;
-                outputTokens?: number;
-                thoughtTokens?: number;
-                totalTokens?: number;
-              }
-            | null
-            | undefined;
-          const meta = response._meta as Record<string, unknown> | undefined;
-          const quota = meta?.quota as
-            | {
-                token_count?: { input_tokens?: number; output_tokens?: number };
-              }
-            | undefined;
-
-          const turnInputTokens =
-            acpUsage?.inputTokens ?? quota?.token_count?.input_tokens ?? undefined;
-          const turnOutputTokens =
-            acpUsage?.outputTokens ?? quota?.token_count?.output_tokens ?? undefined;
-          const turnReasoningTokens = acpUsage?.thoughtTokens ?? undefined;
-
-          if (turnInputTokens !== undefined || turnOutputTokens !== undefined) {
-            // Only update cumulative counters from the prompt response when
-            // no usage_update notification was received during this turn.
-            // usage_update provides authoritative absolute values; adding
-            // turn tokens on top would double-count and cause the context
-            // counter to "reset" when the next usage_update corrects it.
-            if (!ctx.turnReceivedUsageUpdate) {
-              ctx.cumulativeInputTokens += turnInputTokens ?? 0;
-              ctx.cumulativeOutputTokens += turnOutputTokens ?? 0;
-              ctx.cumulativeReasoningTokens += turnReasoningTokens ?? 0;
-            }
-
-            emit({
-              ...makeEventBase(ctx),
-              type: "thread.token-usage.updated",
-              payload: {
-                usage: buildTokenUsageSnapshot(
-                  ctx,
-                  turnInputTokens,
-                  turnOutputTokens,
-                  turnReasoningTokens,
-                ),
-              },
-            } satisfies ProviderRuntimeEvent);
-          }
-
-          emit({
-            ...makeEventBase(ctx),
-            type: "turn.completed",
-            payload: { state, stopReason: response.stopReason },
-          } satisfies ProviderRuntimeEvent);
-          ctx.turnState = undefined;
-          ctx.promptReject = undefined;
-        })
-        .catch((error: unknown) => {
-          const detail = toMessage(error, "Turn failed.");
-          console.error(`[gemini-acp] prompt() rejected:`, error);
-          if (!ctx.stopped) {
-            emit({
-              ...makeEventBase(ctx),
-              type: "turn.completed",
-              payload: {
-                state: "failed",
-                errorMessage: detail,
-              },
-            } satisfies ProviderRuntimeEvent);
-          }
-          ctx.turnState = undefined;
-          ctx.promptReject = undefined;
-        });
-
-      void promptPromise;
+      // Start stream loop in background
+      ctx.activeStreamPromise = runStreamLoop(ctx, promptText);
+      ctx.activeStreamPromise.catch((err) => {
+        if (!ctx.stopped) {
+          console.error("[gemini] Unhandled stream loop error:", err);
+        }
+      });
 
       return {
         threadId: input.threadId,
         turnId: TurnIdBrand.makeUnsafe(turnId),
-        resumeCursor: {
-          threadId: input.threadId,
-          acpSessionId: ctx.acpSessionId,
-        },
+        resumeCursor: ctx.session.resumeCursor,
       };
     });
 
-  // ------------------------------------------------------------------
-  // Adapter method: interruptTurn
-  // ------------------------------------------------------------------
-
-  const interruptTurn: GeminiAcpAdapterShape["interruptTurn"] = (
+  const interruptTurn = (
     threadId: ThreadId,
-    _turnId?: TurnIdBrand,
-  ) =>
+    _turnId?: TurnId,
+  ): Effect.Effect<void, ProviderAdapterError> =>
     Effect.gen(function* () {
-      const ctx = sessions.get(threadId);
-      if (!ctx) {
-        return yield* new ProviderAdapterSessionNotFoundError({
-          provider: PROVIDER,
-          threadId,
-        });
-      }
-
-      yield* Effect.tryPromise({
-        try: () => ctx.connection.cancel({ sessionId: ctx.acpSessionId }),
-        catch: (cause) => toRequestError(threadId, "cancel", cause),
-      });
+      const ctx = yield* getSession(threadId);
+      abortActiveTurn(ctx);
     });
 
-  // ------------------------------------------------------------------
-  // Adapter method: respondToRequest
-  // ------------------------------------------------------------------
-
-  const respondToRequest: GeminiAcpAdapterShape["respondToRequest"] = (
+  const respondToRequest = (
     threadId: ThreadId,
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
-  ) =>
+  ): Effect.Effect<void, ProviderAdapterError> =>
     Effect.gen(function* () {
-      const ctx = sessions.get(threadId);
-      if (!ctx) {
-        return yield* new ProviderAdapterSessionNotFoundError({
-          provider: PROVIDER,
-          threadId,
-        });
-      }
-
+      const ctx = yield* getSession(threadId);
       const pending = ctx.pendingApprovals.get(requestId);
       if (!pending) {
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "respondToRequest",
-          detail: `No pending approval found for requestId "${requestId}".`,
+          detail: `No pending approval for requestId "${requestId}"`,
         });
       }
 
       ctx.pendingApprovals.delete(requestId);
 
-      const base = makeEventBase(ctx);
+      const confirmed =
+        decision === "accept" || decision === "acceptForSession";
+      const outcome = confirmed
+        ? decision === "acceptForSession"
+          ? ToolConfirmationOutcome.ProceedAlways
+          : ToolConfirmationOutcome.ProceedOnce
+        : ToolConfirmationOutcome.Cancel;
+
+      pending.resolve({ confirmed, outcome });
+
       emit({
-        ...base,
+        ...makeEventBase(ctx),
         requestId: RuntimeRequestId.makeUnsafe(requestId),
         type: "request.resolved",
         payload: {
           requestType: pending.requestType,
           decision,
         },
-      } satisfies ProviderRuntimeEvent);
-
-      // Map T3Code decision to ACP response
-      if (decision === "accept" || decision === "acceptForSession") {
-        pending.resolve({
-          outcome: {
-            outcome: "selected",
-            optionId: decision === "acceptForSession" ? "proceed_always" : "proceed_once",
-          },
-        });
-      } else {
-        pending.resolve({
-          outcome: { outcome: "cancelled" },
-        });
-      }
+      } as ProviderRuntimeEvent);
     });
 
-  // ------------------------------------------------------------------
-  // Adapter method: respondToUserInput
-  // ------------------------------------------------------------------
-
-  const respondToUserInput: GeminiAcpAdapterShape["respondToUserInput"] = (
-    _threadId: ThreadId,
-    _requestId: ApprovalRequestId,
-    _answers: ProviderUserInputAnswers,
-  ) => Effect.void;
-
-  // ------------------------------------------------------------------
-  // Adapter method: stopSession
-  // ------------------------------------------------------------------
-
-  const stopSession: GeminiAcpAdapterShape["stopSession"] = (threadId: ThreadId) =>
+  const respondToUserInput = (
+    threadId: ThreadId,
+    requestId: ApprovalRequestId,
+    answers: ProviderUserInputAnswers,
+  ): Effect.Effect<void, ProviderAdapterError> =>
     Effect.gen(function* () {
-      const ctx = sessions.get(threadId);
-      if (!ctx) {
-        return yield* new ProviderAdapterSessionNotFoundError({
+      const ctx = yield* getSession(threadId);
+      const pending = ctx.pendingApprovals.get(requestId);
+      if (!pending) {
+        return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
-          threadId,
+          method: "respondToUserInput",
+          detail: `No pending user input for requestId "${requestId}"`,
         });
       }
 
-      ctx.stopped = true;
-      sessions.delete(threadId);
+      ctx.pendingApprovals.delete(requestId);
+      pending.resolve({
+        confirmed: true,
+        outcome: ToolConfirmationOutcome.ProceedOnce,
+      });
 
+      emit({
+        ...makeEventBase(ctx),
+        requestId: RuntimeRequestId.makeUnsafe(requestId),
+        type: "user-input.resolved",
+        payload: {
+          answers,
+        },
+      } as ProviderRuntimeEvent);
+    });
+
+  const stopSession = (
+    threadId: ThreadId,
+  ): Effect.Effect<void, ProviderAdapterError> =>
+    Effect.gen(function* () {
+      const ctx = sessions.get(threadId);
+      if (!ctx) return;
+
+      ctx.stopped = true;
+      abortActiveTurn(ctx);
+
+      // Clean up MessageBus subscriptions
+      for (const unsub of ctx.messageBusUnsubscribers) {
+        yield* Effect.sync(() => {
+          unsub();
+        }).pipe(Effect.ignore);
+      }
+
+      // Cancel pending approvals
       for (const [, pending] of ctx.pendingApprovals) {
-        pending.resolve({ outcome: { outcome: "cancelled" } });
+        pending.resolve({
+          confirmed: false,
+          outcome: ToolConfirmationOutcome.Cancel,
+        });
       }
       ctx.pendingApprovals.clear();
 
-      yield* Effect.sync(() => {
-        try {
-          ctx.child.kill();
-        } catch {
-          // Process may already have exited
-        }
-      });
+      // Dispose config (handles client cleanup internally)
+      yield* Effect.tryPromise({
+        try: () => ctx.config.dispose(),
+        catch: () => undefined as never, // swallow errors
+      }).pipe(Effect.ignore);
+
+      sessions.delete(threadId);
+      (ctx.session as { status: string }).status = "closed";
 
       emit({
         ...makeEventBase(ctx),
         type: "session.exited",
         payload: {
-          reason: "Session stopped by user.",
-          recoverable: false,
+          reason: "stopped",
           exitKind: "graceful",
         },
-      } satisfies ProviderRuntimeEvent);
+      } as ProviderRuntimeEvent);
     });
 
-  // ------------------------------------------------------------------
-  // Adapter method: stopAll
-  // ------------------------------------------------------------------
+  const listSessions = (): Effect.Effect<ReadonlyArray<ProviderSession>> =>
+    Effect.sync(() =>
+      Array.from(sessions.values())
+        .filter((ctx) => !ctx.stopped)
+        .map((ctx) => ctx.session),
+    );
 
-  const stopAll: GeminiAcpAdapterShape["stopAll"] = () =>
+  const hasSession = (threadId: ThreadId): Effect.Effect<boolean> =>
     Effect.sync(() => {
-      for (const [, ctx] of sessions) {
-        stopSessionInternal(ctx, true);
-        emit({
-          ...makeEventBase(ctx),
-          type: "session.exited",
-          payload: {
-            reason: "All sessions stopped.",
-            recoverable: false,
-            exitKind: "graceful",
-          },
-        } satisfies ProviderRuntimeEvent);
-      }
-      sessions.clear();
+      const ctx = sessions.get(threadId);
+      return !!ctx && !ctx.stopped;
     });
 
-  // ------------------------------------------------------------------
-  // Simple query methods
-  // ------------------------------------------------------------------
-
-  const listSessions: GeminiAcpAdapterShape["listSessions"] = () =>
-    Effect.succeed([...sessions.values()].map((ctx) => ctx.session));
-
-  const hasSession: GeminiAcpAdapterShape["hasSession"] = (threadId: ThreadId) =>
-    Effect.succeed(sessions.has(threadId) && !sessions.get(threadId)!.stopped);
-
-  const readThread: GeminiAcpAdapterShape["readThread"] = (threadId: ThreadId) =>
-    Effect.succeed({ threadId, turns: [] } satisfies ProviderThreadSnapshot);
-
-  const rollbackThread: GeminiAcpAdapterShape["rollbackThread"] = (
+  const readThread = (
     threadId: ThreadId,
-    _numTurns: number,
-  ) => Effect.succeed({ threadId, turns: [] } satisfies ProviderThreadSnapshot);
+  ): Effect.Effect<ProviderThreadSnapshot, ProviderAdapterError> =>
+    Effect.gen(function* () {
+      const ctx = yield* getSession(threadId);
+      return {
+        threadId,
+        turns: ctx.turns.map((t) => ({
+          id: TurnIdBrand.makeUnsafe(t.id),
+          items: t.items,
+        })),
+      };
+    });
 
-  // ------------------------------------------------------------------
-  // Cleanup
-  // ------------------------------------------------------------------
+  const rollbackThread = (
+    threadId: ThreadId,
+    numTurns: number,
+  ): Effect.Effect<ProviderThreadSnapshot, ProviderAdapterError> =>
+    Effect.gen(function* () {
+      const ctx = yield* getSession(threadId);
 
-  yield* Effect.addFinalizer(() =>
-    Effect.sync(() => {
-      for (const ctx of sessions.values()) {
-        stopSessionInternal(ctx, false);
+      // Best-effort rollback of conversation history
+      yield* Effect.sync(() => {
+        const history = ctx.geminiClient.getHistory();
+        // Each turn ≈ 2 history entries (user + assistant)
+        const entriesToRemove = numTurns * 2;
+        const newHistory = history.slice(
+          0,
+          Math.max(0, history.length - entriesToRemove),
+        );
+        ctx.geminiClient.setHistory([...newHistory]);
+      }).pipe(Effect.ignore);
+
+      // Truncate tracked turns
+      const removed = ctx.turns.splice(
+        Math.max(0, ctx.turns.length - numTurns),
+      );
+      void removed;
+      updateResumeCursor(ctx);
+
+      return {
+        threadId,
+        turns: ctx.turns.map((t) => ({
+          id: TurnIdBrand.makeUnsafe(t.id),
+          items: t.items,
+        })),
+      };
+    });
+
+  const stopAll = (): Effect.Effect<void, ProviderAdapterError> =>
+    Effect.gen(function* () {
+      const threadIds = Array.from(sessions.keys());
+      for (const threadId of threadIds) {
+        yield* stopSession(threadId as ThreadId);
       }
-      sessions.clear();
-    }).pipe(Effect.tap(() => Queue.shutdown(runtimeEventQueue))),
-  );
-
-  // ------------------------------------------------------------------
-  // Return adapter shape
-  // ------------------------------------------------------------------
+    });
 
   return GeminiAcpAdapter.of({
     provider: PROVIDER,
@@ -1375,4 +1631,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   });
 });
 
-export const GeminiAcpAdapterLive = Layer.effect(GeminiAcpAdapter, makeGeminiAcpAdapter);
+export const GeminiAcpAdapterLive = Layer.effect(
+  GeminiAcpAdapter,
+  makeGeminiAcpAdapter,
+);
