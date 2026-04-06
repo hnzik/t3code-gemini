@@ -18,10 +18,7 @@ import {
   TurnId as TurnIdBrand,
 } from "@t3tools/contracts";
 import { Effect, Layer, Option, Queue, Stream } from "effect";
-import {
-  GeminiAcpAdapter,
-  type GeminiAcpAdapterShape,
-} from "../Services/GeminiAcpAdapter";
+import { GeminiAcpAdapter, type GeminiAcpAdapterShape } from "../Services/GeminiAcpAdapter";
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter";
 import {
   ProviderAdapterProcessError,
@@ -42,10 +39,7 @@ import {
   type ToolKind,
   PROTOCOL_VERSION,
 } from "@agentclientprotocol/sdk";
-import {
-  spawn,
-  type ChildProcess as NodeChildProcess,
-} from "node:child_process";
+import { spawn, type ChildProcess as NodeChildProcess } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { Readable, Writable } from "node:stream";
 
@@ -195,9 +189,7 @@ function makeEventBase(
     provider: PROVIDER,
     threadId: ctx.session.threadId,
     createdAt: new Date().toISOString(),
-    ...(ctx.turnState
-      ? { turnId: TurnIdBrand.makeUnsafe(ctx.turnState.turnId) }
-      : {}),
+    ...(ctx.turnState ? { turnId: TurnIdBrand.makeUnsafe(ctx.turnState.turnId) } : {}),
     providerRefs: {},
   };
 }
@@ -206,9 +198,7 @@ function makeEventBase(
 // Helpers — ACP tool kind → canonical types
 // ---------------------------------------------------------------------------
 
-function mapToolKindToItemType(
-  kind: ToolKind | undefined | null,
-): CanonicalItemType {
+function mapToolKindToItemType(kind: ToolKind | undefined | null): CanonicalItemType {
   switch (kind) {
     case "read":
     case "search":
@@ -241,19 +231,13 @@ function buildTokenUsageSnapshot(
   const usedTokens = ctx.cumulativeInputTokens + ctx.cumulativeOutputTokens;
   const maxTokens = ctx.lastKnownMaxTokens ?? DEFAULT_GEMINI_CONTEXT_WINDOW;
   const totalProcessedTokens =
-    ctx.cumulativeInputTokens +
-    ctx.cumulativeOutputTokens +
-    ctx.cumulativeReasoningTokens;
+    ctx.cumulativeInputTokens + ctx.cumulativeOutputTokens + ctx.cumulativeReasoningTokens;
   return {
     usedTokens,
     ...(totalProcessedTokens > usedTokens ? { totalProcessedTokens } : {}),
     maxTokens,
-    ...(turnInputTokens !== undefined
-      ? { lastInputTokens: turnInputTokens }
-      : {}),
-    ...(turnOutputTokens !== undefined
-      ? { lastOutputTokens: turnOutputTokens }
-      : {}),
+    ...(turnInputTokens !== undefined ? { lastInputTokens: turnInputTokens } : {}),
+    ...(turnOutputTokens !== undefined ? { lastOutputTokens: turnOutputTokens } : {}),
     ...(turnReasoningTokens !== undefined
       ? { lastReasoningOutputTokens: turnReasoningTokens }
       : {}),
@@ -263,9 +247,7 @@ function buildTokenUsageSnapshot(
   } as ThreadTokenUsageSnapshot;
 }
 
-function mapToolKindToRequestType(
-  kind: ToolKind | undefined | null,
-): CanonicalRequestType {
+function mapToolKindToRequestType(kind: ToolKind | undefined | null): CanonicalRequestType {
   switch (kind) {
     case "read":
     case "search":
@@ -338,28 +320,30 @@ async function tryReadPlanFile(source: PlanFileSource): Promise<string | undefin
 function toMessage(cause: unknown, fallback: string): string {
   if (cause instanceof Error) return cause.message;
   if (typeof cause === "string") return cause;
+  // ACP SDK rejects with JSON-RPC error objects ({ code, message, data })
+  if (typeof cause === "object" && cause !== null) {
+    const obj = cause as Record<string, unknown>;
+    if (typeof obj.message === "string") return obj.message;
+    const str = String(cause);
+    if (str !== "[object Object]") return str;
+    try {
+      return JSON.stringify(cause);
+    } catch {
+      // fall through
+    }
+  }
   return fallback;
 }
 
-function toRequestError(
-  threadId: ThreadId,
-  method: string,
-  cause: unknown,
-): ProviderAdapterError {
+function toRequestError(threadId: ThreadId, method: string, cause: unknown): ProviderAdapterError {
   const message = toMessage(cause, "").toLowerCase();
-  if (
-    message.includes("session not found") ||
-    message.includes("unknown session")
-  ) {
+  if (message.includes("session not found") || message.includes("unknown session")) {
     return new ProviderAdapterSessionNotFoundError({
       provider: PROVIDER,
       threadId,
     });
   }
-  if (
-    message.includes("session is closed") ||
-    message.includes("connection closed")
-  ) {
+  if (message.includes("session is closed") || message.includes("connection closed")) {
     return new ProviderAdapterSessionClosedError({
       provider: PROVIDER,
       threadId,
@@ -377,10 +361,7 @@ function toRequestError(
 // Helpers — cleanup a single session (internal, does not throw)
 // ---------------------------------------------------------------------------
 
-function stopSessionInternal(
-  ctx: GeminiAcpSessionContext,
-  emitExitEvent: boolean,
-): void {
+function stopSessionInternal(ctx: GeminiAcpSessionContext, emitExitEvent: boolean): void {
   if (ctx.stopped) return;
   ctx.stopped = true;
 
@@ -431,14 +412,17 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             // The Gemini ACP replays the full conversation history as
             // sessionUpdate notifications on each prompt() call.
             //
+            // Layer 0 — no active turn:
+            // Between turns (after the previous turn's prompt resolved and
+            // before sendTurn sets the next turnState), any agent_message_chunk
+            // is either a late replay or a leftover from the previous prompt.
+            // Fresh model output can only arrive while a turn is active.
+            if (!ctx.turnState) {
+              break; // No active turn — definitively replay/leftover.
+            }
             // Layer 1 — messageId (if available):
-            const chunkMessageId = (
-              update as { messageId?: string | null }
-            ).messageId;
-            if (
-              chunkMessageId &&
-              ctx.completedMessageIds.has(chunkMessageId)
-            ) {
+            const chunkMessageId = (update as { messageId?: string | null }).messageId;
+            if (chunkMessageId && ctx.completedMessageIds.has(chunkMessageId)) {
               break; // Known replay — skip.
             }
             // Layer 2 — user_message_chunk timing:
@@ -447,10 +431,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             // the ACP is replaying history.  Skip agent chunks that arrive
             // within 2 s of the last user_message_chunk — real model
             // generation always has a longer processing gap.
-            if (
-              ctx.replayActive &&
-              Date.now() - ctx.lastReplaySignalTime < 2000
-            ) {
+            if (ctx.replayActive && Date.now() - ctx.lastReplaySignalTime < 2000) {
               break; // Still within replay window — skip.
             }
             // If we passed both checks, replay is over.
@@ -462,9 +443,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             ctx.turnHasFreshContent = true;
 
             const text =
-              update.content && "text" in update.content
-                ? update.content.text
-                : undefined;
+              update.content && "text" in update.content ? update.content.text : undefined;
             if (text) {
               // agent_message_chunk is always the model's visible response.
               // Reasoning/thinking is delivered via agent_thought_chunk instead.
@@ -493,6 +472,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             break;
           }
           case "tool_call": {
+            if (!ctx.turnState) break; // No active turn — replay/leftover.
             // Each tool call creates a boundary — assistant text after this
             // point should be a separate message from text before it.
             ctx.seenToolCallIds.add(update.toolCallId);
@@ -510,10 +490,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
               } satisfies ProviderRuntimeEvent);
               // Emit turn.diff.updated for file-modifying tools so that
               // CheckpointReactor captures a git checkpoint (same as Codex).
-              if (
-                update.status === "completed" &&
-                isFileModifyingKind(update.kind)
-              ) {
+              if (update.status === "completed" && isFileModifyingKind(update.kind)) {
                 emit({
                   ...base,
                   itemId,
@@ -550,13 +527,11 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             break;
           }
           case "tool_call_update": {
+            if (!ctx.turnState) break; // No active turn — replay/leftover.
             // If this is a tool call we haven't seen yet (i.e. no prior
             // tool_call event), create a segment boundary so that pre-tool
             // and post-tool assistant text become separate messages.
-            if (
-              update.toolCallId &&
-              !ctx.seenToolCallIds.has(update.toolCallId)
-            ) {
+            if (update.toolCallId && !ctx.seenToolCallIds.has(update.toolCallId)) {
               ctx.seenToolCallIds.add(update.toolCallId);
               ctx.assistantMessageSegment++;
             }
@@ -577,10 +552,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
               } satisfies ProviderRuntimeEvent);
               // Emit turn.diff.updated for file-modifying tools so that
               // CheckpointReactor captures a git checkpoint (same as Codex).
-              if (
-                update.status === "completed" &&
-                isFileModifyingKind(update.kind)
-              ) {
+              if (update.status === "completed" && isFileModifyingKind(update.kind)) {
                 emit({
                   ...base,
                   ...(itemId ? { itemId } : {}),
@@ -622,9 +594,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             // Plan has `entries` array, emit a summary as plan_text
             const entries = update.entries;
             if (entries && entries.length > 0) {
-              const text = entries
-                .map((e) => `- [${e.status}] ${e.content}`)
-                .join("\n");
+              const text = entries.map((e) => `- [${e.status}] ${e.content}`).join("\n");
               emit({
                 ...base,
                 type: "content.delta",
@@ -679,9 +649,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             // replaying conversation history.
             ctx.replayActive = true;
             ctx.lastReplaySignalTime = Date.now();
-            const chunkMessageId = (
-              update as { messageId?: string | null }
-            ).messageId;
+            const chunkMessageId = (update as { messageId?: string | null }).messageId;
             if (chunkMessageId) {
               ctx.currentTurnMessageIds.add(chunkMessageId);
             }
@@ -724,9 +692,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           // successfully presented.  Cancelling would tell the agent the
           // plan was rejected, which breaks refinement on subsequent turns
           // (the agent refuses to re-write or enters a degraded state).
-          const allowOption = request.options.find(
-            (opt) => opt.kind === "allow_once",
-          );
+          const allowOption = request.options.find((opt) => opt.kind === "allow_once");
           return {
             outcome: {
               outcome: "selected",
@@ -777,8 +743,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
     const connection = new ClientSideConnection(() => {
       const proxy: Client = {
-        sessionUpdate: (params) =>
-          clientRef.value?.sessionUpdate(params) ?? Promise.resolve(),
+        sessionUpdate: (params) => clientRef.value?.sessionUpdate(params) ?? Promise.resolve(),
         requestPermission: (params) => {
           if (clientRef.value?.requestPermission) {
             return clientRef.value.requestPermission(params);
@@ -818,9 +783,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     return undefined;
   }
 
-  const startSession: GeminiAcpAdapterShape["startSession"] = (
-    input: ProviderSessionStartInput,
-  ) =>
+  const startSession: GeminiAcpAdapterShape["startSession"] = (input: ProviderSessionStartInput) =>
     Effect.gen(function* () {
       if (input.provider !== undefined && input.provider !== PROVIDER) {
         return yield* new ProviderAdapterValidationError({
@@ -995,17 +958,13 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             ...makeEventBase(ctx),
             type: "session.exited",
             payload: {
-              reason: signal
-                ? `Process killed by ${signal}`
-                : `Process exited with code ${code}`,
+              reason: signal ? `Process killed by ${signal}` : `Process exited with code ${code}`,
               recoverable: false,
               exitKind: code === 0 ? "graceful" : "error",
             },
           } satisfies ProviderRuntimeEvent);
 
-          ctx.promptReject?.(
-            new Error("Gemini ACP process exited unexpectedly."),
-          );
+          ctx.promptReject?.(new Error("Gemini ACP process exited unexpectedly."));
         }
       });
 
@@ -1040,18 +999,13 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
   // Resolve the desired ACP session mode from T3Code's interactionMode and runtimeMode.
   // Plan mode overrides everything; otherwise runtimeMode determines approval behavior.
-  function resolveAcpModeId(
-    interactionMode: string | undefined,
-    runtimeMode: string,
-  ): string {
+  function resolveAcpModeId(interactionMode: string | undefined, runtimeMode: string): string {
     if (interactionMode === "plan") return "plan";
     if (runtimeMode === "full-access") return "autoEdit";
     return "default";
   }
 
-  const sendTurn: GeminiAcpAdapterShape["sendTurn"] = (
-    input: ProviderSendTurnInput,
-  ) =>
+  const sendTurn: GeminiAcpAdapterShape["sendTurn"] = (input: ProviderSendTurnInput) =>
     Effect.gen(function* () {
       const ctx = sessions.get(input.threadId);
       if (!ctx) {
@@ -1068,10 +1022,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       }
 
       // Sync interaction mode + runtime mode to ACP session mode before sending the turn
-      const desiredAcpMode = resolveAcpModeId(
-        input.interactionMode,
-        ctx.session.runtimeMode,
-      );
+      const desiredAcpMode = resolveAcpModeId(input.interactionMode, ctx.session.runtimeMode);
       if (desiredAcpMode !== ctx.currentAcpMode) {
         const result = yield* Effect.tryPromise(() =>
           ctx.connection.setSessionMode({
@@ -1125,16 +1076,11 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       const promptPromise = ctx.connection
         .prompt({
           sessionId: ctx.acpSessionId,
-          prompt:
-            promptBlocks.length > 0
-              ? promptBlocks
-              : [{ type: "text", text: "" }],
+          prompt: promptBlocks.length > 0 ? promptBlocks : [{ type: "text", text: "" }],
         })
         .then((response) => {
           const state =
-            response.stopReason === "cancelled"
-              ? ("cancelled" as const)
-              : ("completed" as const);
+            response.stopReason === "cancelled" ? ("cancelled" as const) : ("completed" as const);
 
           // Extract token usage from the prompt response.
           // Gemini CLI returns usage in _meta.quota.token_count; the ACP SDK
@@ -1156,13 +1102,9 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             | undefined;
 
           const turnInputTokens =
-            acpUsage?.inputTokens ??
-            quota?.token_count?.input_tokens ??
-            undefined;
+            acpUsage?.inputTokens ?? quota?.token_count?.input_tokens ?? undefined;
           const turnOutputTokens =
-            acpUsage?.outputTokens ??
-            quota?.token_count?.output_tokens ??
-            undefined;
+            acpUsage?.outputTokens ?? quota?.token_count?.output_tokens ?? undefined;
           const turnReasoningTokens = acpUsage?.thoughtTokens ?? undefined;
 
           if (turnInputTokens !== undefined || turnOutputTokens !== undefined) {
@@ -1200,13 +1142,15 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           ctx.promptReject = undefined;
         })
         .catch((error: unknown) => {
+          const detail = toMessage(error, "Turn failed.");
+          console.error(`[gemini-acp] prompt() rejected:`, error);
           if (!ctx.stopped) {
             emit({
               ...makeEventBase(ctx),
               type: "turn.completed",
               payload: {
                 state: "failed",
-                errorMessage: toMessage(error, "Turn failed."),
+                errorMessage: detail,
               },
             } satisfies ProviderRuntimeEvent);
           }
@@ -1294,10 +1238,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         pending.resolve({
           outcome: {
             outcome: "selected",
-            optionId:
-              decision === "acceptForSession"
-                ? "proceed_always"
-                : "proceed_once",
+            optionId: decision === "acceptForSession" ? "proceed_always" : "proceed_once",
           },
         });
       } else {
@@ -1321,9 +1262,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   // Adapter method: stopSession
   // ------------------------------------------------------------------
 
-  const stopSession: GeminiAcpAdapterShape["stopSession"] = (
-    threadId: ThreadId,
-  ) =>
+  const stopSession: GeminiAcpAdapterShape["stopSession"] = (threadId: ThreadId) =>
     Effect.gen(function* () {
       const ctx = sessions.get(threadId);
       if (!ctx) {
@@ -1388,14 +1327,11 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   const listSessions: GeminiAcpAdapterShape["listSessions"] = () =>
     Effect.succeed([...sessions.values()].map((ctx) => ctx.session));
 
-  const hasSession: GeminiAcpAdapterShape["hasSession"] = (
-    threadId: ThreadId,
-  ) =>
+  const hasSession: GeminiAcpAdapterShape["hasSession"] = (threadId: ThreadId) =>
     Effect.succeed(sessions.has(threadId) && !sessions.get(threadId)!.stopped);
 
-  const readThread: GeminiAcpAdapterShape["readThread"] = (
-    threadId: ThreadId,
-  ) => Effect.succeed({ threadId, turns: [] } satisfies ProviderThreadSnapshot);
+  const readThread: GeminiAcpAdapterShape["readThread"] = (threadId: ThreadId) =>
+    Effect.succeed({ threadId, turns: [] } satisfies ProviderThreadSnapshot);
 
   const rollbackThread: GeminiAcpAdapterShape["rollbackThread"] = (
     threadId: ThreadId,
@@ -1439,7 +1375,4 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   });
 });
 
-export const GeminiAcpAdapterLive = Layer.effect(
-  GeminiAcpAdapter,
-  makeGeminiAcpAdapter,
-);
+export const GeminiAcpAdapterLive = Layer.effect(GeminiAcpAdapter, makeGeminiAcpAdapter);
