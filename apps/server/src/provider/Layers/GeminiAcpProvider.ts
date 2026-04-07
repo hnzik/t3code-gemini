@@ -78,6 +78,7 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
       BUILT_IN_MODELS,
       PROVIDER,
       geminiSettings.customModels,
+      GEMINI_MODEL_CAPABILITIES,
     );
 
     if (!geminiSettings.enabled) {

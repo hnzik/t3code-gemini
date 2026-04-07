@@ -47,6 +47,7 @@ import {
   LegacyAgentSession,
   MessageBusType,
   ApprovalMode,
+  QuestionType,
   ROOT_SCHEDULER_ID,
   Scheduler,
   ToolConfirmationOutcome,
@@ -55,6 +56,7 @@ import {
   type ContentPart,
   type GeminiClient,
   type MessageBus,
+  type Question,
   type ToolConfirmationRequest,
 } from "@google/gemini-cli-core";
 
@@ -127,7 +129,7 @@ You are in **Plan Mode**. Your ONLY job is to collaborate with the user on a pla
 
 **Phase 1 — Ground in the environment.** Explore the codebase. Read files, search code, inspect types. Discover facts before asking the user.
 
-**Phase 2 — Clarify intent.** Ask about goals, scope, constraints, and preferences. Do not guess on high-impact ambiguities.
+**Phase 2 — Clarify intent.** Ask about goals, scope, constraints, and preferences. Do not guess on high-impact ambiguities. When you need the user's answer before you can finish or refine the plan, use the \`ask_user\` tool instead of burying the question in normal assistant text. Prefer short multiple-choice questions with 2-4 strong options when possible; use free-text only when needed. After calling \`ask_user\`, stop and wait for the answer.
 
 **Phase 3 — Refine the plan.** Iterate until the plan is decision-complete: approach, interfaces, data flow, edge cases, testing, and rollout.
 
@@ -172,6 +174,7 @@ const GEMINI_PLAN_MODE_REMINDER = `<plan_mode_reminder>
 You are still in **Plan Mode**. Reminders:
 - **DO NOT edit, write, or create any files.** No \`write_file\`, no \`cat >\`, no heredocs, no shell writes. File mutations are blocked and the turn will be cancelled.
 - **Present your plan ONLY using \`<proposed_plan>\` tags in your text response.** This is the only way the client captures the plan. Do not write the plan to a file.
+- If you need a blocking clarification to continue planning, use the \`ask_user\` tool and then stop until the user answers.
 - If the user is asking a question or giving feedback, respond in text. Only output a \`<proposed_plan>\` block when you have a complete or updated plan to present.
 </plan_mode_reminder>`;
 
@@ -189,10 +192,27 @@ interface PendingApproval {
   readonly requestType: CanonicalRequestType;
   readonly detail: string;
   readonly correlationId: string;
-  resolve: (response: {
-    confirmed: boolean;
-    outcome: ToolConfirmationOutcome;
-  }) => void;
+  resolve: (response: { confirmed: boolean; outcome: ToolConfirmationOutcome }) => void;
+}
+
+interface GeminiUserInputQuestionOption {
+  readonly label: string;
+  readonly description: string;
+}
+
+interface GeminiUserInputQuestion {
+  readonly id: string;
+  readonly header: string;
+  readonly question: string;
+  readonly options: ReadonlyArray<GeminiUserInputQuestionOption>;
+  readonly multiSelect?: boolean;
+}
+
+interface PendingUserInput {
+  readonly detail: string;
+  readonly correlationId: string;
+  readonly questions: ReadonlyArray<GeminiUserInputQuestion>;
+  resolve: (answers: ProviderUserInputAnswers | undefined) => void;
 }
 
 interface ToolInFlight {
@@ -219,6 +239,7 @@ interface GeminiSessionContext {
   turnState: GeminiTurnState | undefined;
   stopped: boolean;
   readonly pendingApprovals: Map<string, PendingApproval>;
+  readonly pendingUserInputs: Map<string, PendingUserInput>;
   // Plan mode
   userRequestedMode: string;
   planModePromptSent: boolean;
@@ -253,17 +274,13 @@ function nextEventId(): string {
   return `evt-gemini-${Date.now()}-${++eventCounter}`;
 }
 
-function makeEventBase(
-  ctx: GeminiSessionContext,
-): Omit<ProviderRuntimeEvent, "type" | "payload"> {
+function makeEventBase(ctx: GeminiSessionContext): Omit<ProviderRuntimeEvent, "type" | "payload"> {
   return {
     eventId: EventId.makeUnsafe(nextEventId()),
     provider: PROVIDER,
     threadId: ctx.session.threadId,
     createdAt: new Date().toISOString(),
-    ...(ctx.turnState
-      ? { turnId: TurnIdBrand.makeUnsafe(ctx.turnState.turnId) }
-      : {}),
+    ...(ctx.turnState ? { turnId: TurnIdBrand.makeUnsafe(ctx.turnState.turnId) } : {}),
     providerRefs: {},
   };
 }
@@ -350,15 +367,10 @@ function isFileModifyingTool(name: string): boolean {
   );
 }
 
-function isShellWriteTool(
-  name: string,
-  args: Record<string, unknown>,
-): boolean {
+function isShellWriteTool(name: string, args: Record<string, unknown>): boolean {
   if (!name.toLowerCase().includes("shell")) return false;
   const cmd = String(args.command ?? args.cmd ?? "").toLowerCase();
-  return /\b(cat\s*>|echo\s*>|tee\s|cp\s|mv\s|sed\s+-i|rm\s|mkdir|touch)\b/.test(
-    cmd,
-  );
+  return /\b(cat\s*>|echo\s*>|tee\s|cp\s|mv\s|sed\s+-i|rm\s|mkdir|touch)\b/.test(cmd);
 }
 
 function titleForToolType(type: CanonicalItemType): string {
@@ -380,18 +392,372 @@ function titleForToolType(type: CanonicalItemType): string {
   }
 }
 
+function normalizeGeminiAskUserOption(option: unknown): GeminiUserInputQuestionOption | undefined {
+  if (!option || typeof option !== "object") {
+    return undefined;
+  }
+
+  const candidate = option as Record<string, unknown>;
+  const label = typeof candidate.label === "string" ? candidate.label.trim() : "";
+  const description =
+    typeof candidate.description === "string" ? candidate.description.trim() : label;
+
+  if (!label) {
+    return undefined;
+  }
+
+  return {
+    label,
+    description: description || label,
+  };
+}
+
+function fallbackOptionsForGeminiQuestion(question: {
+  readonly type?: unknown;
+  readonly placeholder?: unknown;
+}): ReadonlyArray<GeminiUserInputQuestionOption> {
+  if (question.type === QuestionType.YESNO) {
+    return [
+      { label: "Yes", description: "Yes" },
+      { label: "No", description: "No" },
+    ];
+  }
+
+  const placeholder = typeof question.placeholder === "string" ? question.placeholder.trim() : "";
+
+  return [
+    {
+      label: "Use custom answer",
+      description: placeholder || "Type your answer in the composer below",
+    },
+  ];
+}
+
+export function normalizeGeminiAskUserQuestions(
+  rawQuestions: unknown,
+): ReadonlyArray<GeminiUserInputQuestion> {
+  if (!Array.isArray(rawQuestions)) {
+    return [];
+  }
+
+  return rawQuestions
+    .map<GeminiUserInputQuestion | null>((entry, index) => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+
+      const question = entry as Question;
+      const prompt = typeof question.question === "string" ? question.question.trim() : "";
+      if (!prompt) {
+        return null;
+      }
+
+      const header =
+        typeof question.header === "string" && question.header.trim().length > 0
+          ? question.header.trim()
+          : `Question ${index + 1}`;
+
+      const normalizedOptions = Array.isArray(question.options)
+        ? question.options
+            .map((option) => normalizeGeminiAskUserOption(option))
+            .filter((option): option is GeminiUserInputQuestionOption => option !== undefined)
+        : [];
+
+      const options =
+        normalizedOptions.length > 0
+          ? normalizedOptions
+          : fallbackOptionsForGeminiQuestion(question);
+
+      return {
+        id: `q-${index}`,
+        header,
+        question: prompt,
+        options,
+        ...(typeof question.multiSelect === "boolean" ? { multiSelect: question.multiSelect } : {}),
+      };
+    })
+    .filter((question): question is GeminiUserInputQuestion => question !== null);
+}
+
+export function buildGeminiAskUserResponseAnswers(input: {
+  readonly questions: ReadonlyArray<GeminiUserInputQuestion>;
+  readonly answers: ProviderUserInputAnswers;
+}): Record<string, string> {
+  const indexedAnswers: Record<string, string> = {};
+
+  for (const [index, question] of input.questions.entries()) {
+    const answer =
+      input.answers[question.id] ??
+      input.answers[String(index)] ??
+      input.answers[question.question];
+
+    if (typeof answer !== "string") {
+      continue;
+    }
+
+    const trimmed = answer.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    indexedAnswers[String(index)] = trimmed;
+  }
+
+  return indexedAnswers;
+}
+
+function openGeminiUserInputRequest(input: {
+  readonly ctx: GeminiSessionContext;
+  readonly messageBus: MessageBus;
+  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
+  readonly correlationId: string;
+  readonly rawQuestions: unknown;
+  readonly responseChannel: "tool_confirmation" | "ask_user";
+}): boolean {
+  const questions = normalizeGeminiAskUserQuestions(input.rawQuestions);
+  if (questions.length === 0) {
+    if (input.responseChannel === "tool_confirmation") {
+      void input.messageBus.publish({
+        type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+        correlationId: input.correlationId,
+        confirmed: false,
+        outcome: ToolConfirmationOutcome.Cancel,
+      });
+    } else {
+      void input.messageBus.publish({
+        type: MessageBusType.ASK_USER_RESPONSE,
+        correlationId: input.correlationId,
+        answers: {},
+        cancelled: true,
+      } as never);
+    }
+    return false;
+  }
+
+  const requestId = `user-input-${input.correlationId}`;
+  if (input.ctx.pendingUserInputs.has(requestId)) {
+    return true;
+  }
+
+  input.ctx.pendingUserInputs.set(requestId, {
+    detail: questions[0]?.question ?? "User input requested",
+    correlationId: input.correlationId,
+    questions,
+    resolve: (answers) => {
+      if (input.responseChannel === "tool_confirmation") {
+        void input.messageBus.publish({
+          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+          correlationId: input.correlationId,
+          confirmed: answers !== undefined,
+          outcome:
+            answers === undefined
+              ? ToolConfirmationOutcome.Cancel
+              : ToolConfirmationOutcome.ProceedOnce,
+          ...(answers
+            ? {
+                payload: {
+                  answers: buildGeminiAskUserResponseAnswers({ questions, answers }),
+                },
+              }
+            : {}),
+        });
+        return;
+      }
+
+      void input.messageBus.publish({
+        type: MessageBusType.ASK_USER_RESPONSE,
+        correlationId: input.correlationId,
+        answers: answers ? buildGeminiAskUserResponseAnswers({ questions, answers }) : {},
+        ...(answers ? {} : { cancelled: true }),
+      } as never);
+    },
+  });
+
+  const { ctx } = input;
+  input.emitEvent({
+    ...makeEventBase(ctx),
+    requestId: RuntimeRequestId.makeUnsafe(requestId),
+    type: "user-input.requested",
+    payload: {
+      questions,
+    },
+  } as ProviderRuntimeEvent);
+  return true;
+}
+
+function openGeminiUserInputRequestFromScheduler(input: {
+  readonly ctx: GeminiSessionContext;
+  readonly scheduler: Scheduler;
+  readonly messageBus: MessageBus;
+  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
+}): boolean {
+  const schedulerState = (
+    input.scheduler as unknown as {
+      state?: {
+        allActiveCalls?: ReadonlyArray<{
+          status?: string;
+          correlationId?: string;
+          confirmationDetails?: { type?: string; questions?: unknown };
+        }>;
+      };
+    }
+  ).state;
+
+  const waitingAskUserCall = schedulerState?.allActiveCalls?.find(
+    (call) =>
+      call.status === "awaiting_approval" &&
+      typeof call.correlationId === "string" &&
+      call.confirmationDetails?.type === "ask_user",
+  );
+
+  if (!waitingAskUserCall?.correlationId) {
+    return false;
+  }
+
+  return openGeminiUserInputRequest({
+    ctx: input.ctx,
+    messageBus: input.messageBus,
+    emitEvent: input.emitEvent,
+    correlationId: waitingAskUserCall.correlationId,
+    rawQuestions: waitingAskUserCall.confirmationDetails?.questions,
+    responseChannel: "tool_confirmation",
+  });
+}
+
+interface GeminiSchedulerAwaitingApprovalCall {
+  readonly status?: string;
+  readonly correlationId?: string;
+  readonly request?: {
+    readonly name?: string;
+    readonly args?: unknown;
+  };
+  readonly confirmationDetails?: {
+    readonly type?: string;
+    readonly fileName?: string;
+    readonly command?: string;
+    readonly toolName?: string;
+    readonly toolDisplayName?: string;
+    readonly prompt?: string;
+  };
+}
+
+interface GeminiSchedulerApprovalRequest {
+  readonly correlationId: string;
+  readonly requestType: CanonicalRequestType;
+  readonly detail: string;
+  readonly args: Record<string, unknown>;
+}
+
+function buildGeminiSchedulerApprovalDetail(call: GeminiSchedulerAwaitingApprovalCall): string {
+  const details = call.confirmationDetails;
+  if (!details) {
+    return call.request?.name ?? "Tool operation";
+  }
+
+  switch (details.type) {
+    case "edit":
+      return `Edit ${details.fileName ?? "file"}`;
+    case "exec":
+      return details.command ?? "Execute command";
+    case "mcp":
+      return `MCP: ${details.toolDisplayName ?? details.toolName ?? "tool"}`;
+    case "info":
+      return details.prompt ?? call.request?.name ?? "Tool operation";
+    case "exit_plan_mode":
+      return "Exit plan mode";
+    default:
+      return call.request?.name ?? "Tool operation";
+  }
+}
+
+export function extractGeminiSchedulerApprovalRequest(
+  call: GeminiSchedulerAwaitingApprovalCall,
+): GeminiSchedulerApprovalRequest | undefined {
+  if (
+    call.status !== "awaiting_approval" ||
+    typeof call.correlationId !== "string" ||
+    typeof call.request?.name !== "string" ||
+    call.confirmationDetails?.type === "ask_user"
+  ) {
+    return undefined;
+  }
+
+  return {
+    correlationId: call.correlationId,
+    requestType: classifyRequestTypeForTool(call.request.name),
+    detail: buildGeminiSchedulerApprovalDetail(call),
+    args:
+      call.request.args &&
+      typeof call.request.args === "object" &&
+      !Array.isArray(call.request.args)
+        ? (call.request.args as Record<string, unknown>)
+        : {},
+  };
+}
+
+function openGeminiApprovalRequestFromScheduler(input: {
+  readonly ctx: GeminiSessionContext;
+  readonly scheduler: Scheduler;
+  readonly messageBus: MessageBus;
+  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
+}): boolean {
+  const schedulerState = (
+    input.scheduler as unknown as {
+      state?: {
+        allActiveCalls?: ReadonlyArray<GeminiSchedulerAwaitingApprovalCall>;
+      };
+    }
+  ).state;
+
+  const approval = schedulerState?.allActiveCalls
+    ?.map((call) => extractGeminiSchedulerApprovalRequest(call))
+    .find((call): call is GeminiSchedulerApprovalRequest => call !== undefined);
+
+  if (!approval) {
+    return false;
+  }
+
+  const requestId = `req-${approval.correlationId}`;
+  if (input.ctx.pendingApprovals.has(requestId)) {
+    return true;
+  }
+
+  input.ctx.pendingApprovals.set(requestId, {
+    requestType: approval.requestType,
+    detail: approval.detail,
+    correlationId: approval.correlationId,
+    resolve: (response) => {
+      void input.messageBus.publish({
+        type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+        correlationId: approval.correlationId,
+        confirmed: response.confirmed,
+        outcome: response.outcome,
+      });
+    },
+  });
+
+  input.emitEvent({
+    ...makeEventBase(input.ctx),
+    requestId: RuntimeRequestId.makeUnsafe(requestId),
+    type: "request.opened",
+    payload: {
+      requestType: approval.requestType,
+      detail: approval.detail,
+      args: approval.args,
+    },
+  } as ProviderRuntimeEvent);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — proposed plan extraction (exported for tests)
 // ---------------------------------------------------------------------------
 
-const PROPOSED_PLAN_BLOCK_REGEX =
-  /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i;
+const PROPOSED_PLAN_BLOCK_REGEX = /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i;
 const PROPOSED_PLAN_OPEN_TAG = "<proposed_plan>";
 const PROPOSED_PLAN_CLOSE_TAG = "</proposed_plan>";
 
-function extractProposedPlanMarkdown(
-  text: string | undefined,
-): string | undefined {
+function extractProposedPlanMarkdown(text: string | undefined): string | undefined {
   const match = text ? PROPOSED_PLAN_BLOCK_REGEX.exec(text) : null;
   const planMarkdown = match?.[1]?.trim();
   return planMarkdown && planMarkdown.length > 0 ? planMarkdown : undefined;
@@ -415,14 +781,8 @@ export function extractVisibleAssistantText(rawText: string): string {
     const openTagIndex = rawText.indexOf(PROPOSED_PLAN_OPEN_TAG, cursor);
     if (openTagIndex === -1) {
       const trailingText = rawText.slice(cursor);
-      const holdBackLength = trailingTagPrefixLength(
-        trailingText,
-        PROPOSED_PLAN_OPEN_TAG,
-      );
-      visibleText += trailingText.slice(
-        0,
-        trailingText.length - holdBackLength,
-      );
+      const holdBackLength = trailingTagPrefixLength(trailingText, PROPOSED_PLAN_OPEN_TAG);
+      visibleText += trailingText.slice(0, trailingText.length - holdBackLength);
       break;
     }
 
@@ -505,14 +865,10 @@ export function formatAgentThoughtText(input: {
 }): string {
   const thought = input.thought.trim();
   if (!input.subject) return thought;
-  return thought.length > 0
-    ? `**${input.subject}** ${thought}`
-    : `**${input.subject}**`;
+  return thought.length > 0 ? `**${input.subject}** ${thought}` : `**${input.subject}**`;
 }
 
-function isTextContentPart(
-  part: ContentPart,
-): part is Extract<ContentPart, { type: "text" }> {
+function isTextContentPart(part: ContentPart): part is Extract<ContentPart, { type: "text" }> {
   return part.type === "text";
 }
 
@@ -526,12 +882,8 @@ function buildTokenUsageSnapshot(
   return {
     usedTokens,
     maxTokens,
-    ...(turnInputTokens !== undefined
-      ? { lastInputTokens: turnInputTokens }
-      : {}),
-    ...(turnOutputTokens !== undefined
-      ? { lastOutputTokens: turnOutputTokens }
-      : {}),
+    ...(turnInputTokens !== undefined ? { lastInputTokens: turnInputTokens } : {}),
+    ...(turnOutputTokens !== undefined ? { lastOutputTokens: turnOutputTokens } : {}),
     ...(turnInputTokens !== undefined || turnOutputTokens !== undefined
       ? { lastUsedTokens: (turnInputTokens ?? 0) + (turnOutputTokens ?? 0) }
       : {}),
@@ -565,14 +917,8 @@ export function resolveGeminiAuthType(
   return authTypeFromEnv ?? AuthType.LOGIN_WITH_GOOGLE;
 }
 
-export function readGeminiResumeState(
-  resumeCursor: unknown,
-): GeminiResumeState | undefined {
-  if (
-    !resumeCursor ||
-    typeof resumeCursor !== "object" ||
-    Array.isArray(resumeCursor)
-  ) {
+export function readGeminiResumeState(resumeCursor: unknown): GeminiResumeState | undefined {
+  if (!resumeCursor || typeof resumeCursor !== "object" || Array.isArray(resumeCursor)) {
     return undefined;
   }
 
@@ -605,28 +951,7 @@ function createGeminiResumeState(ctx: GeminiSessionContext): GeminiResumeState {
 }
 
 function updateResumeCursor(ctx: GeminiSessionContext): void {
-  (ctx.session as { resumeCursor?: unknown }).resumeCursor =
-    createGeminiResumeState(ctx);
-}
-
-function buildToolDetail(request: ToolConfirmationRequest): string {
-  const details = request.details;
-  if (!details) return request.toolCall?.name ?? "Unknown tool";
-
-  switch (details.type) {
-    case "edit":
-      return `Edit ${details.fileName}`;
-    case "exec":
-      return details.command ?? "Execute command";
-    case "mcp":
-      return `MCP: ${details.toolDisplayName ?? details.toolName}`;
-    case "ask_user":
-      return details.questions?.[0]?.question ?? "User input requested";
-    case "exit_plan_mode":
-      return "Exit plan mode";
-    default:
-      return request.toolCall?.name ?? "Tool operation";
-  }
+  (ctx.session as { resumeCursor?: unknown }).resumeCursor = createGeminiResumeState(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -672,9 +997,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       );
     }
     if (ctx.stopped) {
-      return Effect.fail(
-        new ProviderAdapterSessionClosedError({ provider: PROVIDER, threadId }),
-      );
+      return Effect.fail(new ProviderAdapterSessionClosedError({ provider: PROVIDER, threadId }));
     }
     return Effect.succeed(ctx);
   };
@@ -683,16 +1006,29 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   // MessageBus tool confirmation handler
   // ---------------------------------------------------------------------------
 
-  function setupMessageBusHandlers(
-    ctx: GeminiSessionContext,
-    messageBus: MessageBus,
-  ): void {
+  function setupMessageBusHandlers(ctx: GeminiSessionContext, messageBus: MessageBus): void {
     const handleConfirmation = (request: ToolConfirmationRequest): void => {
       if (ctx.stopped || !ctx.turnState) return;
 
       const toolName = request.toolCall?.name ?? "unknown";
       const correlationId = request.correlationId;
       const args = (request.toolCall?.args ?? {}) as Record<string, unknown>;
+      const askUserQuestions =
+        request.details?.type === "ask_user"
+          ? normalizeGeminiAskUserQuestions(request.details.questions)
+          : undefined;
+
+      if (askUserQuestions && askUserQuestions.length > 0) {
+        openGeminiUserInputRequest({
+          ctx,
+          messageBus,
+          emitEvent: emit,
+          correlationId,
+          rawQuestions: askUserQuestions,
+          responseChannel: "tool_confirmation",
+        });
+        return;
+      }
 
       // Plan mode: auto-deny file-modifying tools, auto-approve read-only
       if (ctx.userRequestedMode === "plan") {
@@ -732,47 +1068,11 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         });
         return;
       }
-
-      // Approval-required mode: emit request to UI
-      const requestType = classifyRequestTypeForTool(toolName);
-      const detail = buildToolDetail(request);
-      const requestId = `req-${correlationId}`;
-
-      ctx.pendingApprovals.set(requestId, {
-        requestType,
-        detail,
-        correlationId,
-        resolve: (response) => {
-          void messageBus.publish({
-            type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-            correlationId,
-            confirmed: response.confirmed,
-            outcome: response.outcome,
-          });
-        },
-      });
-
-      emit({
-        ...makeEventBase(ctx),
-        requestId: RuntimeRequestId.makeUnsafe(requestId),
-        type: "request.opened",
-        payload: {
-          requestType,
-          detail,
-          args,
-        },
-      } as ProviderRuntimeEvent);
     };
 
-    messageBus.subscribe(
-      MessageBusType.TOOL_CONFIRMATION_REQUEST,
-      handleConfirmation as any,
-    );
+    messageBus.subscribe(MessageBusType.TOOL_CONFIRMATION_REQUEST, handleConfirmation as any);
     ctx.messageBusUnsubscribers.push(() => {
-      messageBus.unsubscribe(
-        MessageBusType.TOOL_CONFIRMATION_REQUEST,
-        handleConfirmation as any,
-      );
+      messageBus.unsubscribe(MessageBusType.TOOL_CONFIRMATION_REQUEST, handleConfirmation as any);
     });
 
     // Handle ask_user requests
@@ -780,47 +1080,19 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       if (ctx.stopped || !ctx.turnState) return;
 
       const correlationId = request.correlationId as string;
-      const questions = (request.questions ?? []) as Array<{
-        question: string;
-        header?: string;
-      }>;
-      const requestId = `user-input-${correlationId}`;
-
-      ctx.pendingApprovals.set(requestId, {
-        requestType: "tool_user_input",
-        detail: questions[0]?.question ?? "User input requested",
+      openGeminiUserInputRequest({
+        ctx,
+        messageBus,
+        emitEvent: emit,
         correlationId,
-        resolve: (response) => {
-          void messageBus.publish({
-            type: MessageBusType.ASK_USER_RESPONSE,
-            correlationId,
-            confirmed: response.confirmed,
-            outcome: response.outcome,
-          } as never);
-        },
+        rawQuestions: request.questions,
+        responseChannel: "ask_user",
       });
-
-      emit({
-        ...makeEventBase(ctx),
-        requestId: RuntimeRequestId.makeUnsafe(requestId),
-        type: "user-input.requested",
-        payload: {
-          questions: questions.map((q, i) => ({
-            id: `q-${i}`,
-            header: q.header ?? "Question",
-            question: q.question,
-            options: [],
-          })),
-        },
-      } as ProviderRuntimeEvent);
     };
 
     messageBus.subscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
     ctx.messageBusUnsubscribers.push(() => {
-      messageBus.unsubscribe(
-        MessageBusType.ASK_USER_REQUEST,
-        handleAskUser as any,
-      );
+      messageBus.unsubscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
     });
   }
 
@@ -851,10 +1123,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     } as ProviderRuntimeEvent);
   }
 
-  function emitReasoningText(
-    ctx: GeminiSessionContext,
-    thoughtText: string,
-  ): void {
+  function emitReasoningText(ctx: GeminiSessionContext, thoughtText: string): void {
     if (!ctx.turnState) return;
 
     if (!ctx.turnState.reasoningItemEmitted) {
@@ -882,10 +1151,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     } as ProviderRuntimeEvent);
   }
 
-  function handleAgentEvent(
-    ctx: GeminiSessionContext,
-    event: AgentEvent,
-  ): void {
+  function handleAgentEvent(ctx: GeminiSessionContext, event: AgentEvent): void {
     if (!ctx.turnState) return;
 
     switch (event.type) {
@@ -903,10 +1169,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
               ctx,
               formatAgentThoughtText({
                 thought: part.thought,
-                subject:
-                  typeof event._meta?.subject === "string"
-                    ? event._meta.subject
-                    : undefined,
+                subject: typeof event._meta?.subject === "string" ? event._meta.subject : undefined,
               }),
             );
           }
@@ -964,9 +1227,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         if (outputParts && outputParts.length > 0) {
           const outputText = outputParts.map((part) => part.text).join("\n");
           const streamKind =
-            tool.itemType === "command_execution"
-              ? "command_output"
-              : "file_change_output";
+            tool.itemType === "command_execution" ? "command_output" : "file_change_output";
           emit({
             ...makeEventBase(ctx),
             itemId: RuntimeItemId.makeUnsafe(tool.itemId),
@@ -997,11 +1258,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       }
 
       case "error": {
-        console.error(
-          "[gemini] Agent session error event:",
-          event.message,
-          event._meta,
-        );
+        console.error("[gemini] Agent session error event:", event.message, event._meta);
         break;
       }
 
@@ -1035,16 +1292,33 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   // Stream loop — background turn processing
   // ---------------------------------------------------------------------------
 
-  async function runStreamLoop(
-    ctx: GeminiSessionContext,
-    promptText: string,
-  ): Promise<void> {
+  async function runStreamLoop(ctx: GeminiSessionContext, promptText: string): Promise<void> {
     const promptId = `prompt-${Date.now()}`;
-    const scheduler = new Scheduler({
+    let scheduler: Scheduler;
+    scheduler = new Scheduler({
       context: ctx.config,
       messageBus: ctx.config.getMessageBus(),
       getPreferredEditor: () => undefined,
       schedulerId: ROOT_SCHEDULER_ID,
+      onWaitingForConfirmation: (waiting) => {
+        if (!waiting || ctx.stopped || !ctx.turnState) {
+          return;
+        }
+
+        openGeminiApprovalRequestFromScheduler({
+          ctx,
+          scheduler,
+          messageBus: ctx.config.getMessageBus(),
+          emitEvent: emit,
+        });
+
+        openGeminiUserInputRequestFromScheduler({
+          ctx,
+          scheduler,
+          messageBus: ctx.config.getMessageBus(),
+          emitEvent: emit,
+        });
+      },
     });
     const agentSession = new LegacyAgentSession({
       client: ctx.geminiClient,
@@ -1142,6 +1416,19 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     }
     ctx.pendingApprovals.clear();
 
+    for (const [requestId, pending] of ctx.pendingUserInputs) {
+      pending.resolve(undefined);
+      emit({
+        ...makeEventBase(ctx),
+        requestId: RuntimeRequestId.makeUnsafe(requestId),
+        type: "user-input.resolved",
+        payload: {
+          answers: {},
+        },
+      } as ProviderRuntimeEvent);
+    }
+    ctx.pendingUserInputs.clear();
+
     // Extract proposed plan from assistant text
     if (ctx.userRequestedMode === "plan") {
       const plan = extractProposedPlanMarkdown(ctx.turnAssistantText);
@@ -1228,10 +1515,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         model: modelId,
         clientVersion: "0.36.0",
         debugMode: false,
-        approvalMode:
-          runtimeMode === "full-access"
-            ? ApprovalMode.AUTO_EDIT
-            : ApprovalMode.DEFAULT,
+        approvalMode: runtimeMode === "full-access" ? ApprovalMode.AUTO_EDIT : ApprovalMode.DEFAULT,
         interactive: true,
         ptyInfo: "node-pty",
         acpMode: true,
@@ -1264,9 +1548,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
       yield* Effect.tryPromise({
         try: () =>
-          resumeState
-            ? geminiClient.resumeChat([...resumeState.history])
-            : Promise.resolve(),
+          resumeState ? geminiClient.resumeChat([...resumeState.history]) : Promise.resolve(),
         catch: (cause) =>
           new ProviderAdapterProcessError({
             provider: PROVIDER,
@@ -1296,6 +1578,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         turnState: undefined,
         stopped: false,
         pendingApprovals: new Map(),
+        pendingUserInputs: new Map(),
         userRequestedMode: "default",
         planModePromptSent: false,
         defaultModePromptSent: false,
@@ -1371,13 +1654,12 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       ctx.abortController = new AbortController();
 
       // Build prompt
-      const { promptBlocks, planModePromptSent, defaultModePromptSent } =
-        buildGeminiPromptBlocks({
-          interactionMode,
-          userInput: input.input?.trim(),
-          planModePromptSent: ctx.planModePromptSent,
-          defaultModePromptSent: ctx.defaultModePromptSent,
-        });
+      const { promptBlocks, planModePromptSent, defaultModePromptSent } = buildGeminiPromptBlocks({
+        interactionMode,
+        userInput: input.input?.trim(),
+        planModePromptSent: ctx.planModePromptSent,
+        defaultModePromptSent: ctx.defaultModePromptSent,
+      });
       ctx.planModePromptSent = planModePromptSent;
       ctx.defaultModePromptSent = defaultModePromptSent;
 
@@ -1385,8 +1667,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
       // Update session status (cast to mutable for internal tracking)
       (ctx.session as { status: string }).status = "running";
-      (ctx.session as { activeTurnId?: TurnId }).activeTurnId =
-        TurnIdBrand.makeUnsafe(turnId);
+      (ctx.session as { activeTurnId?: TurnId }).activeTurnId = TurnIdBrand.makeUnsafe(turnId);
       (ctx.session as { updatedAt: string }).updatedAt = now;
 
       // Emit turn started
@@ -1443,8 +1724,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
       ctx.pendingApprovals.delete(requestId);
 
-      const confirmed =
-        decision === "accept" || decision === "acceptForSession";
+      const confirmed = decision === "accept" || decision === "acceptForSession";
       const outcome = confirmed
         ? decision === "acceptForSession"
           ? ToolConfirmationOutcome.ProceedAlways
@@ -1471,7 +1751,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   ): Effect.Effect<void, ProviderAdapterError> =>
     Effect.gen(function* () {
       const ctx = yield* getSession(threadId);
-      const pending = ctx.pendingApprovals.get(requestId);
+      const pending = ctx.pendingUserInputs.get(requestId);
       if (!pending) {
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
@@ -1480,11 +1760,8 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         });
       }
 
-      ctx.pendingApprovals.delete(requestId);
-      pending.resolve({
-        confirmed: true,
-        outcome: ToolConfirmationOutcome.ProceedOnce,
-      });
+      ctx.pendingUserInputs.delete(requestId);
+      pending.resolve(answers);
 
       emit({
         ...makeEventBase(ctx),
@@ -1496,9 +1773,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       } as ProviderRuntimeEvent);
     });
 
-  const stopSession = (
-    threadId: ThreadId,
-  ): Effect.Effect<void, ProviderAdapterError> =>
+  const stopSession = (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
     Effect.gen(function* () {
       const ctx = sessions.get(threadId);
       if (!ctx) return;
@@ -1521,6 +1796,19 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         });
       }
       ctx.pendingApprovals.clear();
+
+      for (const [requestId, pending] of ctx.pendingUserInputs) {
+        pending.resolve(undefined);
+        emit({
+          ...makeEventBase(ctx),
+          requestId: RuntimeRequestId.makeUnsafe(requestId),
+          type: "user-input.resolved",
+          payload: {
+            answers: {},
+          },
+        } as ProviderRuntimeEvent);
+      }
+      ctx.pendingUserInputs.clear();
 
       // Dispose config (handles client cleanup internally)
       yield* Effect.tryPromise({
@@ -1580,17 +1868,12 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         const history = ctx.geminiClient.getHistory();
         // Each turn ≈ 2 history entries (user + assistant)
         const entriesToRemove = numTurns * 2;
-        const newHistory = history.slice(
-          0,
-          Math.max(0, history.length - entriesToRemove),
-        );
+        const newHistory = history.slice(0, Math.max(0, history.length - entriesToRemove));
         ctx.geminiClient.setHistory([...newHistory]);
       }).pipe(Effect.ignore);
 
       // Truncate tracked turns
-      const removed = ctx.turns.splice(
-        Math.max(0, ctx.turns.length - numTurns),
-      );
+      const removed = ctx.turns.splice(Math.max(0, ctx.turns.length - numTurns));
       void removed;
       updateResumeCursor(ctx);
 
@@ -1631,7 +1914,4 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   });
 });
 
-export const GeminiAcpAdapterLive = Layer.effect(
-  GeminiAcpAdapter,
-  makeGeminiAcpAdapter,
-);
+export const GeminiAcpAdapterLive = Layer.effect(GeminiAcpAdapter, makeGeminiAcpAdapter);

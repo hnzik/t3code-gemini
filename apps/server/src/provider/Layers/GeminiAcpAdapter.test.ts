@@ -1,10 +1,13 @@
 import { assert, describe, it } from "@effect/vitest";
-import { AuthType } from "@google/gemini-cli-core";
+import { AuthType, QuestionType } from "@google/gemini-cli-core";
 
 import {
+  buildGeminiAskUserResponseAnswers,
   buildGeminiPromptBlocks,
+  extractGeminiSchedulerApprovalRequest,
   extractVisibleAssistantText,
   formatAgentThoughtText,
+  normalizeGeminiAskUserQuestions,
   readGeminiResumeState,
   resolveGeminiAuthType,
   shouldApplyUsageUpdate,
@@ -27,19 +30,11 @@ describe("GeminiAcpAdapter proposed plan parsing", () => {
 
   it("withholds partial proposed-plan opening tags until they are resolved", () => {
     assert.equal(extractVisibleAssistantText("Hello <proposed_"), "Hello ");
-    assert.equal(
-      extractVisibleAssistantText("Hello <proposed_x"),
-      "Hello <proposed_x",
-    );
+    assert.equal(extractVisibleAssistantText("Hello <proposed_x"), "Hello <proposed_x");
   });
 
   it("only emits text outside the proposed-plan block across streamed chunks", () => {
-    const chunks = [
-      "Intro: ",
-      "<propose",
-      "d_plan>\n# Plan\n",
-      "</proposed_plan> Outro",
-    ];
+    const chunks = ["Intro: ", "<propose", "d_plan>\n# Plan\n", "</proposed_plan> Outro"];
 
     let rawText = "";
     let visibleLength = 0;
@@ -119,14 +114,8 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
   });
 
   it("preserves env-selected Gemini auth modes", () => {
-    assert.equal(
-      resolveGeminiAuthType(AuthType.USE_GEMINI),
-      AuthType.USE_GEMINI,
-    );
-    assert.equal(
-      resolveGeminiAuthType(AuthType.USE_VERTEX_AI),
-      AuthType.USE_VERTEX_AI,
-    );
+    assert.equal(resolveGeminiAuthType(AuthType.USE_GEMINI), AuthType.USE_GEMINI);
+    assert.equal(resolveGeminiAuthType(AuthType.USE_VERTEX_AI), AuthType.USE_VERTEX_AI);
   });
 
   it("reads persisted Gemini resume state", () => {
@@ -144,13 +133,143 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
   it("rejects invalid Gemini resume cursors", () => {
     assert.equal(readGeminiResumeState(undefined), undefined);
     assert.equal(readGeminiResumeState({ turnCount: 2 }), undefined);
-    assert.deepStrictEqual(
-      readGeminiResumeState({ history: [], turnCount: -1 }),
+    assert.deepStrictEqual(readGeminiResumeState({ history: [], turnCount: -1 }), {
+      history: [],
+      turnCount: 0,
+    });
+  });
+});
+
+describe("GeminiAcpAdapter ask-user helpers", () => {
+  it("normalizes Gemini ask_user questions for the UI", () => {
+    const questions = normalizeGeminiAskUserQuestions([
       {
-        history: [],
-        turnCount: 0,
+        question: "Pick an environment",
+        header: "Environment",
+        type: QuestionType.CHOICE,
+        options: [
+          { label: "Staging", description: "Deploy to staging" },
+          { label: "Production", description: "Deploy to production" },
+        ],
       },
-    );
+      {
+        question: "Any extra notes?",
+        type: QuestionType.TEXT,
+        placeholder: "Type details",
+      },
+      {
+        question: "Continue now?",
+        type: QuestionType.YESNO,
+      },
+    ]);
+
+    assert.deepStrictEqual(questions, [
+      {
+        id: "q-0",
+        header: "Environment",
+        question: "Pick an environment",
+        options: [
+          { label: "Staging", description: "Deploy to staging" },
+          { label: "Production", description: "Deploy to production" },
+        ],
+      },
+      {
+        id: "q-1",
+        header: "Question 2",
+        question: "Any extra notes?",
+        options: [{ label: "Use custom answer", description: "Type details" }],
+      },
+      {
+        id: "q-2",
+        header: "Question 3",
+        question: "Continue now?",
+        options: [
+          { label: "Yes", description: "Yes" },
+          { label: "No", description: "No" },
+        ],
+      },
+    ]);
+  });
+
+  it("maps UI answers back to Gemini's index-based ask_user payload", () => {
+    const questions = normalizeGeminiAskUserQuestions([
+      {
+        question: "Pick an environment",
+        header: "Environment",
+        type: QuestionType.CHOICE,
+        options: [
+          { label: "Staging", description: "Deploy to staging" },
+          { label: "Production", description: "Deploy to production" },
+        ],
+      },
+      {
+        question: "Any extra notes?",
+        type: QuestionType.TEXT,
+      },
+    ]);
+
+    const answers = buildGeminiAskUserResponseAnswers({
+      questions,
+      answers: {
+        "q-0": "Production",
+        "q-1": "Ship after 5pm",
+      },
+    });
+
+    assert.deepStrictEqual(answers, {
+      "0": "Production",
+      "1": "Ship after 5pm",
+    });
+  });
+});
+
+describe("GeminiAcpAdapter scheduler approval extraction", () => {
+  it("extracts edit approvals from scheduler awaiting-approval state", () => {
+    const approval = extractGeminiSchedulerApprovalRequest({
+      status: "awaiting_approval",
+      correlationId: "corr-1",
+      request: {
+        name: "replace",
+        args: {
+          file_path: "chapters-raw/chapter-5.md",
+          old_string: "old",
+          new_string: "new",
+        },
+      },
+      confirmationDetails: {
+        type: "edit",
+        fileName: "chapter-5.md",
+      },
+    });
+
+    assert.deepStrictEqual(approval, {
+      correlationId: "corr-1",
+      requestType: "file_change_approval",
+      detail: "Edit chapter-5.md",
+      args: {
+        file_path: "chapters-raw/chapter-5.md",
+        old_string: "old",
+        new_string: "new",
+      },
+    });
+  });
+
+  it("skips ask_user confirmations because they are handled separately", () => {
+    const approval = extractGeminiSchedulerApprovalRequest({
+      status: "awaiting_approval",
+      correlationId: "corr-2",
+      request: {
+        name: "replace",
+        args: {
+          file_path: "chapters-raw/chapter-5.md",
+        },
+      },
+      confirmationDetails: {
+        type: "ask_user",
+      },
+    });
+
+    assert.equal(approval, undefined);
   });
 });
 
@@ -167,9 +286,7 @@ describe("GeminiAcpAdapter default-mode prompting", () => {
     assert.equal(built.defaultModePromptSent, true);
     assert.equal(built.planModePromptSent, false);
     assert.equal(
-      built.promptBlocks[0]?.text.includes(
-        "Do **NOT** ask a blocking question and then continue",
-      ),
+      built.promptBlocks[0]?.text.includes("Do **NOT** ask a blocking question and then continue"),
       true,
     );
     assert.equal(built.promptBlocks[1]?.text, "Please update the adapter.");
@@ -185,9 +302,7 @@ describe("GeminiAcpAdapter default-mode prompting", () => {
 
     assert.equal(built.promptBlocks.length, 2);
     assert.equal(
-      built.promptBlocks[0]?.text.includes(
-        "ask the question and end the turn immediately",
-      ),
+      built.promptBlocks[0]?.text.includes("ask the question and end the turn immediately"),
       true,
     );
     assert.equal(built.promptBlocks[1]?.text, "Continue.");
