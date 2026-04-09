@@ -2,16 +2,19 @@ import { assert, describe, it } from "@effect/vitest";
 import { AuthType, QuestionType } from "@google/gemini-cli-core";
 
 import {
+  buildGeminiAgentMessage,
   buildGeminiAskUserResponseAnswers,
   buildGeminiPromptBlocks,
   extractGeminiSchedulerApprovalRequest,
   extractVisibleAssistantText,
+  formatGeminiRetryWarningMessage,
   formatAgentThoughtText,
+  interceptGeminiStream,
   normalizeGeminiAskUserQuestions,
   readGeminiResumeState,
-  resolveGeminiAuthType,
   shouldApplyUsageUpdate,
 } from "./GeminiAcpAdapter.ts";
+import { resolveGeminiAuthType } from "./GeminiCoreConfig";
 
 describe("GeminiAcpAdapter proposed plan parsing", () => {
   it("removes complete proposed-plan blocks from visible assistant text", () => {
@@ -137,6 +140,32 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
       history: [],
       turnCount: 0,
     });
+  });
+});
+
+describe("GeminiAcpAdapter retry warnings", () => {
+  it("formats capacity retries for the UI", () => {
+    assert.equal(
+      formatGeminiRetryWarningMessage({
+        attempt: 1,
+        maxAttempts: 10,
+        delayMs: 30_000,
+        error: "MODEL_CAPACITY_EXHAUSTED",
+      }),
+      "Capacity exhausted, retrying in 30s (attempt 1/10)",
+    );
+  });
+
+  it("formats generic retries for the UI", () => {
+    assert.equal(
+      formatGeminiRetryWarningMessage({
+        attempt: 2,
+        maxAttempts: 10,
+        delayMs: 5_000,
+        error: "ECONNRESET",
+      }),
+      "Request retrying in 5s (attempt 2/10)",
+    );
   });
 });
 
@@ -274,6 +303,12 @@ describe("GeminiAcpAdapter scheduler approval extraction", () => {
 });
 
 describe("GeminiAcpAdapter default-mode prompting", () => {
+  it("builds the installed LegacyAgentSession message payload", () => {
+    assert.deepStrictEqual(buildGeminiAgentMessage("Refine the plan"), [
+      { type: "text", text: "Refine the plan" },
+    ]);
+  });
+
   it("prepends the default-mode prompt on the first non-plan turn", () => {
     const built = buildGeminiPromptBlocks({
       interactionMode: "default",
@@ -321,5 +356,28 @@ describe("GeminiAcpAdapter default-mode prompting", () => {
     assert.equal(built.defaultModePromptSent, true);
     assert.equal(built.promptBlocks[0]?.text.includes("# Plan Mode"), true);
     assert.equal(built.promptBlocks[1]?.text, "Refine the plan.");
+  });
+});
+
+describe("GeminiAcpAdapter stream interception", () => {
+  it("closes the wrapped Gemini stream when the consumer stops early", async () => {
+    let innerClosed = false;
+
+    async function* innerStream(): AsyncGenerator<number, string> {
+      try {
+        yield 1;
+        yield 2;
+        return "done";
+      } finally {
+        innerClosed = true;
+      }
+    }
+
+    const wrapped = interceptGeminiStream(innerStream(), () => {});
+
+    assert.deepStrictEqual(await wrapped.next(), { done: false, value: 1 });
+    await wrapped.return("" as string);
+
+    assert.equal(innerClosed, true);
   });
 });

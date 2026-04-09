@@ -550,6 +550,45 @@ describe("incremental orchestration updates", () => {
     expect(next.threads[0]?.messages).toHaveLength(1);
   });
 
+  it("settles the latest turn when the session returns to ready without a completion message", () => {
+    const turnId = TurnId.makeUnsafe("turn-1");
+    const state = makeState(
+      makeThread({
+        latestTurn: {
+          turnId,
+          state: "running",
+          requestedAt: "2026-02-27T00:00:00.000Z",
+          startedAt: "2026-02-27T00:00:01.000Z",
+          completedAt: null,
+          assistantMessageId: null,
+        },
+      }),
+    );
+
+    const next = applyOrchestrationEvent(
+      state,
+      makeEvent("thread.session-set", {
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        session: {
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          status: "ready",
+          providerName: "geminiAcp",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-02-27T00:00:05.000Z",
+        },
+      }),
+    );
+
+    expect(next.threads[0]?.session?.status).toBe("ready");
+    expect(next.threads[0]?.latestTurn).toMatchObject({
+      turnId,
+      state: "running",
+      completedAt: "2026-02-27T00:00:05.000Z",
+    });
+  });
+
   it("does not regress latestTurn when an older turn diff completes late", () => {
     const state = makeState(
       makeThread({

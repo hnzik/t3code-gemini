@@ -244,15 +244,16 @@ function runtimeEventToActivities(
     }
 
     case "runtime.warning": {
+      const summary = truncateDetail(event.payload.message);
       return [
         {
           id: event.eventId,
           createdAt: event.createdAt,
           tone: "info",
           kind: "runtime.warning",
-          summary: "Runtime warning",
+          summary,
           payload: {
-            message: truncateDetail(event.payload.message),
+            message: summary,
             ...(event.payload.detail !== undefined ? { detail: event.payload.detail } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,

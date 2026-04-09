@@ -366,6 +366,32 @@ function buildLatestTurn(params: {
   };
 }
 
+function settleLatestTurnAfterSessionUpdate(input: {
+  latestTurn: Thread["latestTurn"];
+  session: OrchestrationSession;
+}): Thread["latestTurn"] {
+  const latestTurn = input.latestTurn;
+  if (!latestTurn) {
+    return latestTurn;
+  }
+  if (input.session.status === "running" || input.session.activeTurnId !== null) {
+    return latestTurn;
+  }
+  if (latestTurn.completedAt !== null) {
+    return latestTurn;
+  }
+
+  return buildLatestTurn({
+    previous: latestTurn,
+    turnId: latestTurn.turnId,
+    state: latestTurn.state,
+    requestedAt: latestTurn.requestedAt,
+    startedAt: latestTurn.startedAt,
+    completedAt: input.session.updatedAt,
+    assistantMessageId: latestTurn.assistantMessageId,
+  });
+}
+
 function rebindTurnDiffSummariesForAssistantMessage(
   turnDiffSummaries: ReadonlyArray<Thread["turnDiffSummaries"][number]>,
   turnId: Thread["turnDiffSummaries"][number]["turnId"],
@@ -917,7 +943,10 @@ export function applyOrchestrationEvent(state: AppState, event: OrchestrationEve
                     : null,
                 sourceProposedPlan: thread.pendingSourceProposedPlan,
               })
-            : thread.latestTurn,
+            : settleLatestTurnAfterSessionUpdate({
+                latestTurn: thread.latestTurn,
+                session: event.payload.session,
+              }),
         updatedAt: event.occurredAt,
       }));
     }

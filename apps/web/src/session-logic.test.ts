@@ -945,6 +945,88 @@ describe("deriveWorkLogEntries", () => {
     });
   });
 
+  it("collapses consecutive retry runtime warnings into one entry", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "retry-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "runtime.warning",
+        summary: "Capacity exhausted, retrying in 30s (attempt 1/10)",
+        tone: "info",
+        payload: {
+          message: "Capacity exhausted, retrying in 30s (attempt 1/10)",
+          detail: {
+            attempt: 1,
+            maxAttempts: 10,
+            delayMs: 30_000,
+            model: "gemini-3.1-pro-preview",
+          },
+        },
+      }),
+      makeActivity({
+        id: "retry-2",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "runtime.warning",
+        summary: "Capacity exhausted, retrying in 60s (attempt 2/10)",
+        tone: "info",
+        payload: {
+          message: "Capacity exhausted, retrying in 60s (attempt 2/10)",
+          detail: {
+            attempt: 2,
+            maxAttempts: 10,
+            delayMs: 60_000,
+            model: "gemini-3.1-pro-preview",
+          },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      id: "retry-2",
+      createdAt: "2026-02-23T00:00:02.000Z",
+      label: "Capacity exhausted, retrying in 60s (attempt 2/10)",
+    });
+  });
+
+  it("keeps unrelated runtime warnings separate", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "retry-warning",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "runtime.warning",
+        summary: "Capacity exhausted, retrying in 30s (attempt 1/10)",
+        tone: "info",
+        payload: {
+          message: "Capacity exhausted, retrying in 30s (attempt 1/10)",
+          detail: {
+            attempt: 1,
+            maxAttempts: 10,
+            delayMs: 30_000,
+            model: "gemini-3.1-pro-preview",
+          },
+        },
+      }),
+      makeActivity({
+        id: "generic-warning",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "runtime.warning",
+        summary: "Provider got slow",
+        tone: "info",
+        payload: {
+          message: "Provider got slow",
+          detail: { latencyMs: 1_500 },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries.map((entry) => entry.id)).toEqual(["retry-warning", "generic-warning"]);
+  });
+
   it("keeps separate tool entries when an identical call starts after the prior one completed", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

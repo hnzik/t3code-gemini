@@ -535,7 +535,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (requestKind) {
     entry.requestKind = requestKind;
   }
-  const collapseKey = deriveToolLifecycleCollapseKey(entry);
+  const collapseKey = deriveWorkLogCollapseKey(entry, payload);
   if (collapseKey) {
     entry.collapseKey = collapseKey;
   }
@@ -548,7 +548,7 @@ function collapseDerivedWorkLogEntries(
   const collapsed: DerivedWorkLogEntry[] = [];
   for (const entry of entries) {
     const previous = collapsed.at(-1);
-    if (previous && shouldCollapseToolLifecycleEntries(previous, entry)) {
+    if (previous && shouldCollapseWorkLogEntries(previous, entry)) {
       collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
       continue;
     }
@@ -557,20 +557,25 @@ function collapseDerivedWorkLogEntries(
   return collapsed;
 }
 
-function shouldCollapseToolLifecycleEntries(
+function shouldCollapseWorkLogEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
+  if (previous.collapseKey === undefined || previous.collapseKey !== next.collapseKey) {
+    return false;
+  }
+
+  if (previous.activityKind === "runtime.warning" && next.activityKind === "runtime.warning") {
+    return true;
+  }
+
   if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
     return false;
   }
   if (next.activityKind !== "tool.updated" && next.activityKind !== "tool.completed") {
     return false;
   }
-  if (previous.activityKind === "tool.completed") {
-    return false;
-  }
-  return previous.collapseKey !== undefined && previous.collapseKey === next.collapseKey;
+  return previous.activityKind !== "tool.completed";
 }
 
 function mergeDerivedWorkLogEntries(
@@ -608,6 +613,35 @@ function mergeChangedFiles(
     return [];
   }
   return [...new Set(merged)];
+}
+
+function deriveWorkLogCollapseKey(
+  entry: DerivedWorkLogEntry,
+  payload: Record<string, unknown> | null,
+): string | undefined {
+  return deriveRetryWarningCollapseKey(entry, payload) ?? deriveToolLifecycleCollapseKey(entry);
+}
+
+function deriveRetryWarningCollapseKey(
+  entry: DerivedWorkLogEntry,
+  payload: Record<string, unknown> | null,
+): string | undefined {
+  if (entry.activityKind !== "runtime.warning") {
+    return undefined;
+  }
+  const detail = asRecord(payload?.detail);
+  const attempt = detail?.attempt;
+  const maxAttempts = detail?.maxAttempts;
+  const delayMs = detail?.delayMs;
+  if (
+    typeof attempt !== "number" ||
+    typeof maxAttempts !== "number" ||
+    typeof delayMs !== "number"
+  ) {
+    return undefined;
+  }
+  const model = asTrimmedString(detail?.model) ?? "unknown-model";
+  return ["runtime.warning", "retry", model].join("\u001f");
 }
 
 function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | undefined {

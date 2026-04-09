@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, it, assert } from "@effect/vitest";
+import { AuthType } from "@google/gemini-cli-core";
 import {
   Effect,
   Exit,
@@ -30,6 +31,12 @@ import {
   readCodexConfigModelProvider,
 } from "./CodexProvider";
 import { checkClaudeProviderStatus, parseClaudeAuthStatusFromOutput } from "./ClaudeProvider";
+import {
+  checkGeminiAcpProviderStatus,
+  hasGeminiAdcConfiguration,
+  hasGeminiGoogleOAuthSession,
+  validateGeminiAuthConfiguration,
+} from "./GeminiAcpProvider";
 import { haveProvidersChanged, ProviderRegistryLive } from "./ProviderRegistry";
 import { ServerSettingsService, type ServerSettingsShape } from "../../serverSettings";
 import { ProviderRegistry } from "../Services/ProviderRegistry";
@@ -1054,6 +1061,162 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
         assert.strictEqual(parsed.status, "warning");
         assert.strictEqual(parsed.auth.status, "unknown");
       });
+    });
+
+    // ── checkGeminiAcpProviderStatus tests ───────────────────────────
+
+    describe("Gemini auth helpers", () => {
+      it("requires GEMINI_API_KEY for Gemini API key auth", () => {
+        assert.strictEqual(
+          validateGeminiAuthConfiguration(AuthType.USE_GEMINI, {}),
+          "Gemini API key auth requires the GEMINI_API_KEY environment variable. Update your environment and try again.",
+        );
+      });
+
+      it("accepts Vertex AI express mode with GOOGLE_API_KEY", () => {
+        assert.strictEqual(
+          validateGeminiAuthConfiguration(AuthType.USE_VERTEX_AI, {
+            GOOGLE_API_KEY: "test-key",
+          }),
+          undefined,
+        );
+      });
+
+      it("treats a cached Google account as an active OAuth session", () => {
+        assert.strictEqual(
+          hasGeminiGoogleOAuthSession({
+            env: {},
+            getCachedGoogleAccount: () => "user@example.com",
+            hasOauthCredentialFile: () => false,
+          }),
+          true,
+        );
+      });
+
+      it("detects ADC configuration from GOOGLE_APPLICATION_CREDENTIALS", () => {
+        assert.strictEqual(
+          hasGeminiAdcConfiguration({
+            GOOGLE_APPLICATION_CREDENTIALS: "/tmp/service-account.json",
+          }),
+          true,
+        );
+      });
+    });
+
+    describe("checkGeminiAcpProviderStatus", () => {
+      it.effect(
+        "reports Google OAuth as authenticated when stored Gemini auth state is present",
+        () =>
+          Effect.gen(function* () {
+            const status = yield* checkGeminiAcpProviderStatus({
+              resolveAuthType: () => AuthType.LOGIN_WITH_GOOGLE,
+              hasGoogleOAuthSession: () => true,
+            });
+
+            assert.strictEqual(status.provider, "geminiAcp");
+            assert.strictEqual(status.status, "ready");
+            assert.strictEqual(status.installed, true);
+            assert.strictEqual(status.auth.status, "authenticated");
+            assert.strictEqual(status.auth.type, "oauth-personal");
+            assert.strictEqual(status.auth.label, "Google OAuth");
+            assert.strictEqual(status.message, undefined);
+          }).pipe(
+            Effect.provide(
+              mockSpawnerLayer((args) => {
+                const joined = args.join(" ");
+                if (joined === "--version")
+                  return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+                throw new Error(`Unexpected args: ${joined}`);
+              }),
+            ),
+          ),
+      );
+
+      it.effect("returns unknown when no stored Gemini Google OAuth session is detected", () =>
+        Effect.gen(function* () {
+          const status = yield* checkGeminiAcpProviderStatus({
+            resolveAuthType: () => AuthType.LOGIN_WITH_GOOGLE,
+            hasGoogleOAuthSession: () => false,
+          });
+
+          assert.strictEqual(status.provider, "geminiAcp");
+          assert.strictEqual(status.status, "warning");
+          assert.strictEqual(status.installed, true);
+          assert.strictEqual(status.auth.status, "unknown");
+          assert.strictEqual(status.auth.type, "oauth-personal");
+          assert.strictEqual(status.auth.label, "Google OAuth");
+          assert.strictEqual(
+            status.message,
+            "Gemini Google OAuth could not be verified from stored CLI state during background refresh. T3 Code will retry authentication when a chat session starts.",
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
+      it.effect("returns unknown when Gemini ADC cannot be verified during passive refresh", () =>
+        Effect.gen(function* () {
+          const status = yield* checkGeminiAcpProviderStatus({
+            resolveAuthType: () => AuthType.COMPUTE_ADC,
+            hasAdcConfiguration: () => false,
+          });
+
+          assert.strictEqual(status.provider, "geminiAcp");
+          assert.strictEqual(status.status, "warning");
+          assert.strictEqual(status.installed, true);
+          assert.strictEqual(status.auth.status, "unknown");
+          assert.strictEqual(status.auth.type, "compute-default-credentials");
+          assert.strictEqual(status.auth.label, "Google ADC");
+          assert.strictEqual(
+            status.message,
+            "Gemini Google ADC could not be verified during background refresh. T3 Code will retry authentication when a chat session starts.",
+          );
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
+      it.effect(
+        "returns unauthenticated when Gemini API key auth is selected without GEMINI_API_KEY",
+        () =>
+          Effect.gen(function* () {
+            const status = yield* checkGeminiAcpProviderStatus({
+              resolveAuthType: () => AuthType.USE_GEMINI,
+            });
+
+            assert.strictEqual(status.provider, "geminiAcp");
+            assert.strictEqual(status.status, "error");
+            assert.strictEqual(status.installed, true);
+            assert.strictEqual(status.auth.status, "unauthenticated");
+            assert.strictEqual(status.auth.type, "gemini-api-key");
+            assert.strictEqual(status.auth.label, "Gemini API Key");
+            assert.strictEqual(
+              status.message,
+              "Gemini API key auth requires the GEMINI_API_KEY environment variable. Update your environment and try again.",
+            );
+          }).pipe(
+            Effect.provide(
+              mockSpawnerLayer((args) => {
+                const joined = args.join(" ");
+                if (joined === "--version")
+                  return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+                throw new Error(`Unexpected args: ${joined}`);
+              }),
+            ),
+          ),
+      );
     });
   },
 );

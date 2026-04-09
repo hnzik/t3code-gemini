@@ -835,6 +835,28 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         case "thread.session-set": {
           const turnId = event.payload.session.activeTurnId;
           if (turnId === null || event.payload.session.status !== "running") {
+            if (turnId !== null || event.payload.session.status === "running") {
+              return;
+            }
+
+            const existingTurns = yield* projectionTurnRepository.listByThreadId({
+              threadId: event.payload.threadId,
+            });
+            const latestConcreteTurn = existingTurns
+              .toReversed()
+              .find((row) => row.turnId !== null);
+            if (
+              latestConcreteTurn &&
+              latestConcreteTurn.turnId !== null &&
+              latestConcreteTurn.state === "running" &&
+              latestConcreteTurn.completedAt === null
+            ) {
+              yield* projectionTurnRepository.upsertByTurnId({
+                ...latestConcreteTurn,
+                turnId: latestConcreteTurn.turnId,
+                completedAt: event.occurredAt,
+              });
+            }
             return;
           }
 

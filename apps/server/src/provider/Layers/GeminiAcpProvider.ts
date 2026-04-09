@@ -1,4 +1,13 @@
-import type { GeminiSettings, ServerProvider, ServerProviderModel } from "@t3tools/contracts";
+import { existsSync } from "node:fs";
+
+import { AuthType, Storage, UserAccountManager } from "@google/gemini-cli-core";
+import type {
+  GeminiSettings,
+  ServerProvider,
+  ServerProviderAuth,
+  ServerProviderModel,
+  ServerProviderState,
+} from "@t3tools/contracts";
 import { ServerSettingsError } from "@t3tools/contracts";
 import { Effect, Equal, Layer, Option, Result, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -14,8 +23,13 @@ import {
   providerModelsFromSettings,
   spawnAndCollect,
 } from "../providerSnapshot";
+import { resolveGeminiAuthType } from "./GeminiCoreConfig";
 
 const PROVIDER = "geminiAcp" as const;
+const GEMINI_GOOGLE_AUTH_MESSAGE =
+  "Gemini Google OAuth could not be verified from stored CLI state during background refresh. T3 Code will retry authentication when a chat session starts.";
+const GEMINI_ADC_AUTH_MESSAGE =
+  "Gemini Google ADC could not be verified during background refresh. T3 Code will retry authentication when a chat session starts.";
 
 const GEMINI_MODEL_CAPABILITIES = {
   reasoningEffortLevels: [],
@@ -63,8 +77,134 @@ const runGeminiCommand = Effect.fn("runGeminiCommand")(function* (args: Readonly
   return yield* spawnAndCollect(geminiSettings.binaryPath, command);
 });
 
+function geminiAuthMetadata(authType: AuthType): Pick<ServerProviderAuth, "type" | "label"> {
+  switch (authType) {
+    case AuthType.LOGIN_WITH_GOOGLE:
+      return { type: authType, label: "Google OAuth" };
+    case AuthType.USE_GEMINI:
+      return { type: authType, label: "Gemini API Key" };
+    case AuthType.USE_VERTEX_AI:
+      return { type: authType, label: "Vertex AI" };
+    case AuthType.COMPUTE_ADC:
+      return { type: authType, label: "Google ADC" };
+    case AuthType.LEGACY_CLOUD_SHELL:
+      return { type: authType, label: "Google Cloud Shell" };
+    case AuthType.GATEWAY:
+      return { type: authType, label: "Gateway" };
+  }
+}
+
+export interface GeminiAuthProbeResult {
+  readonly status: Exclude<ServerProviderState, "disabled">;
+  readonly auth: Pick<ServerProviderAuth, "status">;
+  readonly message?: string;
+}
+
+export function validateGeminiAuthConfiguration(
+  authType: AuthType,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (authType === AuthType.USE_GEMINI && !env.GEMINI_API_KEY) {
+    return "Gemini API key auth requires the GEMINI_API_KEY environment variable. Update your environment and try again.";
+  }
+
+  if (authType === AuthType.USE_VERTEX_AI) {
+    const hasVertexProjectLocationConfig = Boolean(
+      (env.GOOGLE_CLOUD_PROJECT || env.GOOGLE_CLOUD_PROJECT_ID) && env.GOOGLE_CLOUD_LOCATION,
+    );
+    const hasGoogleApiKey = Boolean(env.GOOGLE_API_KEY);
+
+    if (!hasVertexProjectLocationConfig && !hasGoogleApiKey) {
+      return "Vertex AI auth requires either GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, or GOOGLE_API_KEY for express mode. Update your environment and try again.";
+    }
+  }
+
+  return undefined;
+}
+
+export function hasGeminiGoogleOAuthSession(input?: {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly getCachedGoogleAccount?: () => string | null;
+  readonly hasOauthCredentialFile?: () => boolean;
+}): boolean {
+  const env = input?.env ?? process.env;
+  if (env.GOOGLE_GENAI_USE_GCA === "true" && env.GOOGLE_CLOUD_ACCESS_TOKEN) {
+    return true;
+  }
+
+  const cachedGoogleAccount =
+    input?.getCachedGoogleAccount?.() ?? new UserAccountManager().getCachedGoogleAccount();
+  if (cachedGoogleAccount) {
+    return true;
+  }
+
+  return input?.hasOauthCredentialFile?.() ?? existsSync(Storage.getOAuthCredsPath());
+}
+
+export function hasGeminiAdcConfiguration(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(
+    env.CLOUD_SHELL === "true" ||
+    env.GEMINI_CLI_USE_COMPUTE_ADC === "true" ||
+    env.GOOGLE_APPLICATION_CREDENTIALS,
+  );
+}
+
+function resolveGeminiAuthProbeResult(
+  authType: AuthType,
+  deps?: {
+    readonly hasGoogleOAuthSession?: () => boolean;
+    readonly hasAdcConfiguration?: () => boolean;
+  },
+): GeminiAuthProbeResult {
+  const staticConfigurationError = validateGeminiAuthConfiguration(authType);
+  if (staticConfigurationError) {
+    return {
+      status: "error",
+      auth: { status: "unauthenticated" },
+      message: staticConfigurationError,
+    };
+  }
+
+  if (authType === AuthType.LOGIN_WITH_GOOGLE) {
+    const hasGoogleOAuthSession = deps?.hasGoogleOAuthSession?.() ?? hasGeminiGoogleOAuthSession();
+    return hasGoogleOAuthSession
+      ? {
+          status: "ready",
+          auth: { status: "authenticated" },
+        }
+      : {
+          status: "warning",
+          auth: { status: "unknown" },
+          message: GEMINI_GOOGLE_AUTH_MESSAGE,
+        };
+  }
+
+  if (authType === AuthType.COMPUTE_ADC) {
+    const hasAdcConfiguration = deps?.hasAdcConfiguration?.() ?? hasGeminiAdcConfiguration();
+    return hasAdcConfiguration
+      ? {
+          status: "ready",
+          auth: { status: "authenticated" },
+        }
+      : {
+          status: "warning",
+          auth: { status: "unknown" },
+          message: GEMINI_ADC_AUTH_MESSAGE,
+        };
+  }
+
+  return {
+    status: "ready",
+    auth: { status: "authenticated" },
+  };
+}
+
 export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderStatus")(
-  function* (): Effect.fn.Return<
+  function* (deps?: {
+    readonly resolveAuthType?: () => AuthType;
+    readonly hasGoogleOAuthSession?: () => boolean;
+    readonly hasAdcConfiguration?: () => boolean;
+  }): Effect.fn.Return<
     ServerProvider,
     ServerSettingsError,
     ChildProcessSpawner.ChildProcessSpawner | ServerSettingsService
@@ -97,7 +237,6 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
       });
     }
 
-    // Check if gemini CLI is installed and get version
     const versionProbe = yield* runGeminiCommand(["--version"]).pipe(
       Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
       Effect.result,
@@ -160,9 +299,10 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
       });
     }
 
-    // Gemini CLI doesn't expose a standalone auth-check command.
-    // Authentication is validated during the ACP connection flow (initialize → authenticate).
-    // If --version succeeds, report the provider as ready — auth errors surface at session start.
+    const authType = deps?.resolveAuthType?.() ?? resolveGeminiAuthType();
+    const authMetadata = geminiAuthMetadata(authType);
+    const authProbe = resolveGeminiAuthProbeResult(authType, deps);
+
     return buildServerProvider({
       provider: PROVIDER,
       enabled: geminiSettings.enabled,
@@ -171,8 +311,9 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
       probe: {
         installed: true,
         version: parsedVersion,
-        status: "ready",
-        auth: { status: "unknown" },
+        status: authProbe.status,
+        auth: { ...authProbe.auth, ...authMetadata },
+        ...(authProbe.message ? { message: authProbe.message } : {}),
       },
     });
   },

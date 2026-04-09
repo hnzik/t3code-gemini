@@ -23,15 +23,15 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.77",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.97",
     "@effect/platform-bun": "catalog:",
     "@effect/platform-node": "catalog:",
     "@effect/sql-sqlite-bun": "catalog:",
-    "@google/gemini-cli-core": "^0.36.0",
-    "@pierre/diffs": "^1.1.0-beta.16",
+    "@google/gemini-cli-core": "^0.37.0",
+    "@pierre/diffs": "^1.1.12",
     "effect": "catalog:",
     "node-pty": "^1.1.0",
-    "open": "^10.1.0"
+    "open": "^10.2.0"
   },
   "devDependencies": {
     "@effect/language-service": "catalog:",
@@ -39,11 +39,11 @@
     "@t3tools/contracts": "workspace:*",
     "@t3tools/shared": "workspace:*",
     "@t3tools/web": "workspace:*",
-    "@types/bun": "catalog:",
-    "@types/node": "catalog:",
-    "tsdown": "catalog:",
-    "typescript": "catalog:",
-    "vitest": "catalog:"
+    "@types/bun": "^1.3.11",
+    "@types/node": "^24.12.2",
+    "tsdown": "^0.20.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.3"
   },
   "engines": {
     "node": "^22.16 || ^23.11 || >=24.10"

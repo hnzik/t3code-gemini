@@ -1840,6 +1840,114 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
   ),
 );
 
+it.effect(
+  "settles the latest running turn when a session returns to ready without a turn diff",
+  () =>
+    Effect.gen(function* () {
+      const eventStore = yield* OrchestrationEventStore;
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.makeUnsafe("thread-ready-settle");
+      const turnId = TurnId.makeUnsafe("turn-ready-settle");
+
+      yield* eventStore.append({
+        type: "thread.created",
+        eventId: EventId.makeUnsafe("evt-ready-settle-1"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T15:00:00.000Z",
+        commandId: CommandId.makeUnsafe("cmd-ready-settle-1"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-ready-settle-1"),
+        metadata: {},
+        payload: {
+          threadId,
+          projectId: ProjectId.makeUnsafe("project-ready-settle"),
+          title: "Ready settle",
+          modelSelection: {
+            provider: "codex",
+            model: "gpt-5-codex",
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: "2026-02-26T15:00:00.000Z",
+          updatedAt: "2026-02-26T15:00:00.000Z",
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.makeUnsafe("evt-ready-settle-2"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T15:00:01.000Z",
+        commandId: CommandId.makeUnsafe("cmd-ready-settle-2"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-ready-settle-2"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "geminiAcp",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: "2026-02-26T15:00:01.000Z",
+          },
+        },
+      });
+
+      yield* eventStore.append({
+        type: "thread.session-set",
+        eventId: EventId.makeUnsafe("evt-ready-settle-3"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: "2026-02-26T15:00:04.000Z",
+        commandId: CommandId.makeUnsafe("cmd-ready-settle-3"),
+        causationEventId: null,
+        correlationId: CorrelationId.makeUnsafe("cmd-ready-settle-3"),
+        metadata: {},
+        payload: {
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "geminiAcp",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-02-26T15:00:04.000Z",
+          },
+        },
+      });
+
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly state: string;
+        readonly completedAt: string | null;
+      }>`
+      SELECT
+        state,
+        completed_at AS "completedAt"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id = ${turnId}
+    `;
+
+      assert.deepEqual(rows, [
+        {
+          state: "running",
+          completedAt: "2026-02-26T15:00:04.000Z",
+        },
+      ]);
+    }).pipe(Effect.provide(BaseTestLayer)),
+);
+
 const engineLayer = it.layer(
   OrchestrationEngineLive.pipe(
     Layer.provide(OrchestrationProjectionSnapshotQueryLive),

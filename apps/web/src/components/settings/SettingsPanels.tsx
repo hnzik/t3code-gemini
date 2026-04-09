@@ -193,6 +193,17 @@ function getProviderVersionLabel(version: string | null | undefined) {
   return version.startsWith("v") ? version : `v${version}`;
 }
 
+function getProviderInfoMessage(provider: ProviderKind): string | null {
+  if (provider !== "geminiAcp") {
+    return null;
+  }
+
+  return [
+    "Gemini provider refresh passively checks stored Gemini auth state and validates environment-based auth configuration.",
+    "It does not force a browser login or re-run Gemini's interactive OAuth flow during background refresh, and OAuth or ADC verification is retried when a chat session starts.",
+  ].join(" ");
+}
+
 function useRelativeTimeTick(intervalMs = 1_000) {
   const [tick, setTick] = useState(() => Date.now());
   useEffect(() => {
@@ -779,6 +790,7 @@ export function GeneralSettingsPanel() {
       statusStyle: PROVIDER_STATUS_STYLES[statusKey],
       summary,
       versionLabel: getProviderVersionLabel(liveProvider?.version),
+      infoMessage: getProviderInfoMessage(providerSettings.provider),
     };
   });
 
@@ -1132,6 +1144,27 @@ export function GeneralSettingsPanel() {
                         <code className="text-xs text-muted-foreground">
                           {providerCard.versionLabel}
                         </code>
+                      ) : null}
+                      {providerCard.infoMessage ? (
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <button
+                                type="button"
+                                className="shrink-0 text-muted-foreground/50 transition-colors hover:text-muted-foreground"
+                                aria-label={`${providerDisplayName} provider status details`}
+                              >
+                                <InfoIcon className="size-3" />
+                              </button>
+                            }
+                          />
+                          <TooltipPopup
+                            side="top"
+                            className="max-w-72 whitespace-pre-wrap leading-tight"
+                          >
+                            {providerCard.infoMessage}
+                          </TooltipPopup>
+                        </Tooltip>
                       ) : null}
                       <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center">
                         {providerCard.isDirty ? (
