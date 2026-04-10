@@ -1,9 +1,8 @@
 /**
  * GeminiAcpAdapterLive — @google/gemini-cli-core based implementation.
  *
- * Uses GeminiClient.sendMessageStream() as the primary streaming interface.
- * Tool execution is handled by the library's built-in Scheduler; confirmations
- * are bridged to T3Code's approval flow via the library's MessageBus.
+ * Uses Gemini CLI core chat/tool primitives directly and projects them into
+ * T3 Code's provider runtime events and approval flow.
  *
  * @module GeminiAcpAdapterLive
  */
@@ -28,6 +27,7 @@ import {
   TurnId as TurnIdBrand,
 } from "@t3tools/contracts";
 import { Effect, Layer, Queue, Stream } from "effect";
+import type { Content, FunctionCall, Part } from "@google/genai";
 
 import { ServerSettingsService } from "../../serverSettings";
 import {
@@ -40,25 +40,39 @@ import {
 } from "../Errors";
 import { GeminiAcpAdapter } from "../Services/GeminiAcpAdapter";
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter";
+import {
+  type ProviderRuntimeBinding,
+  ProviderSessionDirectory,
+} from "../Services/ProviderSessionDirectory";
 
 import {
-  AuthType,
-  Config,
-  LegacyAgentSession,
+  CoreEvent,
+  DiscoveredMCPTool,
+  InvalidStreamError,
+  LlmRole,
   MessageBusType,
-  ApprovalMode,
   QuestionType,
-  ROOT_SCHEDULER_ID,
-  Scheduler,
   ToolConfirmationOutcome,
-  getAuthTypeFromEnv,
-  type AgentEvent,
+  type Config,
   type ContentPart,
   type GeminiClient,
+  type GeminiChat,
   type MessageBus,
   type Question,
+  type RetryAttemptPayload,
   type ToolConfirmationRequest,
+  type ToolCallConfirmationDetails,
+  type ToolConfirmationPayload,
+  type ToolLiveOutput,
+  type ToolResult,
+  type RoutingContext,
+  StreamEventType,
+  convertToFunctionResponse,
+  coreEvents,
+  logToolCall,
+  ToolCallEvent,
 } from "@google/gemini-cli-core";
+import { createGeminiCoreConfig, resolveGeminiAuthType } from "./GeminiCoreConfig";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -392,6 +406,303 @@ function titleForToolType(type: CanonicalItemType): string {
   }
 }
 
+function buildGeminiPendingId(prefix: "req" | "user-input"): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function forcedGeminiToolDecision(
+  ctx: GeminiSessionContext,
+  toolName: string,
+  args: Record<string, unknown>,
+): "allow" | "deny" | "ask_user" {
+  if (toolName === "ask_user" || toolName === "exit_plan_mode") {
+    return "ask_user";
+  }
+
+  if (ctx.userRequestedMode === "plan") {
+    return isFileModifyingTool(toolName) || isShellWriteTool(toolName, args) ? "deny" : "allow";
+  }
+
+  return ctx.session.runtimeMode === "full-access" ? "allow" : "ask_user";
+}
+
+function buildGeminiApprovalDetailFromConfirmation(
+  toolName: string,
+  confirmation: ToolCallConfirmationDetails,
+): string {
+  switch (confirmation.type) {
+    case "edit":
+      return `Edit ${confirmation.filePath || confirmation.fileName || "file"}`;
+    case "exec":
+      return confirmation.command || "Execute command";
+    case "sandbox_expansion":
+      return confirmation.command || confirmation.rootCommand || "Expand sandbox";
+    case "mcp":
+      return `MCP: ${confirmation.toolDisplayName || confirmation.toolName || toolName}`;
+    case "exit_plan_mode":
+      return "Exit plan mode";
+    case "info":
+      return confirmation.prompt || toolName;
+    case "ask_user":
+      return confirmation.questions[0]?.question?.trim() || "User input requested";
+    default:
+      return toolName;
+  }
+}
+
+function isGracefulGeminiTurnError(error: unknown): boolean {
+  if (error instanceof InvalidStreamError) {
+    return true;
+  }
+
+  if (!error || typeof error !== "object" || !("type" in error)) {
+    return false;
+  }
+
+  const type = (error as { type?: unknown }).type;
+  return (
+    type === "NO_RESPONSE_TEXT" ||
+    type === "NO_FINISH_REASON" ||
+    type === "MALFORMED_FUNCTION_CALL" ||
+    type === "UNEXPECTED_TOOL_CALL"
+  );
+}
+
+function isGeminiTextPart(part: Part): part is Part & { text: string } {
+  return typeof part.text === "string" && part.text.length > 0 && part.thought !== true;
+}
+
+function consolidateGeminiModelParts(parts: ReadonlyArray<Part>): Part[] {
+  const consolidated: Part[] = [];
+
+  for (const part of parts) {
+    const lastPart = consolidated[consolidated.length - 1];
+    if (lastPart && isGeminiTextPart(lastPart) && isGeminiTextPart(part)) {
+      lastPart.text += part.text;
+      continue;
+    }
+    consolidated.push(part);
+  }
+
+  return consolidated;
+}
+
+export function buildGeminiAssistantHistoryEntry(parts: ReadonlyArray<Part>): Content | undefined {
+  const consolidated = consolidateGeminiModelParts(parts);
+  if (consolidated.length === 0) {
+    return undefined;
+  }
+
+  return {
+    role: "model",
+    parts: consolidated,
+  };
+}
+
+function appendGeminiAssistantHistory(chat: GeminiChat, parts: ReadonlyArray<Part>): void {
+  const historyEntry = buildGeminiAssistantHistoryEntry(parts);
+  if (!historyEntry) {
+    return;
+  }
+
+  chat.addHistory(historyEntry);
+}
+
+function buildGeminiToolErrorResponse(
+  toolName: string,
+  callId: string,
+  error: Error,
+): ReadonlyArray<Part> {
+  return [
+    {
+      functionResponse: {
+        id: callId,
+        name: toolName,
+        response: { error: error.message },
+      },
+    },
+  ];
+}
+
+function summarizeGeminiToolResult(result: ToolResult): string | undefined {
+  if (typeof result.returnDisplay === "string") {
+    return result.returnDisplay;
+  }
+
+  if (typeof result.llmContent === "string") {
+    return result.llmContent;
+  }
+
+  if (Array.isArray(result.llmContent)) {
+    const text = result.llmContent
+      .map((part) =>
+        part && typeof part === "object" && "text" in part && typeof part.text === "string"
+          ? part.text
+          : "",
+      )
+      .join("");
+    return text.length > 0 ? text : undefined;
+  }
+
+  return result.error?.message;
+}
+
+function restoreGeminiHistoryFromResumeCursor(ctx: GeminiSessionContext): void {
+  const resumeState = readGeminiResumeState(ctx.session.resumeCursor);
+  if (!resumeState) {
+    return;
+  }
+
+  ctx.geminiClient.setHistory([...resumeState.history]);
+}
+
+function requestGeminiApproval(input: {
+  readonly ctx: GeminiSessionContext;
+  readonly toolName: string;
+  readonly args: Record<string, unknown>;
+  readonly confirmation: Exclude<ToolCallConfirmationDetails, { type: "ask_user" }>;
+  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
+}): Promise<{ confirmed: boolean; outcome: ToolConfirmationOutcome }> {
+  if (input.ctx.abortController.signal.aborted) {
+    return Promise.resolve({
+      confirmed: false,
+      outcome: ToolConfirmationOutcome.Cancel,
+    });
+  }
+
+  const requestId = buildGeminiPendingId("req");
+  return new Promise((resolve) => {
+    input.ctx.pendingApprovals.set(requestId, {
+      requestType:
+        input.confirmation.type === "edit"
+          ? "file_change_approval"
+          : input.confirmation.type === "exec" || input.confirmation.type === "sandbox_expansion"
+            ? "exec_command_approval"
+            : classifyRequestTypeForTool(input.toolName),
+      detail: buildGeminiApprovalDetailFromConfirmation(input.toolName, input.confirmation),
+      correlationId: requestId,
+      resolve,
+    });
+
+    input.emitEvent({
+      ...makeEventBase(input.ctx),
+      requestId: RuntimeRequestId.makeUnsafe(requestId),
+      type: "request.opened",
+      payload: {
+        requestType:
+          input.confirmation.type === "edit"
+            ? "file_change_approval"
+            : input.confirmation.type === "exec" || input.confirmation.type === "sandbox_expansion"
+              ? "exec_command_approval"
+              : classifyRequestTypeForTool(input.toolName),
+        detail: buildGeminiApprovalDetailFromConfirmation(input.toolName, input.confirmation),
+        args: input.args,
+      },
+    } as ProviderRuntimeEvent);
+  });
+}
+
+function requestGeminiUserInput(input: {
+  readonly ctx: GeminiSessionContext;
+  readonly rawQuestions: unknown;
+  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
+}): Promise<ProviderUserInputAnswers | undefined> {
+  const questions = normalizeGeminiAskUserQuestions(input.rawQuestions);
+  if (questions.length === 0 || input.ctx.abortController.signal.aborted) {
+    return Promise.resolve(undefined);
+  }
+
+  const requestId = buildGeminiPendingId("user-input");
+  return new Promise((resolve) => {
+    input.ctx.pendingUserInputs.set(requestId, {
+      detail: questions[0]?.question ?? "User input requested",
+      correlationId: requestId,
+      questions,
+      resolve,
+    });
+
+    input.emitEvent({
+      ...makeEventBase(input.ctx),
+      requestId: RuntimeRequestId.makeUnsafe(requestId),
+      type: "user-input.requested",
+      payload: {
+        questions,
+      },
+    } as ProviderRuntimeEvent);
+  });
+}
+
+interface GeminiSchedulerAwaitingApprovalCall {
+  readonly status?: string;
+  readonly correlationId?: string;
+  readonly request?: {
+    readonly name?: string;
+    readonly args?: unknown;
+  };
+  readonly confirmationDetails?: {
+    readonly type?: string;
+    readonly fileName?: string;
+    readonly command?: string;
+    readonly toolName?: string;
+    readonly toolDisplayName?: string;
+    readonly prompt?: string;
+  };
+}
+
+interface GeminiSchedulerApprovalRequest {
+  readonly correlationId: string;
+  readonly requestType: CanonicalRequestType;
+  readonly detail: string;
+  readonly args: Record<string, unknown>;
+}
+
+function buildGeminiSchedulerApprovalDetail(call: GeminiSchedulerAwaitingApprovalCall): string {
+  const details = call.confirmationDetails;
+  if (!details) {
+    return call.request?.name ?? "Tool operation";
+  }
+
+  switch (details.type) {
+    case "edit":
+      return `Edit ${details.fileName ?? "file"}`;
+    case "exec":
+      return details.command ?? "Execute command";
+    case "mcp":
+      return `MCP: ${details.toolDisplayName ?? details.toolName ?? "tool"}`;
+    case "info":
+      return details.prompt ?? call.request?.name ?? "Tool operation";
+    case "exit_plan_mode":
+      return "Exit plan mode";
+    default:
+      return call.request?.name ?? "Tool operation";
+  }
+}
+
+export function extractGeminiSchedulerApprovalRequest(
+  call: GeminiSchedulerAwaitingApprovalCall,
+): GeminiSchedulerApprovalRequest | undefined {
+  if (
+    call.status !== "awaiting_approval" ||
+    typeof call.correlationId !== "string" ||
+    typeof call.request?.name !== "string" ||
+    call.confirmationDetails?.type === "ask_user"
+  ) {
+    return undefined;
+  }
+
+  return {
+    correlationId: call.correlationId,
+    requestType: classifyRequestTypeForTool(call.request.name),
+    detail: buildGeminiSchedulerApprovalDetail(call),
+    args:
+      call.request.args &&
+      typeof call.request.args === "object" &&
+      !Array.isArray(call.request.args)
+        ? (call.request.args as Record<string, unknown>)
+        : {},
+  };
+}
+
 function normalizeGeminiAskUserOption(option: unknown): GeminiUserInputQuestionOption | undefined {
   if (!option || typeof option !== "object") {
     return undefined;
@@ -585,170 +896,6 @@ function openGeminiUserInputRequest(input: {
   return true;
 }
 
-function openGeminiUserInputRequestFromScheduler(input: {
-  readonly ctx: GeminiSessionContext;
-  readonly scheduler: Scheduler;
-  readonly messageBus: MessageBus;
-  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
-}): boolean {
-  const schedulerState = (
-    input.scheduler as unknown as {
-      state?: {
-        allActiveCalls?: ReadonlyArray<{
-          status?: string;
-          correlationId?: string;
-          confirmationDetails?: { type?: string; questions?: unknown };
-        }>;
-      };
-    }
-  ).state;
-
-  const waitingAskUserCall = schedulerState?.allActiveCalls?.find(
-    (call) =>
-      call.status === "awaiting_approval" &&
-      typeof call.correlationId === "string" &&
-      call.confirmationDetails?.type === "ask_user",
-  );
-
-  if (!waitingAskUserCall?.correlationId) {
-    return false;
-  }
-
-  return openGeminiUserInputRequest({
-    ctx: input.ctx,
-    messageBus: input.messageBus,
-    emitEvent: input.emitEvent,
-    correlationId: waitingAskUserCall.correlationId,
-    rawQuestions: waitingAskUserCall.confirmationDetails?.questions,
-    responseChannel: "tool_confirmation",
-  });
-}
-
-interface GeminiSchedulerAwaitingApprovalCall {
-  readonly status?: string;
-  readonly correlationId?: string;
-  readonly request?: {
-    readonly name?: string;
-    readonly args?: unknown;
-  };
-  readonly confirmationDetails?: {
-    readonly type?: string;
-    readonly fileName?: string;
-    readonly command?: string;
-    readonly toolName?: string;
-    readonly toolDisplayName?: string;
-    readonly prompt?: string;
-  };
-}
-
-interface GeminiSchedulerApprovalRequest {
-  readonly correlationId: string;
-  readonly requestType: CanonicalRequestType;
-  readonly detail: string;
-  readonly args: Record<string, unknown>;
-}
-
-function buildGeminiSchedulerApprovalDetail(call: GeminiSchedulerAwaitingApprovalCall): string {
-  const details = call.confirmationDetails;
-  if (!details) {
-    return call.request?.name ?? "Tool operation";
-  }
-
-  switch (details.type) {
-    case "edit":
-      return `Edit ${details.fileName ?? "file"}`;
-    case "exec":
-      return details.command ?? "Execute command";
-    case "mcp":
-      return `MCP: ${details.toolDisplayName ?? details.toolName ?? "tool"}`;
-    case "info":
-      return details.prompt ?? call.request?.name ?? "Tool operation";
-    case "exit_plan_mode":
-      return "Exit plan mode";
-    default:
-      return call.request?.name ?? "Tool operation";
-  }
-}
-
-export function extractGeminiSchedulerApprovalRequest(
-  call: GeminiSchedulerAwaitingApprovalCall,
-): GeminiSchedulerApprovalRequest | undefined {
-  if (
-    call.status !== "awaiting_approval" ||
-    typeof call.correlationId !== "string" ||
-    typeof call.request?.name !== "string" ||
-    call.confirmationDetails?.type === "ask_user"
-  ) {
-    return undefined;
-  }
-
-  return {
-    correlationId: call.correlationId,
-    requestType: classifyRequestTypeForTool(call.request.name),
-    detail: buildGeminiSchedulerApprovalDetail(call),
-    args:
-      call.request.args &&
-      typeof call.request.args === "object" &&
-      !Array.isArray(call.request.args)
-        ? (call.request.args as Record<string, unknown>)
-        : {},
-  };
-}
-
-function openGeminiApprovalRequestFromScheduler(input: {
-  readonly ctx: GeminiSessionContext;
-  readonly scheduler: Scheduler;
-  readonly messageBus: MessageBus;
-  readonly emitEvent: (event: ProviderRuntimeEvent) => void;
-}): boolean {
-  const schedulerState = (
-    input.scheduler as unknown as {
-      state?: {
-        allActiveCalls?: ReadonlyArray<GeminiSchedulerAwaitingApprovalCall>;
-      };
-    }
-  ).state;
-
-  const approval = schedulerState?.allActiveCalls
-    ?.map((call) => extractGeminiSchedulerApprovalRequest(call))
-    .find((call): call is GeminiSchedulerApprovalRequest => call !== undefined);
-
-  if (!approval) {
-    return false;
-  }
-
-  const requestId = `req-${approval.correlationId}`;
-  if (input.ctx.pendingApprovals.has(requestId)) {
-    return true;
-  }
-
-  input.ctx.pendingApprovals.set(requestId, {
-    requestType: approval.requestType,
-    detail: approval.detail,
-    correlationId: approval.correlationId,
-    resolve: (response) => {
-      void input.messageBus.publish({
-        type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-        correlationId: approval.correlationId,
-        confirmed: response.confirmed,
-        outcome: response.outcome,
-      });
-    },
-  });
-
-  input.emitEvent({
-    ...makeEventBase(input.ctx),
-    requestId: RuntimeRequestId.makeUnsafe(requestId),
-    type: "request.opened",
-    payload: {
-      requestType: approval.requestType,
-      detail: approval.detail,
-      args: approval.args,
-    },
-  } as ProviderRuntimeEvent);
-  return true;
-}
-
 // ---------------------------------------------------------------------------
 // Helpers — proposed plan extraction (exported for tests)
 // ---------------------------------------------------------------------------
@@ -848,6 +995,77 @@ export function buildGeminiPromptBlocks(input: {
   };
 }
 
+export function buildGeminiAgentMessage(promptText: string): ContentPart[] {
+  // @google/gemini-cli-core@0.37.0 still expects a raw ContentPart[] message payload.
+  // Keep the payload construction isolated here so upgrading to the newer
+  // upstream { content, displayContent } contract only changes one helper.
+  return [{ type: "text", text: promptText }];
+}
+
+export async function* interceptGeminiStream<TEvent, TReturn>(
+  stream: AsyncGenerator<TEvent, TReturn>,
+  onEvent: (event: TEvent) => void,
+): AsyncGenerator<TEvent, TReturn> {
+  let exhausted = false;
+
+  try {
+    while (true) {
+      const result = await stream.next();
+      if (result.done) {
+        exhausted = true;
+        return result.value;
+      }
+
+      onEvent(result.value);
+      yield result.value;
+    }
+  } finally {
+    if (!exhausted && typeof stream.return === "function") {
+      await stream.return(undefined as TReturn);
+    }
+  }
+}
+
+function formatRetryDelayMs(delayMs: number): string {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return "a moment";
+  }
+  if (delayMs < 1_000) {
+    return `${Math.max(1, Math.round(delayMs))}ms`;
+  }
+  if (delayMs < 60_000) {
+    return `${Math.max(1, Math.round(delayMs / 1_000))}s`;
+  }
+  const minutes = Math.floor(delayMs / 60_000);
+  const seconds = Math.round((delayMs % 60_000) / 1_000);
+  if (seconds === 0) {
+    return `${minutes}m`;
+  }
+  return `${minutes}m ${seconds}s`;
+}
+
+function isGeminiCapacityRetry(payload: Pick<RetryAttemptPayload, "error">): boolean {
+  const normalizedError = payload.error?.toLowerCase() ?? "";
+  return (
+    normalizedError.includes("capacity") ||
+    normalizedError.includes("resource_exhausted") ||
+    normalizedError.includes("rate_limit") ||
+    normalizedError.includes("429") ||
+    normalizedError.includes("overloaded")
+  );
+}
+
+export function formatGeminiRetryWarningMessage(
+  payload: Pick<RetryAttemptPayload, "attempt" | "maxAttempts" | "delayMs" | "error">,
+): string {
+  const retryWindow = formatRetryDelayMs(payload.delayMs);
+  const attemptLabel = `attempt ${payload.attempt}/${payload.maxAttempts}`;
+  if (isGeminiCapacityRetry(payload)) {
+    return `Capacity exhausted, retrying in ${retryWindow} (${attemptLabel})`;
+  }
+  return `Request retrying in ${retryWindow} (${attemptLabel})`;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — token usage
 // ---------------------------------------------------------------------------
@@ -866,10 +1084,6 @@ export function formatAgentThoughtText(input: {
   const thought = input.thought.trim();
   if (!input.subject) return thought;
   return thought.length > 0 ? `**${input.subject}** ${thought}` : `**${input.subject}**`;
-}
-
-function isTextContentPart(part: ContentPart): part is Extract<ContentPart, { type: "text" }> {
-  return part.type === "text";
 }
 
 function buildTokenUsageSnapshot(
@@ -911,12 +1125,6 @@ function toMessage(cause: unknown, fallback: string): string {
   return fallback;
 }
 
-export function resolveGeminiAuthType(
-  authTypeFromEnv: AuthType | undefined = getAuthTypeFromEnv(),
-): AuthType {
-  return authTypeFromEnv ?? AuthType.LOGIN_WITH_GOOGLE;
-}
-
 export function readGeminiResumeState(resumeCursor: unknown): GeminiResumeState | undefined {
   if (!resumeCursor || typeof resumeCursor !== "object" || Array.isArray(resumeCursor)) {
     return undefined;
@@ -954,12 +1162,48 @@ function updateResumeCursor(ctx: GeminiSessionContext): void {
   (ctx.session as { resumeCursor?: unknown }).resumeCursor = createGeminiResumeState(ctx);
 }
 
+function abortActiveTurn(ctx: GeminiSessionContext): void {
+  ctx.abortController.abort();
+  const activeAgentSession = ctx.activeAgentSession;
+  if (!activeAgentSession) return;
+  void activeAgentSession.abort().catch((error: unknown) => {
+    console.error("[gemini] Failed to abort active agent session:", error);
+  });
+}
+
+export function buildGeminiPersistedBinding(input: {
+  readonly session: ProviderSession;
+  readonly status: ProviderRuntimeBinding["status"];
+  readonly lastRuntimeEvent: string;
+  readonly lastRuntimeEventAt: string;
+}): ProviderRuntimeBinding {
+  const { session } = input;
+  return {
+    threadId: session.threadId,
+    provider: session.provider,
+    runtimeMode: session.runtimeMode,
+    ...(input.status !== undefined ? { status: input.status } : {}),
+    ...(session.resumeCursor !== undefined ? { resumeCursor: session.resumeCursor } : {}),
+    runtimePayload: {
+      cwd: session.cwd ?? null,
+      model: session.model ?? null,
+      activeTurnId: session.activeTurnId ?? null,
+      lastError: session.lastError ?? null,
+      lastRuntimeEvent: input.lastRuntimeEvent,
+      lastRuntimeEventAt: input.lastRuntimeEventAt,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Adapter factory
 // ---------------------------------------------------------------------------
 
 const makeGeminiAcpAdapter = Effect.gen(function* () {
   const settingsService = yield* ServerSettingsService;
+  const sessionDirectory = yield* ProviderSessionDirectory;
+  const services = yield* Effect.services();
+  const runFork = Effect.runForkWith(services);
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
 
   const sessions = new Map<string, GeminiSessionContext>();
@@ -968,15 +1212,49 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   // because events are emitted from both Effect fibers and plain JS callbacks
   // (MessageBus handlers). For an unbounded queue, offer never blocks.
   const emit = (event: ProviderRuntimeEvent): void => {
-    Effect.runSync(Queue.offer(runtimeEventQueue, event));
+    Effect.runSyncWith(services)(Queue.offer(runtimeEventQueue, event));
   };
 
-  const abortActiveTurn = (ctx: GeminiSessionContext): void => {
-    ctx.abortController.abort();
-    const activeAgentSession = ctx.activeAgentSession;
-    if (!activeAgentSession) return;
-    void activeAgentSession.abort().catch((error: unknown) => {
-      console.error("[gemini] Failed to abort active agent session:", error);
+  const setupRetryAttemptHandler = (ctx: GeminiSessionContext): void => {
+    const onRetryAttempt = (payload: RetryAttemptPayload): void => {
+      if (!ctx.turnState || !ctx.activeStreamPromise || ctx.stopped) {
+        return;
+      }
+      if (payload.model !== ctx.session.model) {
+        return;
+      }
+
+      const activeMatchingSessions = [...sessions.values()].filter(
+        (candidate) =>
+          !candidate.stopped &&
+          candidate.turnState !== undefined &&
+          candidate.activeStreamPromise !== undefined &&
+          candidate.session.model === payload.model,
+      );
+      if (activeMatchingSessions.length !== 1 || activeMatchingSessions[0] !== ctx) {
+        return;
+      }
+
+      const message = formatGeminiRetryWarningMessage(payload);
+      emit({
+        ...makeEventBase(ctx),
+        type: "runtime.warning",
+        payload: {
+          message,
+          detail: {
+            attempt: payload.attempt,
+            maxAttempts: payload.maxAttempts,
+            delayMs: payload.delayMs,
+            error: payload.error,
+            model: payload.model,
+          },
+        },
+      } as ProviderRuntimeEvent);
+    };
+
+    coreEvents.on(CoreEvent.RetryAttempt, onRetryAttempt);
+    ctx.messageBusUnsubscribers.push(() => {
+      coreEvents.off(CoreEvent.RetryAttempt, onRetryAttempt);
     });
   };
 
@@ -1034,7 +1312,6 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       if (ctx.userRequestedMode === "plan") {
         if (isFileModifyingTool(toolName) || isShellWriteTool(toolName, args)) {
           ctx.planModeDeniedInTurn++;
-          ctx.planModeTextSuppressed = true;
 
           void messageBus.publish({
             type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
@@ -1151,140 +1428,235 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     } as ProviderRuntimeEvent);
   }
 
-  function handleAgentEvent(ctx: GeminiSessionContext, event: AgentEvent): void {
-    if (!ctx.turnState) return;
+  function beginGeminiToolCall(
+    ctx: GeminiSessionContext,
+    requestId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): ToolInFlight {
+    const itemType = classifyToolName(toolName);
+    const tool = {
+      itemId: `tool-${requestId}`,
+      itemType,
+      toolName,
+      title: titleForToolType(itemType),
+      input: args,
+    } satisfies ToolInFlight;
 
-    switch (event.type) {
-      case "message": {
-        if (event.role !== "agent") break;
-        if (event._meta?.citation === true) break;
+    ctx.assistantMessageSegment++;
+    ctx.planModeTextSuppressed = false;
+    ctx.inFlightTools.set(requestId, tool);
 
-        for (const part of event.content) {
-          if (part.type === "text") {
-            emitAssistantText(ctx, part.text);
-            continue;
+    emit({
+      ...makeEventBase(ctx),
+      itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+      type: "item.started",
+      payload: {
+        itemType,
+        title: tool.title,
+        detail: toolName,
+        data: args,
+      },
+    } as ProviderRuntimeEvent);
+
+    return tool;
+  }
+
+  function emitGeminiToolOutput(
+    ctx: GeminiSessionContext,
+    tool: ToolInFlight,
+    output: string,
+  ): void {
+    const trimmed = output.trim();
+    if (trimmed.length === 0) {
+      return;
+    }
+
+    emit({
+      ...makeEventBase(ctx),
+      itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+      type: "content.delta",
+      payload: {
+        streamKind: tool.itemType === "command_execution" ? "command_output" : "file_change_output",
+        delta: trimmed,
+      },
+    } as ProviderRuntimeEvent);
+  }
+
+  function completeGeminiToolCall(
+    ctx: GeminiSessionContext,
+    tool: ToolInFlight,
+    status: "completed" | "failed",
+  ): void {
+    ctx.inFlightTools.delete(tool.itemId.replace(/^tool-/, ""));
+    emit({
+      ...makeEventBase(ctx),
+      itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+      type: "item.completed",
+      payload: {
+        itemType: tool.itemType,
+        status,
+      },
+    } as ProviderRuntimeEvent);
+  }
+
+  async function runGeminiTool(
+    ctx: GeminiSessionContext,
+    promptId: string,
+    functionCall: FunctionCall,
+  ): Promise<ReadonlyArray<Part>> {
+    const callId =
+      functionCall.id ?? `tool-${Date.now()}-${ctx.inFlightTools.size + ctx.pendingApprovals.size}`;
+    const toolName = functionCall.name ?? "";
+    const args = (functionCall.args ?? {}) as Record<string, unknown>;
+    const startedAt = Date.now();
+
+    if (!toolName) {
+      return buildGeminiToolErrorResponse("unknown", callId, new Error("Missing function name"));
+    }
+
+    const tool = ctx.config.getToolRegistry().getTool(toolName);
+    if (!tool) {
+      return buildGeminiToolErrorResponse(
+        toolName,
+        callId,
+        new Error(`Tool "${toolName}" not found in registry.`),
+      );
+    }
+
+    const inFlightTool = beginGeminiToolCall(ctx, callId, toolName, args);
+
+    try {
+      const invocation = tool.build(args);
+      const explanation =
+        typeof invocation.getExplanation === "function" ? invocation.getExplanation() : "";
+      if (explanation) {
+        emitReasoningText(ctx, explanation);
+      }
+
+      const forcedDecision = forcedGeminiToolDecision(ctx, toolName, args);
+      if (forcedDecision === "deny" && ctx.userRequestedMode === "plan") {
+        ctx.planModeDeniedInTurn++;
+        if (ctx.planModeDeniedInTurn >= PLAN_MODE_DENY_LIMIT) {
+          abortActiveTurn(ctx);
+        }
+      }
+
+      const confirmation = await invocation.shouldConfirmExecute(
+        ctx.abortController.signal,
+        forcedDecision,
+      );
+
+      if (confirmation) {
+        if (confirmation.type === "ask_user") {
+          const answers = await requestGeminiUserInput({
+            ctx,
+            rawQuestions: confirmation.questions,
+            emitEvent: emit,
+          });
+          const payload =
+            answers === undefined
+              ? undefined
+              : ({
+                  answers: buildGeminiAskUserResponseAnswers({
+                    questions: normalizeGeminiAskUserQuestions(confirmation.questions),
+                    answers,
+                  }),
+                } satisfies ToolConfirmationPayload);
+
+          await confirmation.onConfirm(
+            answers === undefined
+              ? ToolConfirmationOutcome.Cancel
+              : ToolConfirmationOutcome.ProceedOnce,
+            payload,
+          );
+
+          if (answers === undefined) {
+            throw new Error(`Tool "${toolName}" was canceled by the user.`);
           }
-          if (part.type === "thought") {
-            emitReasoningText(
-              ctx,
-              formatAgentThoughtText({
-                thought: part.thought,
-                subject: typeof event._meta?.subject === "string" ? event._meta.subject : undefined,
-              }),
-            );
+        } else {
+          const approval = await requestGeminiApproval({
+            ctx,
+            toolName,
+            args,
+            confirmation,
+            emitEvent: emit,
+          });
+
+          if (confirmation.type === "exit_plan_mode") {
+            await confirmation.onConfirm(approval.outcome, {
+              approved: approval.confirmed,
+            } satisfies ToolConfirmationPayload);
+          } else {
+            await confirmation.onConfirm(approval.outcome);
+          }
+
+          if (!approval.confirmed) {
+            throw new Error(`Tool "${toolName}" was canceled by the user.`);
           }
         }
-        break;
       }
 
-      case "tool_request": {
-        const itemType = classifyToolName(event.name);
-        const itemId = `tool-${event.requestId}`;
+      let liveOutputBuffer = "";
+      const toolResult = await invocation.execute(
+        ctx.abortController.signal,
+        (output: ToolLiveOutput) => {
+          if (typeof output !== "string") {
+            return;
+          }
+          liveOutputBuffer += output;
+          emitGeminiToolOutput(ctx, inFlightTool, output);
+        },
+      );
 
-        ctx.assistantMessageSegment++;
-        ctx.planModeTextSuppressed = false;
-
-        ctx.inFlightTools.set(event.requestId, {
-          itemId,
-          itemType,
-          toolName: event.name,
-          title: titleForToolType(itemType),
-          input: event.args ?? {},
-        });
-
-        emit({
-          ...makeEventBase(ctx),
-          itemId: RuntimeItemId.makeUnsafe(itemId),
-          type: "item.started",
-          payload: {
-            itemType,
-            title: titleForToolType(itemType),
-            detail: event.name,
-            data: event.args ?? {},
-          },
-        } as ProviderRuntimeEvent);
-        break;
+      const resultText = summarizeGeminiToolResult(toolResult);
+      if (resultText && liveOutputBuffer.trim().length === 0) {
+        emitGeminiToolOutput(ctx, inFlightTool, resultText);
       }
 
-      case "tool_response": {
-        const existingTool = ctx.inFlightTools.get(event.requestId);
-        const tool =
-          existingTool ??
-          ({
-            itemId: `tool-${event.requestId}`,
-            itemType: classifyToolName(event.name),
-            toolName: event.name,
-            title: titleForToolType(classifyToolName(event.name)),
-            input: {},
-          } satisfies ToolInFlight);
+      completeGeminiToolCall(ctx, inFlightTool, "completed");
 
-        ctx.inFlightTools.delete(event.requestId);
+      logToolCall(
+        ctx.config,
+        new ToolCallEvent(
+          undefined,
+          toolName,
+          args,
+          Date.now() - startedAt,
+          true,
+          promptId,
+          tool instanceof DiscoveredMCPTool ? "mcp" : "native",
+        ),
+      );
 
-        const outputParts = (event.displayContent ?? event.content)?.filter(
-          (part): part is Extract<ContentPart, { type: "text" }> =>
-            isTextContentPart(part) && part.text.length > 0,
-        );
-        if (outputParts && outputParts.length > 0) {
-          const outputText = outputParts.map((part) => part.text).join("\n");
-          const streamKind =
-            tool.itemType === "command_execution" ? "command_output" : "file_change_output";
-          emit({
-            ...makeEventBase(ctx),
-            itemId: RuntimeItemId.makeUnsafe(tool.itemId),
-            type: "content.delta",
-            payload: {
-              streamKind,
-              delta: outputText,
-            },
-          } as ProviderRuntimeEvent);
-        }
+      return convertToFunctionResponse(
+        toolName,
+        callId,
+        toolResult.llmContent,
+        ctx.config.getActiveModel(),
+        ctx.config,
+      );
+    } catch (error) {
+      const toolError = error instanceof Error ? error : new Error(String(error));
 
-        emit({
-          ...makeEventBase(ctx),
-          itemId: RuntimeItemId.makeUnsafe(tool.itemId),
-          type: "item.completed",
-          payload: {
-            itemType: tool.itemType,
-            status: event.isError ? "failed" : "completed",
-          },
-        } as ProviderRuntimeEvent);
-        break;
-      }
+      emitGeminiToolOutput(ctx, inFlightTool, toolError.message);
+      completeGeminiToolCall(ctx, inFlightTool, "failed");
 
-      case "usage": {
-        ctx.cumulativeInputTokens += event.inputTokens ?? 0;
-        ctx.cumulativeOutputTokens += event.outputTokens ?? 0;
-        break;
-      }
+      logToolCall(
+        ctx.config,
+        new ToolCallEvent(
+          undefined,
+          toolName,
+          args,
+          Date.now() - startedAt,
+          false,
+          promptId,
+          tool instanceof DiscoveredMCPTool ? "mcp" : "native",
+          toolError.message,
+        ),
+      );
 
-      case "error": {
-        console.error("[gemini] Agent session error event:", event.message, event._meta);
-        break;
-      }
-
-      case "agent_end": {
-        const state =
-          event.reason === "aborted"
-            ? "interrupted"
-            : event.reason === "failed"
-              ? "failed"
-              : "completed";
-        const errorMessage =
-          state === "failed" && typeof event.data?.message === "string"
-            ? event.data.message
-            : undefined;
-        completeTurn(ctx, state, event.reason, errorMessage);
-        break;
-      }
-
-      case "initialize":
-      case "session_update":
-      case "agent_start":
-      case "tool_update":
-      case "elicitation_request":
-      case "elicitation_response":
-      case "custom":
-        break;
+      return buildGeminiToolErrorResponse(toolName, callId, toolError);
     }
   }
 
@@ -1294,56 +1666,115 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
   async function runStreamLoop(ctx: GeminiSessionContext, promptText: string): Promise<void> {
     const promptId = `prompt-${Date.now()}`;
-    let scheduler: Scheduler;
-    scheduler = new Scheduler({
-      context: ctx.config,
-      messageBus: ctx.config.getMessageBus(),
-      getPreferredEditor: () => undefined,
-      schedulerId: ROOT_SCHEDULER_ID,
-      onWaitingForConfirmation: (waiting) => {
-        if (!waiting || ctx.stopped || !ctx.turnState) {
+    const chat = ctx.geminiClient.getChat();
+    let nextMessage: Content | null = {
+      role: "user",
+      parts: [{ text: promptText }],
+    };
+
+    try {
+      while (nextMessage !== null && ctx.turnState && !ctx.stopped) {
+        if (ctx.abortController.signal.aborted) {
+          completeTurn(ctx, "interrupted", "aborted");
           return;
         }
 
-        openGeminiApprovalRequestFromScheduler({
-          ctx,
-          scheduler,
-          messageBus: ctx.config.getMessageBus(),
-          emitEvent: emit,
-        });
+        const functionCalls: FunctionCall[] = [];
+        const modelParts: Part[] = [];
+        const routingContext: RoutingContext = {
+          history: chat.getHistory(true),
+          request: nextMessage.parts ?? [],
+          signal: ctx.abortController.signal,
+          requestedModel: ctx.config.getModel(),
+        };
+        const { model } = await ctx.config.getModelRouterService().route(routingContext);
 
-        openGeminiUserInputRequestFromScheduler({
-          ctx,
-          scheduler,
-          messageBus: ctx.config.getMessageBus(),
-          emitEvent: emit,
-        });
-      },
-    });
-    const agentSession = new LegacyAgentSession({
-      client: ctx.geminiClient,
-      scheduler,
-      config: ctx.config,
-      promptId,
-    });
-    ctx.activeAgentSession = agentSession;
+        let responseStream: AsyncGenerator<any>;
+        try {
+          responseStream = await chat.sendMessageStream(
+            { model },
+            nextMessage.parts ?? [],
+            promptId,
+            ctx.abortController.signal,
+            LlmRole.MAIN,
+          );
+        } catch (error) {
+          if (ctx.abortController.signal.aborted) {
+            completeTurn(ctx, "interrupted", "aborted");
+            return;
+          }
+          throw error;
+        }
 
-    const abortListener = (): void => {
-      void agentSession.abort().catch((error: unknown) => {
-        console.error("[gemini] Failed to abort agent session:", error);
-      });
-    };
-    ctx.abortController.signal.addEventListener("abort", abortListener, {
-      once: true,
-    });
+        nextMessage = null;
 
-    try {
-      for await (const event of agentSession.sendStream({
-        message: [{ type: "text", text: promptText }],
-      })) {
-        if (ctx.stopped) break;
-        handleAgentEvent(ctx, event);
-        if (!ctx.turnState) break;
+        try {
+          for await (const response of responseStream) {
+            if (ctx.abortController.signal.aborted) {
+              completeTurn(ctx, "interrupted", "aborted");
+              return;
+            }
+
+            if (response.type !== StreamEventType.CHUNK) {
+              continue;
+            }
+
+            const usage = response.value?.usageMetadata;
+            if (usage) {
+              ctx.cumulativeInputTokens += usage.promptTokenCount ?? 0;
+              ctx.cumulativeOutputTokens += usage.candidatesTokenCount ?? 0;
+            }
+
+            if (Array.isArray(response.value?.functionCalls)) {
+              functionCalls.push(...response.value.functionCalls);
+            }
+
+            const candidate = response.value?.candidates?.[0];
+            for (const part of candidate?.content?.parts ?? []) {
+              if (part.thought && typeof part.text === "string") {
+                emitReasoningText(ctx, part.text);
+                continue;
+              }
+
+              if (typeof part.text === "string") {
+                modelParts.push(part);
+                emitAssistantText(ctx, part.text);
+              }
+            }
+          }
+        } catch (error) {
+          if (ctx.abortController.signal.aborted) {
+            completeTurn(ctx, "interrupted", "aborted");
+            return;
+          }
+
+          if (functionCalls.length === 0 && isGracefulGeminiTurnError(error)) {
+            appendGeminiAssistantHistory(chat, modelParts);
+            break;
+          }
+
+          throw error;
+        }
+
+        if (functionCalls.length === 0) {
+          break;
+        }
+
+        const toolResponseParts: Part[] = [];
+        for (const functionCall of functionCalls) {
+          const responses = await runGeminiTool(ctx, promptId, functionCall);
+          toolResponseParts.push(...responses);
+        }
+
+        if (ctx.abortController.signal.aborted) {
+          completeTurn(ctx, "interrupted", "aborted");
+          return;
+        }
+
+        nextMessage = {
+          role: "user",
+          parts: toolResponseParts,
+        };
       }
 
       if (ctx.turnState) {
@@ -1353,18 +1784,18 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           ctx.abortController.signal.aborted ? "aborted" : "completed",
         );
       }
-    } catch (err: unknown) {
-      if (ctx.stopped) return;
+    } catch (error) {
+      if (ctx.stopped) {
+        return;
+      }
+
       if (ctx.abortController.signal.aborted) {
         completeTurn(ctx, "interrupted", "interrupted");
-      } else {
-        console.error("[gemini] Stream error:", err);
-        completeTurn(ctx, "failed", "error", toMessage(err, "Stream error"));
+        return;
       }
-    } finally {
-      ctx.abortController.signal.removeEventListener("abort", abortListener);
-      ctx.activeAgentSession = undefined;
-      scheduler.dispose();
+
+      console.error("[gemini] Stream error:", error);
+      completeTurn(ctx, "failed", "error", toMessage(error, "Stream error"));
     }
   }
 
@@ -1453,10 +1884,45 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       },
     } as ProviderRuntimeEvent);
 
-    // Store turn
+    // Only completed turns advance the durable Gemini history snapshot.
     const turnId = ctx.turnState.turnId;
-    ctx.turns.push({ id: turnId, items: [] });
-    updateResumeCursor(ctx);
+    if (state === "completed") {
+      ctx.turns.push({ id: turnId, items: [] });
+      updateResumeCursor(ctx);
+    }
+    const completedAt = new Date().toISOString();
+    const mutableSession = ctx.session as {
+      status: ProviderSession["status"];
+      activeTurnId: TurnId | undefined;
+      updatedAt: string;
+      lastError?: string;
+    };
+    mutableSession.status = state === "failed" ? "error" : "ready";
+    mutableSession.activeTurnId = undefined;
+    mutableSession.updatedAt = completedAt;
+    if (errorMessage) {
+      mutableSession.lastError = errorMessage;
+    }
+    runFork(
+      sessionDirectory
+        .upsert(
+          buildGeminiPersistedBinding({
+            session: ctx.session,
+            status: state === "failed" ? "error" : "running",
+            lastRuntimeEvent: "turn.completed",
+            lastRuntimeEventAt: completedAt,
+          }),
+        )
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("failed to persist Gemini session after turn completion", {
+              threadId: ctx.session.threadId,
+              status: state,
+              cause,
+            }),
+          ),
+        ),
+    );
 
     emit({
       ...makeEventBase(ctx),
@@ -1508,17 +1974,12 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
       // Create and initialize Config
       const workDir = (input.cwd as string | undefined) ?? process.cwd();
-      const config = new Config({
+      const config = createGeminiCoreConfig({
         sessionId: threadId as string,
-        targetDir: workDir,
         cwd: workDir,
         model: modelId,
-        clientVersion: "0.36.0",
-        debugMode: false,
-        approvalMode: runtimeMode === "full-access" ? ApprovalMode.AUTO_EDIT : ApprovalMode.DEFAULT,
+        runtimeMode,
         interactive: true,
-        ptyInfo: "node-pty",
-        acpMode: true,
       });
 
       yield* Effect.tryPromise({
@@ -1592,11 +2053,15 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         cumulativeReasoningTokens: 0,
         lastKnownMaxTokens: undefined,
         inFlightTools: new Map(),
-        turns: [],
+        turns: Array.from({ length: resumeState?.turnCount ?? 0 }, (_, index) => ({
+          id: `restored-turn-${index}`,
+          items: [],
+        })),
         activeStreamPromise: undefined,
         activeAgentSession: undefined,
       };
       updateResumeCursor(ctx);
+      setupRetryAttemptHandler(ctx);
 
       // Wire up MessageBus for tool confirmations
       const messageBus = config.getMessageBus();
@@ -1632,6 +2097,19 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   > =>
     Effect.gen(function* () {
       const ctx = yield* getSession(input.threadId);
+      yield* Effect.sync(() => {
+        restoreGeminiHistoryFromResumeCursor(ctx);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+              detail: `Failed to restore Gemini history before turn start: ${toMessage(cause, "unknown error")}`,
+              cause,
+            }),
+        ),
+      );
 
       const interactionMode = input.interactionMode ?? ctx.userRequestedMode;
       ctx.userRequestedMode = interactionMode;

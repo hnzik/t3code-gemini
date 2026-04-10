@@ -1,8 +1,11 @@
 import { assert, describe, it } from "@effect/vitest";
 import { AuthType, QuestionType } from "@google/gemini-cli-core";
+import { ThreadId } from "@t3tools/contracts";
 
 import {
+  buildGeminiPersistedBinding,
   buildGeminiAgentMessage,
+  buildGeminiAssistantHistoryEntry,
   buildGeminiAskUserResponseAnswers,
   buildGeminiPromptBlocks,
   extractGeminiSchedulerApprovalRequest,
@@ -139,6 +142,48 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
     assert.deepStrictEqual(readGeminiResumeState({ history: [], turnCount: -1 }), {
       history: [],
       turnCount: 0,
+    });
+  });
+
+  it("builds the persisted Gemini runtime binding from the completed session state", () => {
+    const binding = buildGeminiPersistedBinding({
+      session: {
+        provider: "geminiAcp",
+        threadId: ThreadId.makeUnsafe("thread-1"),
+        status: "ready",
+        runtimeMode: "full-access",
+        cwd: "/tmp/project",
+        model: "gemini-3.1-pro-preview",
+        resumeCursor: {
+          history: [{ role: "user", parts: [{ text: "Hello" }] }],
+          turnCount: 1,
+        },
+        lastError: "previous failure",
+        createdAt: "2026-04-09T17:00:00.000Z",
+        updatedAt: "2026-04-09T17:05:00.000Z",
+      },
+      status: "running",
+      lastRuntimeEvent: "turn.completed",
+      lastRuntimeEventAt: "2026-04-09T17:05:30.000Z",
+    });
+
+    assert.deepStrictEqual(binding, {
+      threadId: ThreadId.makeUnsafe("thread-1"),
+      provider: "geminiAcp",
+      runtimeMode: "full-access",
+      status: "running",
+      resumeCursor: {
+        history: [{ role: "user", parts: [{ text: "Hello" }] }],
+        turnCount: 1,
+      },
+      runtimePayload: {
+        cwd: "/tmp/project",
+        model: "gemini-3.1-pro-preview",
+        activeTurnId: null,
+        lastError: "previous failure",
+        lastRuntimeEvent: "turn.completed",
+        lastRuntimeEventAt: "2026-04-09T17:05:30.000Z",
+      },
     });
   });
 });
@@ -299,6 +344,25 @@ describe("GeminiAcpAdapter scheduler approval extraction", () => {
     });
 
     assert.equal(approval, undefined);
+  });
+});
+
+describe("GeminiAcpAdapter assistant history repair", () => {
+  it("builds a model history entry from streamed no-tool text chunks", () => {
+    const historyEntry = buildGeminiAssistantHistoryEntry([
+      { text: "Ano, takhle " },
+      { text: "je to lepší." },
+    ]);
+
+    assert.deepStrictEqual(historyEntry, {
+      role: "model",
+      parts: [{ text: "Ano, takhle je to lepší." }],
+    });
+  });
+
+  it("returns undefined when there is no visible assistant content to persist", () => {
+    const historyEntry = buildGeminiAssistantHistoryEntry([]);
+    assert.equal(historyEntry, undefined);
   });
 });
 
