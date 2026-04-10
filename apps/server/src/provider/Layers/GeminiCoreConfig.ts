@@ -1,9 +1,4 @@
-import {
-  ApprovalMode,
-  AuthType,
-  Config,
-  getAuthTypeFromEnv,
-} from "@google/gemini-cli-core";
+import { ApprovalMode, AuthType, Config, getAuthTypeFromEnv } from "@google/gemini-cli-core";
 
 export const GEMINI_CORE_CLIENT_VERSION = "0.37.1";
 export const DEFAULT_GEMINI_MODEL = "gemini-2.5-pro";
@@ -32,9 +27,7 @@ export function createGeminiCoreConfig(input: {
     clientVersion: GEMINI_CORE_CLIENT_VERSION,
     debugMode: false,
     approvalMode:
-      input.runtimeMode === "full-access"
-        ? ApprovalMode.AUTO_EDIT
-        : ApprovalMode.DEFAULT,
+      input.runtimeMode === "full-access" ? ApprovalMode.AUTO_EDIT : ApprovalMode.DEFAULT,
     interactive: input.interactive ?? true,
     ptyInfo: "node-pty",
     acpMode: true,

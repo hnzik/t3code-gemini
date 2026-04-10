@@ -8,10 +8,12 @@ import {
   buildGeminiAssistantHistoryEntry,
   buildGeminiAskUserResponseAnswers,
   buildGeminiPromptBlocks,
+  composeGeminiSystemInstruction,
   extractGeminiSchedulerApprovalRequest,
   extractVisibleAssistantText,
   formatGeminiRetryWarningMessage,
   formatAgentThoughtText,
+  formatGeminiSubagentActivityDetail,
   interceptGeminiStream,
   normalizeGeminiAskUserQuestions,
   readGeminiResumeState,
@@ -36,11 +38,19 @@ describe("GeminiAcpAdapter proposed plan parsing", () => {
 
   it("withholds partial proposed-plan opening tags until they are resolved", () => {
     assert.equal(extractVisibleAssistantText("Hello <proposed_"), "Hello ");
-    assert.equal(extractVisibleAssistantText("Hello <proposed_x"), "Hello <proposed_x");
+    assert.equal(
+      extractVisibleAssistantText("Hello <proposed_x"),
+      "Hello <proposed_x",
+    );
   });
 
   it("only emits text outside the proposed-plan block across streamed chunks", () => {
-    const chunks = ["Intro: ", "<propose", "d_plan>\n# Plan\n", "</proposed_plan> Outro"];
+    const chunks = [
+      "Intro: ",
+      "<propose",
+      "d_plan>\n# Plan\n",
+      "</proposed_plan> Outro",
+    ];
 
     let rawText = "";
     let visibleLength = 0;
@@ -112,6 +122,37 @@ describe("GeminiAcpAdapter agent-event helpers", () => {
       "Need to verify the changed files first.",
     );
   });
+
+  it("formats subagent thought updates for the work log", () => {
+    assert.equal(
+      formatGeminiSubagentActivityDetail({
+        subagentName: "generalist",
+        activity: {
+          type: "thought",
+          content: "Scanning the repository layout first.",
+          status: "running",
+        },
+      }),
+      "generalist: Scanning the repository layout first.",
+    );
+  });
+
+  it("formats subagent tool call updates for the work log", () => {
+    assert.equal(
+      formatGeminiSubagentActivityDetail({
+        subagentName: "codebase_investigator",
+        activity: {
+          type: "tool_call",
+          content: "rg",
+          displayName: "Search code",
+          description: "Looking for the WebSocket handlers.",
+          args: '{\"pattern\":\"websocket\"}',
+          status: "completed",
+        },
+      }),
+      'codebase_investigator: Search code - Looking for the WebSocket handlers. - {"pattern":"websocket"} - status=completed',
+    );
+  });
 });
 
 describe("GeminiAcpAdapter auth and resume helpers", () => {
@@ -120,8 +161,14 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
   });
 
   it("preserves env-selected Gemini auth modes", () => {
-    assert.equal(resolveGeminiAuthType(AuthType.USE_GEMINI), AuthType.USE_GEMINI);
-    assert.equal(resolveGeminiAuthType(AuthType.USE_VERTEX_AI), AuthType.USE_VERTEX_AI);
+    assert.equal(
+      resolveGeminiAuthType(AuthType.USE_GEMINI),
+      AuthType.USE_GEMINI,
+    );
+    assert.equal(
+      resolveGeminiAuthType(AuthType.USE_VERTEX_AI),
+      AuthType.USE_VERTEX_AI,
+    );
   });
 
   it("reads persisted Gemini resume state", () => {
@@ -139,10 +186,13 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
   it("rejects invalid Gemini resume cursors", () => {
     assert.equal(readGeminiResumeState(undefined), undefined);
     assert.equal(readGeminiResumeState({ turnCount: 2 }), undefined);
-    assert.deepStrictEqual(readGeminiResumeState({ history: [], turnCount: -1 }), {
-      history: [],
-      turnCount: 0,
-    });
+    assert.deepStrictEqual(
+      readGeminiResumeState({ history: [], turnCount: -1 }),
+      {
+        history: [],
+        turnCount: 0,
+      },
+    );
   });
 
   it("builds the persisted Gemini runtime binding from the completed session state", () => {
@@ -373,53 +423,35 @@ describe("GeminiAcpAdapter default-mode prompting", () => {
     ]);
   });
 
-  it("prepends the default-mode prompt on the first non-plan turn", () => {
+  it("only forwards user input as the message payload", () => {
     const built = buildGeminiPromptBlocks({
-      interactionMode: "default",
       userInput: "Please update the adapter.",
-      planModePromptSent: false,
-      defaultModePromptSent: false,
     });
 
-    assert.equal(built.promptBlocks.length, 2);
-    assert.equal(built.defaultModePromptSent, true);
-    assert.equal(built.planModePromptSent, false);
-    assert.equal(
-      built.promptBlocks[0]?.text.includes("Do **NOT** ask a blocking question and then continue"),
-      true,
-    );
-    assert.equal(built.promptBlocks[1]?.text, "Please update the adapter.");
+    assert.equal(built.promptBlocks.length, 1);
+    assert.equal(built.promptBlocks[0]?.text, "Please update the adapter.");
   });
 
-  it("uses the shorter default-mode reminder after the first non-plan turn", () => {
+  it("returns an empty prompt payload when the user sends no text", () => {
     const built = buildGeminiPromptBlocks({
-      interactionMode: "default",
-      userInput: "Continue.",
-      planModePromptSent: false,
-      defaultModePromptSent: true,
+      userInput: undefined,
     });
 
-    assert.equal(built.promptBlocks.length, 2);
-    assert.equal(
-      built.promptBlocks[0]?.text.includes("ask the question and end the turn immediately"),
-      true,
-    );
-    assert.equal(built.promptBlocks[1]?.text, "Continue.");
+    assert.equal(built.promptBlocks.length, 0);
   });
 
-  it("keeps plan-mode prompting separate from default-mode prompting", () => {
-    const built = buildGeminiPromptBlocks({
-      interactionMode: "plan",
-      userInput: "Refine the plan.",
-      planModePromptSent: false,
-      defaultModePromptSent: true,
-    });
+  it("appends the plan-mode instruction to the Gemini CLI system prompt", () => {
+    const built = composeGeminiSystemInstruction("base system prompt", "plan");
 
-    assert.equal(built.promptBlocks.length, 2);
-    assert.equal(built.planModePromptSent, true);
-    assert.equal(built.defaultModePromptSent, true);
-    assert.equal(built.promptBlocks[0]?.text.includes("# Plan Mode"), true);
-    assert.equal(built.promptBlocks[1]?.text, "Refine the plan.");
+    assert.equal(built.startsWith("base system prompt"), true);
+    assert.equal(built.includes("# Plan Mode"), true);
+  });
+
+  it("leaves the Gemini CLI system prompt unchanged outside plan mode", () => {
+    assert.equal(
+      composeGeminiSystemInstruction("base system prompt", "default"),
+      "base system prompt",
+    );
   });
 });
 
