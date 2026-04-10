@@ -21,7 +21,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
   traitsMenuContent?: ReactNode;
   onToggleInteractionMode: () => void;
   onTogglePlanSidebar: () => void;
-  onToggleRuntimeMode: () => void;
+  onRuntimeModeChange: (mode: RuntimeMode) => void;
 }) {
   return (
     <Menu>
@@ -65,7 +65,7 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
           value={props.runtimeMode}
           onValueChange={(value) => {
             if (!value || value === props.runtimeMode) return;
-            props.onToggleRuntimeMode();
+            props.onRuntimeModeChange(value as RuntimeMode);
           }}
         >
           <MenuRadioItem value="approval-required" disabled={props.modeChangeDisabled}>

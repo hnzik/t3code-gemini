@@ -38,19 +38,11 @@ describe("GeminiAcpAdapter proposed plan parsing", () => {
 
   it("withholds partial proposed-plan opening tags until they are resolved", () => {
     assert.equal(extractVisibleAssistantText("Hello <proposed_"), "Hello ");
-    assert.equal(
-      extractVisibleAssistantText("Hello <proposed_x"),
-      "Hello <proposed_x",
-    );
+    assert.equal(extractVisibleAssistantText("Hello <proposed_x"), "Hello <proposed_x");
   });
 
   it("only emits text outside the proposed-plan block across streamed chunks", () => {
-    const chunks = [
-      "Intro: ",
-      "<propose",
-      "d_plan>\n# Plan\n",
-      "</proposed_plan> Outro",
-    ];
+    const chunks = ["Intro: ", "<propose", "d_plan>\n# Plan\n", "</proposed_plan> Outro"];
 
     let rawText = "";
     let visibleLength = 0;
@@ -161,14 +153,8 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
   });
 
   it("preserves env-selected Gemini auth modes", () => {
-    assert.equal(
-      resolveGeminiAuthType(AuthType.USE_GEMINI),
-      AuthType.USE_GEMINI,
-    );
-    assert.equal(
-      resolveGeminiAuthType(AuthType.USE_VERTEX_AI),
-      AuthType.USE_VERTEX_AI,
-    );
+    assert.equal(resolveGeminiAuthType(AuthType.USE_GEMINI), AuthType.USE_GEMINI);
+    assert.equal(resolveGeminiAuthType(AuthType.USE_VERTEX_AI), AuthType.USE_VERTEX_AI);
   });
 
   it("reads persisted Gemini resume state", () => {
@@ -186,13 +172,10 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
   it("rejects invalid Gemini resume cursors", () => {
     assert.equal(readGeminiResumeState(undefined), undefined);
     assert.equal(readGeminiResumeState({ turnCount: 2 }), undefined);
-    assert.deepStrictEqual(
-      readGeminiResumeState({ history: [], turnCount: -1 }),
-      {
-        history: [],
-        turnCount: 0,
-      },
-    );
+    assert.deepStrictEqual(readGeminiResumeState({ history: [], turnCount: -1 }), {
+      history: [],
+      turnCount: 0,
+    });
   });
 
   it("builds the persisted Gemini runtime binding from the completed session state", () => {

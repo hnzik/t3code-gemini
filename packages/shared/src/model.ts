@@ -123,9 +123,7 @@ export function normalizeGeminiModelOptionsWithCapabilities(
   modelOptions: GeminiModelOptions | null | undefined,
 ): GeminiModelOptions | undefined {
   const mode = modelOptions?.mode;
-  const nextOptions: GeminiModelOptions = {
-    ...(mode !== undefined ? { mode } : {}),
-  };
+  const nextOptions: GeminiModelOptions = mode === undefined ? {} : { mode };
   return Object.keys(nextOptions).length > 0 ? nextOptions : undefined;
 }
 
