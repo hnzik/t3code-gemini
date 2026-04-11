@@ -1,120 +1,26 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { assert, describe, it } from "@effect/vitest";
 import { AuthType, QuestionType } from "@google/gemini-cli-core";
 import { ThreadId } from "@t3tools/contracts";
 
 import {
+  applyGeminiAssistantTextChunk,
   buildGeminiPersistedBinding,
-  buildGeminiAgentMessage,
   buildGeminiAssistantHistoryEntry,
   buildGeminiAskUserResponseAnswers,
-  buildGeminiPromptBlocks,
-  composeGeminiSystemInstruction,
-  extractGeminiSchedulerApprovalRequest,
-  extractVisibleAssistantText,
   formatGeminiRetryWarningMessage,
-  formatAgentThoughtText,
   formatGeminiSubagentActivityDetail,
-  interceptGeminiStream,
+  inferGeminiTurnHistoryLengths,
   normalizeGeminiAskUserQuestions,
+  readGeminiPlanMarkdownFromFile,
   readGeminiResumeState,
-  shouldApplyUsageUpdate,
 } from "./GeminiAcpAdapter.ts";
 import { resolveGeminiAuthType } from "./GeminiCoreConfig";
 
-describe("GeminiAcpAdapter proposed plan parsing", () => {
-  it("removes complete proposed-plan blocks from visible assistant text", () => {
-    const visibleText = extractVisibleAssistantText(
-      [
-        "Here is the plan:\n",
-        "<proposed_plan>",
-        "\n# Ship it\n",
-        "</proposed_plan>",
-        "\nAnything else?",
-      ].join(""),
-    );
-
-    assert.equal(visibleText, "Here is the plan:\n\nAnything else?");
-  });
-
-  it("withholds partial proposed-plan opening tags until they are resolved", () => {
-    assert.equal(extractVisibleAssistantText("Hello <proposed_"), "Hello ");
-    assert.equal(extractVisibleAssistantText("Hello <proposed_x"), "Hello <proposed_x");
-  });
-
-  it("only emits text outside the proposed-plan block across streamed chunks", () => {
-    const chunks = ["Intro: ", "<propose", "d_plan>\n# Plan\n", "</proposed_plan> Outro"];
-
-    let rawText = "";
-    let visibleLength = 0;
-    const deltas: string[] = [];
-
-    for (const chunk of chunks) {
-      rawText += chunk;
-      const visibleText = extractVisibleAssistantText(rawText);
-      const delta = visibleText.slice(visibleLength);
-      visibleLength = visibleText.length;
-      deltas.push(delta);
-    }
-
-    assert.deepStrictEqual(deltas, ["Intro: ", "", "", " Outro"]);
-  });
-});
-
-describe("GeminiAcpAdapter usage update gating", () => {
-  it("ignores replay-phase usage updates until fresh content begins", () => {
-    assert.equal(
-      shouldApplyUsageUpdate(
-        {
-          turnId: "turn-1",
-          startedAt: new Date().toISOString(),
-          reasoningItemEmitted: false,
-        },
-        false,
-      ),
-      false,
-    );
-  });
-
-  it("accepts usage updates once the turn has fresh content", () => {
-    assert.equal(
-      shouldApplyUsageUpdate(
-        {
-          turnId: "turn-1",
-          startedAt: new Date().toISOString(),
-          reasoningItemEmitted: false,
-        },
-        true,
-      ),
-      true,
-    );
-  });
-
-  it("accepts usage updates outside an active turn", () => {
-    assert.equal(shouldApplyUsageUpdate(undefined, false), true);
-  });
-});
-
 describe("GeminiAcpAdapter agent-event helpers", () => {
-  it("formats thought text with the upstream subject metadata", () => {
-    assert.equal(
-      formatAgentThoughtText({
-        subject: "Check context",
-        thought: "Need to verify the changed files first.",
-      }),
-      "**Check context** Need to verify the changed files first.",
-    );
-  });
-
-  it("falls back to plain thought text when no subject is present", () => {
-    assert.equal(
-      formatAgentThoughtText({
-        subject: undefined,
-        thought: "Need to verify the changed files first.",
-      }),
-      "Need to verify the changed files first.",
-    );
-  });
-
   it("formats subagent thought updates for the work log", () => {
     assert.equal(
       formatGeminiSubagentActivityDetail({
@@ -138,7 +44,7 @@ describe("GeminiAcpAdapter agent-event helpers", () => {
           content: "rg",
           displayName: "Search code",
           description: "Looking for the WebSocket handlers.",
-          args: '{\"pattern\":\"websocket\"}',
+          args: '{"pattern":"websocket"}',
           status: "completed",
         },
       }),
@@ -159,14 +65,57 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
 
   it("reads persisted Gemini resume state", () => {
     const resumeState = readGeminiResumeState({
-      history: [{ role: "user", parts: [{ text: "Hello" }] }],
+      history: [
+        { role: "user", parts: [{ text: "Hello" }] },
+        { role: "model", parts: [{ text: "Hi" }] },
+        { role: "user", parts: [{ text: "Again" }] },
+        { role: "model", parts: [{ text: "Sure" }] },
+        { role: "user", parts: [{ text: "Third" }] },
+        { role: "model", parts: [{ text: "Done" }] },
+      ],
       turnCount: 3,
+      turnHistoryLengths: [2, 4, 6],
     });
 
     assert.deepStrictEqual(resumeState, {
-      history: [{ role: "user", parts: [{ text: "Hello" }] }],
+      history: [
+        { role: "user", parts: [{ text: "Hello" }] },
+        { role: "model", parts: [{ text: "Hi" }] },
+        { role: "user", parts: [{ text: "Again" }] },
+        { role: "model", parts: [{ text: "Sure" }] },
+        { role: "user", parts: [{ text: "Third" }] },
+        { role: "model", parts: [{ text: "Done" }] },
+      ],
       turnCount: 3,
+      turnHistoryLengths: [2, 4, 6],
     });
+  });
+
+  it("infers Gemini turn history boundaries for legacy resume cursors", () => {
+    const history = [
+      { role: "user", parts: [{ text: "First prompt" }] },
+      { role: "model", parts: [{ text: "Need to inspect files" }] },
+      {
+        role: "user",
+        parts: [{ functionResponse: { id: "tool-1", name: "rg", response: { ok: true } } }],
+      },
+      { role: "model", parts: [{ text: "Inspection complete" }] },
+      { role: "user", parts: [{ text: "Second prompt" }] },
+      { role: "model", parts: [{ text: "Second answer" }] },
+    ];
+
+    assert.deepStrictEqual(inferGeminiTurnHistoryLengths(history), [4, 6]);
+    assert.deepStrictEqual(
+      readGeminiResumeState({
+        history,
+        turnCount: 2,
+      }),
+      {
+        history,
+        turnCount: 2,
+        turnHistoryLengths: [4, 6],
+      },
+    );
   });
 
   it("rejects invalid Gemini resume cursors", () => {
@@ -176,6 +125,18 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
       history: [],
       turnCount: 0,
     });
+  });
+
+  it("reads proposed plans from Gemini CLI plan files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gemini-plan-"));
+    try {
+      const planPath = join(dir, "ship-it.md");
+      await writeFile(planPath, "\n# Ship it\n\n- one\n- two\n", "utf8");
+
+      assert.equal(await readGeminiPlanMarkdownFromFile(planPath), "# Ship it\n\n- one\n- two");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("builds the persisted Gemini runtime binding from the completed session state", () => {
@@ -190,6 +151,7 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
         resumeCursor: {
           history: [{ role: "user", parts: [{ text: "Hello" }] }],
           turnCount: 1,
+          turnHistoryLengths: [1],
         },
         lastError: "previous failure",
         createdAt: "2026-04-09T17:00:00.000Z",
@@ -208,6 +170,7 @@ describe("GeminiAcpAdapter auth and resume helpers", () => {
       resumeCursor: {
         history: [{ role: "user", parts: [{ text: "Hello" }] }],
         turnCount: 1,
+        turnHistoryLengths: [1],
       },
       runtimePayload: {
         cwd: "/tmp/project",
@@ -330,57 +293,48 @@ describe("GeminiAcpAdapter ask-user helpers", () => {
   });
 });
 
-describe("GeminiAcpAdapter scheduler approval extraction", () => {
-  it("extracts edit approvals from scheduler awaiting-approval state", () => {
-    const approval = extractGeminiSchedulerApprovalRequest({
-      status: "awaiting_approval",
-      correlationId: "corr-1",
-      request: {
-        name: "replace",
-        args: {
-          file_path: "chapters-raw/chapter-5.md",
-          old_string: "old",
-          new_string: "new",
-        },
-      },
-      confirmationDetails: {
-        type: "edit",
-        fileName: "chapter-5.md",
-      },
-    });
-
-    assert.deepStrictEqual(approval, {
-      correlationId: "corr-1",
-      requestType: "file_change_approval",
-      detail: "Edit chapter-5.md",
-      args: {
-        file_path: "chapters-raw/chapter-5.md",
-        old_string: "old",
-        new_string: "new",
-      },
-    });
-  });
-
-  it("skips ask_user confirmations because they are handled separately", () => {
-    const approval = extractGeminiSchedulerApprovalRequest({
-      status: "awaiting_approval",
-      correlationId: "corr-2",
-      request: {
-        name: "replace",
-        args: {
-          file_path: "chapters-raw/chapter-5.md",
-        },
-      },
-      confirmationDetails: {
-        type: "ask_user",
-      },
-    });
-
-    assert.equal(approval, undefined);
-  });
-});
-
 describe("GeminiAcpAdapter assistant history repair", () => {
+  it("extracts only the appended suffix from cumulative Gemini text snapshots", () => {
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("", "Ahoj"), {
+      nextText: "Ahoj",
+      delta: "Ahoj",
+    });
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("Ahoj", "Ahoj světe"), {
+      nextText: "Ahoj světe",
+      delta: " světe",
+    });
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("Ahoj světe", "Ahoj světe"), {
+      nextText: "Ahoj světe",
+      delta: "",
+    });
+  });
+
+  it("still appends true Gemini delta chunks without losing text", () => {
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("", "Ahoj"), {
+      nextText: "Ahoj",
+      delta: "Ahoj",
+    });
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("Ahoj", " světe"), {
+      nextText: "Ahoj světe",
+      delta: " světe",
+    });
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("Ahoj světe", "!"), {
+      nextText: "Ahoj světe!",
+      delta: "!",
+    });
+  });
+
+  it("drops repeated overlapping Gemini chunks instead of stitching them into the UI", () => {
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("Ahoj světe", "světe"), {
+      nextText: "Ahoj světe",
+      delta: "",
+    });
+    assert.deepStrictEqual(applyGeminiAssistantTextChunk("Ahoj svě", "ěte"), {
+      nextText: "Ahoj světe",
+      delta: "te",
+    });
+  });
+
   it("builds a model history entry from streamed no-tool text chunks", () => {
     const historyEntry = buildGeminiAssistantHistoryEntry([
       { text: "Ano, takhle " },
@@ -396,67 +350,5 @@ describe("GeminiAcpAdapter assistant history repair", () => {
   it("returns undefined when there is no visible assistant content to persist", () => {
     const historyEntry = buildGeminiAssistantHistoryEntry([]);
     assert.equal(historyEntry, undefined);
-  });
-});
-
-describe("GeminiAcpAdapter default-mode prompting", () => {
-  it("builds the installed LegacyAgentSession message payload", () => {
-    assert.deepStrictEqual(buildGeminiAgentMessage("Refine the plan"), [
-      { type: "text", text: "Refine the plan" },
-    ]);
-  });
-
-  it("only forwards user input as the message payload", () => {
-    const built = buildGeminiPromptBlocks({
-      userInput: "Please update the adapter.",
-    });
-
-    assert.equal(built.promptBlocks.length, 1);
-    assert.equal(built.promptBlocks[0]?.text, "Please update the adapter.");
-  });
-
-  it("returns an empty prompt payload when the user sends no text", () => {
-    const built = buildGeminiPromptBlocks({
-      userInput: undefined,
-    });
-
-    assert.equal(built.promptBlocks.length, 0);
-  });
-
-  it("appends the plan-mode instruction to the Gemini CLI system prompt", () => {
-    const built = composeGeminiSystemInstruction("base system prompt", "plan");
-
-    assert.equal(built.startsWith("base system prompt"), true);
-    assert.equal(built.includes("# Plan Mode"), true);
-  });
-
-  it("leaves the Gemini CLI system prompt unchanged outside plan mode", () => {
-    assert.equal(
-      composeGeminiSystemInstruction("base system prompt", "default"),
-      "base system prompt",
-    );
-  });
-});
-
-describe("GeminiAcpAdapter stream interception", () => {
-  it("closes the wrapped Gemini stream when the consumer stops early", async () => {
-    let innerClosed = false;
-
-    async function* innerStream(): AsyncGenerator<number, string> {
-      try {
-        yield 1;
-        yield 2;
-        return "done";
-      } finally {
-        innerClosed = true;
-      }
-    }
-
-    const wrapped = interceptGeminiStream(innerStream(), () => {});
-
-    assert.deepStrictEqual(await wrapped.next(), { done: false, value: 1 });
-    await wrapped.return("" as string);
-
-    assert.equal(innerClosed, true);
   });
 });

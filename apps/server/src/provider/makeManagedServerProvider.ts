@@ -10,6 +10,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
 >(input: {
   readonly getSettings: Effect.Effect<Settings>;
   readonly streamSettings: Stream.Stream<Settings>;
+  readonly refreshTriggers?: Stream.Stream<unknown>;
   readonly haveSettingsChanged: (previous: Settings, next: Settings) => boolean;
   readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
   readonly refreshInterval?: Duration.Input;
@@ -52,6 +53,12 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   yield* Stream.runForEach(input.streamSettings, (nextSettings) =>
     Effect.asVoid(applySnapshot(nextSettings)),
   ).pipe(Effect.forkScoped);
+
+  if (input.refreshTriggers) {
+    yield* Stream.runForEach(input.refreshTriggers, () => Effect.asVoid(refreshSnapshot())).pipe(
+      Effect.forkScoped,
+    );
+  }
 
   yield* Effect.forever(
     Effect.sleep(input.refreshInterval ?? "60 seconds").pipe(

@@ -32,13 +32,16 @@ import {
 } from "./CodexProvider";
 import { checkClaudeProviderStatus, parseClaudeAuthStatusFromOutput } from "./ClaudeProvider";
 import {
+  buildGeminiManualAuthRequiredMessage,
   checkGeminiAcpProviderStatus,
   hasGeminiAdcConfiguration,
   hasGeminiGoogleOAuthSession,
+  resolveGeminiEffectiveAuthProbeResult,
   validateGeminiAuthConfiguration,
 } from "./GeminiAcpProvider";
 import { haveProvidersChanged, ProviderRegistryLive } from "./ProviderRegistry";
 import { ServerSettingsService, type ServerSettingsShape } from "../../serverSettings";
+import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState";
 import { ProviderRegistry } from "../Services/ProviderRegistry";
 
 // ── Test helpers ────────────────────────────────────────────────────
@@ -103,6 +106,13 @@ function failingSpawnerLayer(description: string) {
     ),
   );
 }
+
+const geminiAuthRuntimeStateLayer = Layer.succeed(GeminiAuthRuntimeState, {
+  getFailure: Effect.void.pipe(Effect.as(undefined)),
+  requireManualLogin: () => Effect.void,
+  clearFailure: Effect.void,
+  streamChanges: Stream.empty,
+});
 
 function makeMutableServerSettingsService(
   initial: ContractServerSettings = DEFAULT_SERVER_SETTINGS,
@@ -529,6 +539,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const providerRegistryLayer = ProviderRegistryLive.pipe(
             Layer.provideMerge(Layer.succeed(ServerSettingsService, serverSettings)),
+            Layer.provideMerge(geminiAuthRuntimeStateLayer),
             Layer.provideMerge(
               mockCommandSpawnerLayer((command, args) => {
                 const joined = args.join(" ");
@@ -1105,6 +1116,44 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
     });
 
     describe("checkGeminiAcpProviderStatus", () => {
+      it("surfaces manual Gemini auth failures as provider errors until auth is restored", () => {
+        const result = resolveGeminiEffectiveAuthProbeResult({
+          authType: AuthType.LOGIN_WITH_GOOGLE,
+          manualAuthFailure: {
+            message: buildGeminiManualAuthRequiredMessage({
+              detail: "Authentication failed to authenticate Gemini session.",
+            }),
+          },
+          deps: {
+            hasGoogleOAuthSession: () => false,
+          },
+        });
+
+        assert.deepStrictEqual(result, {
+          status: "error",
+          auth: { status: "unauthenticated" },
+          message:
+            "Gemini authentication failed. Open `gemini` in your terminal, complete authentication there, then retry in T3 Code. Authentication failed to authenticate Gemini session.",
+        });
+      });
+
+      it("drops the manual Gemini auth failure override once auth is restored", () => {
+        const result = resolveGeminiEffectiveAuthProbeResult({
+          authType: AuthType.LOGIN_WITH_GOOGLE,
+          manualAuthFailure: {
+            message: buildGeminiManualAuthRequiredMessage(),
+          },
+          deps: {
+            hasGoogleOAuthSession: () => true,
+          },
+        });
+
+        assert.deepStrictEqual(result, {
+          status: "ready",
+          auth: { status: "authenticated" },
+        });
+      });
+
       it.effect(
         "reports Google OAuth as authenticated when stored Gemini auth state is present",
         () =>
@@ -1123,12 +1172,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
             assert.strictEqual(status.message, undefined);
           }).pipe(
             Effect.provide(
-              mockSpawnerLayer((args) => {
-                const joined = args.join(" ");
-                if (joined === "--version")
-                  return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
-                throw new Error(`Unexpected args: ${joined}`);
-              }),
+              Layer.mergeAll(
+                geminiAuthRuntimeStateLayer,
+                mockSpawnerLayer((args) => {
+                  const joined = args.join(" ");
+                  if (joined === "--version")
+                    return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+                  throw new Error(`Unexpected args: ${joined}`);
+                }),
+              ),
             ),
           ),
       );
@@ -1152,11 +1204,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
           );
         }).pipe(
           Effect.provide(
-            mockSpawnerLayer((args) => {
-              const joined = args.join(" ");
-              if (joined === "--version") return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
-              throw new Error(`Unexpected args: ${joined}`);
-            }),
+            Layer.mergeAll(
+              geminiAuthRuntimeStateLayer,
+              mockSpawnerLayer((args) => {
+                const joined = args.join(" ");
+                if (joined === "--version")
+                  return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+                throw new Error(`Unexpected args: ${joined}`);
+              }),
+            ),
           ),
         ),
       );
@@ -1180,11 +1236,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
           );
         }).pipe(
           Effect.provide(
-            mockSpawnerLayer((args) => {
-              const joined = args.join(" ");
-              if (joined === "--version") return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
-              throw new Error(`Unexpected args: ${joined}`);
-            }),
+            Layer.mergeAll(
+              geminiAuthRuntimeStateLayer,
+              mockSpawnerLayer((args) => {
+                const joined = args.join(" ");
+                if (joined === "--version")
+                  return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+                throw new Error(`Unexpected args: ${joined}`);
+              }),
+            ),
           ),
         ),
       );
@@ -1209,12 +1269,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
             );
           }).pipe(
             Effect.provide(
-              mockSpawnerLayer((args) => {
-                const joined = args.join(" ");
-                if (joined === "--version")
-                  return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
-                throw new Error(`Unexpected args: ${joined}`);
-              }),
+              Layer.mergeAll(
+                geminiAuthRuntimeStateLayer,
+                mockSpawnerLayer((args) => {
+                  const joined = args.join(" ");
+                  if (joined === "--version")
+                    return { stdout: "gemini 1.0.0\n", stderr: "", code: 0 };
+                  throw new Error(`Unexpected args: ${joined}`);
+                }),
+              ),
             ),
           ),
       );

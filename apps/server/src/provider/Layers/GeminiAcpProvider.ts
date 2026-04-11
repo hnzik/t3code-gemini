@@ -13,6 +13,7 @@ import { Effect, Equal, Layer, Option, Result, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { makeManagedServerProvider } from "../makeManagedServerProvider";
 import { GeminiAcpProvider } from "../Services/GeminiAcpProvider";
+import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState";
 import { ServerSettingsService } from "../../serverSettings";
 import {
   buildServerProvider,
@@ -100,6 +101,13 @@ export interface GeminiAuthProbeResult {
   readonly message?: string;
 }
 
+export function buildGeminiManualAuthRequiredMessage(input?: { readonly detail?: string }): string {
+  const detail = input?.detail?.trim();
+  return detail
+    ? `Gemini authentication failed. Open \`gemini\` in your terminal, complete authentication there, then retry in T3 Code. ${detail}`
+    : "Gemini authentication failed. Open `gemini` in your terminal, complete authentication there, then retry in T3 Code.";
+}
+
 export function validateGeminiAuthConfiguration(
   authType: AuthType,
   env: NodeJS.ProcessEnv = process.env,
@@ -149,7 +157,7 @@ export function hasGeminiAdcConfiguration(env: NodeJS.ProcessEnv = process.env):
   );
 }
 
-function resolveGeminiAuthProbeResult(
+export function resolveGeminiAuthProbeResult(
   authType: AuthType,
   deps?: {
     readonly hasGoogleOAuthSession?: () => boolean;
@@ -199,6 +207,33 @@ function resolveGeminiAuthProbeResult(
   };
 }
 
+export function resolveGeminiEffectiveAuthProbeResult(input: {
+  readonly authType: AuthType;
+  readonly manualAuthFailure?: {
+    readonly message: string;
+  };
+  readonly deps?: {
+    readonly hasGoogleOAuthSession?: () => boolean;
+    readonly hasAdcConfiguration?: () => boolean;
+  };
+}): GeminiAuthProbeResult {
+  const authProbe = resolveGeminiAuthProbeResult(input.authType, input.deps);
+
+  if (!input.manualAuthFailure) {
+    return authProbe;
+  }
+
+  if (authProbe.auth.status === "authenticated" || authProbe.status === "error") {
+    return authProbe;
+  }
+
+  return {
+    status: "error",
+    auth: { status: "unauthenticated" },
+    message: input.manualAuthFailure.message,
+  };
+}
+
 export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderStatus")(
   function* (deps?: {
     readonly resolveAuthType?: () => AuthType;
@@ -207,12 +242,13 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
   }): Effect.fn.Return<
     ServerProvider,
     ServerSettingsError,
-    ChildProcessSpawner.ChildProcessSpawner | ServerSettingsService
+    ChildProcessSpawner.ChildProcessSpawner | GeminiAuthRuntimeState | ServerSettingsService
   > {
     const geminiSettings = yield* Effect.service(ServerSettingsService).pipe(
       Effect.flatMap((service) => service.getSettings),
       Effect.map((settings) => settings.providers.geminiAcp),
     );
+    const authRuntimeState = yield* GeminiAuthRuntimeState;
     const checkedAt = new Date().toISOString();
     const models = providerModelsFromSettings(
       BUILT_IN_MODELS,
@@ -301,7 +337,24 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
 
     const authType = deps?.resolveAuthType?.() ?? resolveGeminiAuthType();
     const authMetadata = geminiAuthMetadata(authType);
-    const authProbe = resolveGeminiAuthProbeResult(authType, deps);
+    const manualAuthFailure = yield* authRuntimeState.getFailure;
+    const authProbeDeps =
+      deps &&
+      ({
+        ...(deps.hasGoogleOAuthSession
+          ? { hasGoogleOAuthSession: deps.hasGoogleOAuthSession }
+          : {}),
+        ...(deps.hasAdcConfiguration ? { hasAdcConfiguration: deps.hasAdcConfiguration } : {}),
+      } satisfies NonNullable<Parameters<typeof resolveGeminiAuthProbeResult>[1]>);
+    const authProbe = resolveGeminiEffectiveAuthProbeResult({
+      authType,
+      ...(authProbeDeps ? { deps: authProbeDeps } : {}),
+      ...(manualAuthFailure ? { manualAuthFailure } : {}),
+    });
+
+    if (manualAuthFailure && authProbe.auth.status === "authenticated") {
+      yield* authRuntimeState.clearFailure;
+    }
 
     return buildServerProvider({
       provider: PROVIDER,
@@ -324,10 +377,12 @@ export const GeminiAcpProviderLive = Layer.effect(
   Effect.gen(function* () {
     const settingsService = yield* ServerSettingsService;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const authRuntimeState = yield* GeminiAuthRuntimeState;
 
     const checkProvider = checkGeminiAcpProviderStatus().pipe(
       Effect.provideService(ServerSettingsService, settingsService),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Effect.provideService(GeminiAuthRuntimeState, authRuntimeState),
     );
 
     return yield* makeManagedServerProvider<GeminiSettings>({
@@ -340,6 +395,7 @@ export const GeminiAcpProviderLive = Layer.effect(
         prev.binaryPath !== next.binaryPath ||
         !Equal.equals(prev.customModels, next.customModels),
       checkProvider,
+      refreshTriggers: authRuntimeState.streamChanges,
     });
   }),
 );

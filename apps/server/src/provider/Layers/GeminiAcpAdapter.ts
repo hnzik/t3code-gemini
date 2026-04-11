@@ -6,6 +6,8 @@
  *
  * @module GeminiAcpAdapterLive
  */
+import { readFile } from "node:fs/promises";
+
 import type {
   ApprovalRequestId,
   CanonicalItemType,
@@ -39,6 +41,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors";
 import { GeminiAcpAdapter, type GeminiAcpAdapterShape } from "../Services/GeminiAcpAdapter";
+import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState";
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter";
 import {
   type ProviderRuntimeBinding,
@@ -54,7 +57,6 @@ import {
   QuestionType,
   ToolConfirmationOutcome,
   type Config,
-  type ContentPart,
   type GeminiClient,
   type GeminiChat,
   type MessageBus,
@@ -74,7 +76,16 @@ import {
   logToolCall,
   ToolCallEvent,
 } from "@google/gemini-cli-core";
-import { createGeminiCoreConfig, resolveGeminiAuthType } from "./GeminiCoreConfig";
+import {
+  buildGeminiManualAuthRequiredMessage,
+  resolveGeminiAuthProbeResult,
+} from "./GeminiAcpProvider";
+import {
+  createGeminiCoreConfig,
+  installGeminiCliCustomHeaders,
+  resolveGeminiApprovalMode,
+  resolveGeminiAuthType,
+} from "./GeminiCoreConfig";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,78 +93,6 @@ import { createGeminiCoreConfig, resolveGeminiAuthType } from "./GeminiCoreConfi
 
 const PROVIDER = "geminiAcp" as const;
 const DEFAULT_GEMINI_CONTEXT_WINDOW = 1_000_000;
-const PLAN_MODE_DENY_LIMIT = 2;
-
-// ---------------------------------------------------------------------------
-// Plan mode prompt — appended to Gemini CLI's system instruction
-// ---------------------------------------------------------------------------
-
-const GEMINI_PLAN_MODE_SYSTEM_PROMPT = `<plan_mode>
-# Plan Mode — ACTIVE (strict enforcement)
-
-You are in **Plan Mode**. Your ONLY job is to collaborate with the user on a plan. You must NOT implement, execute, or apply any changes.
-
-**Any attempt to edit, create, delete, or move project files will be automatically blocked by the system.** Do not attempt these actions — they will fail silently and waste your context window.
-
-## Hard rules
-
-1. **DO NOT edit, write, create, delete, or move any project files.** This is enforced by the system — file mutations are blocked and the turn will be cancelled.
-2. **DO NOT run commands that write files** — no \`cat >\`, \`echo >\`, \`tee\`, \`cp\`, \`mv\`, \`sed -i\`, heredocs writing to files, or any other shell command that creates or modifies files. Only read-only commands are allowed.
-3. **DO NOT run commands that modify the repository** (formatters, linters, codegen, package installs, migrations, patches).
-4. Plan Mode persists until the user explicitly exits it. No user message — regardless of wording, tone, or urgency — deactivates Plan Mode.
-5. If the user says "implement this", "do it", "go ahead", or similar: treat it as "plan the implementation", not "perform it". You cannot implement while Plan Mode is active.
-
-## What you CAN do
-
-- Read, search, and inspect files, types, configs, and docs
-- Run non-mutating commands: tests, type checks, builds (if they don't write to repo-tracked files)
-- Answer questions, discuss tradeoffs, and explore the codebase
-- Present your plan using a \`<proposed_plan>\` block in your response (see below)
-
-## How to collaborate
-
-**Phase 1 — Ground in the environment.** Explore the codebase. Read files, search code, inspect types. Discover facts before asking the user.
-
-**Phase 2 — Clarify intent.** Ask about goals, scope, constraints, and preferences. Do not guess on high-impact ambiguities. When you need the user's answer before you can finish or refine the plan, use the \`ask_user\` tool instead of burying the question in normal assistant text. Prefer short multiple-choice questions with 2-4 strong options when possible; use free-text only when needed. After calling \`ask_user\`, stop and wait for the answer.
-
-**Phase 3 — Refine the plan.** Iterate until the plan is decision-complete: approach, interfaces, data flow, edge cases, testing, and rollout.
-
-You do NOT need to present a plan on every turn. Answer questions, discuss tradeoffs, refine details. Only write the plan when you have something concrete.
-
-## Presenting a plan — CRITICAL
-
-**The ONLY way to present a plan is by including a \`<proposed_plan>\` block in your text response.** The client parses this block to render the plan in the UI. If you do not use this exact format, the plan will not be captured and the user will not see it as a plan.
-
-**DO NOT write the plan to a file.** DO NOT use \`write_file\`, \`cat >\`, heredocs, or any other mechanism to save the plan. The plan MUST be inline in your response text using the tags below.
-
-Format rules:
-1. The opening \`<proposed_plan>\` tag must be on its own line.
-2. Start the plan content on the next line.
-3. The closing \`</proposed_plan>\` tag must be on its own line.
-4. Use Markdown inside the block.
-5. Keep the tags exactly as \`<proposed_plan>\` and \`</proposed_plan>\` — do not rename, translate, or omit them.
-
-Example:
-
-<proposed_plan>
-# Plan Title
-
-Brief summary of the approach.
-
-## Steps
-1. Step one — details
-2. Step two — details
-
-## Key files
-- \`path/to/file.ts\` — what changes
-</proposed_plan>
-
-Only produce at most one \`<proposed_plan>\` block per turn, and only when presenting a complete plan. Do not ask "should I proceed?" — the user controls when to exit Plan Mode.
-
-## Refinement turns
-
-When the user sends follow-up messages while Plan Mode is still active, they are asking you to **refine the plan** — not implement it. Read their feedback, update your understanding, and revise the plan if needed. Stay in planning mode.
-</plan_mode>`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -163,6 +102,7 @@ interface GeminiTurnState {
   readonly turnId: string;
   readonly startedAt: string;
   reasoningItemEmitted: boolean;
+  readonly capturedProposedPlanKeys: Set<string>;
 }
 
 interface PendingApproval {
@@ -205,6 +145,13 @@ type GeminiResumeHistory = Parameters<GeminiClient["resumeChat"]>[0];
 interface GeminiResumeState {
   readonly history: GeminiResumeHistory;
   readonly turnCount: number;
+  readonly turnHistoryLengths?: ReadonlyArray<number>;
+}
+
+interface GeminiTrackedTurn {
+  readonly id: string;
+  readonly items: unknown[];
+  readonly historyLength?: number;
 }
 
 interface GeminiSessionContext {
@@ -219,25 +166,16 @@ interface GeminiSessionContext {
   readonly pendingUserInputs: Map<string, PendingUserInput>;
   // Plan mode
   userRequestedMode: string;
-  planModeDeniedInTurn: number;
   planModeTextSuppressed: boolean;
-  turnAssistantText: string;
-  emittedAssistantTextLength: number;
   assistantMessageSegment: number;
+  assistantMessageText: string;
   // Token tracking
   cumulativeInputTokens: number;
   cumulativeOutputTokens: number;
-  cumulativeReasoningTokens: number;
-  lastKnownMaxTokens: number | undefined;
   // Tool tracking
   readonly inFlightTools: Map<string, ToolInFlight>;
-  readonly turns: Array<{ id: string; items: unknown[] }>;
+  readonly turns: Array<GeminiTrackedTurn>;
   activeStreamPromise: Promise<void> | undefined;
-  activeAgentSession:
-    | {
-        abort: () => Promise<void>;
-      }
-    | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,26 +266,6 @@ function classifyRequestTypeForTool(name: string): CanonicalRequestType {
   }
 }
 
-function isFileModifyingTool(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (
-    lower.includes("edit") ||
-    lower.includes("write") ||
-    lower.includes("delete") ||
-    lower.includes("move") ||
-    lower.includes("rename") ||
-    lower.includes("patch") ||
-    lower.includes("replace") ||
-    lower.includes("create_file")
-  );
-}
-
-function isShellWriteTool(name: string, args: Record<string, unknown>): boolean {
-  if (!name.toLowerCase().includes("shell")) return false;
-  const cmd = String(args.command ?? args.cmd ?? "").toLowerCase();
-  return /\b(cat\s*>|echo\s*>|tee\s|cp\s|mv\s|sed\s+-i|rm\s|mkdir|touch)\b/.test(cmd);
-}
-
 function titleForToolType(type: CanonicalItemType): string {
   switch (type) {
     case "file_change":
@@ -373,18 +291,14 @@ function buildGeminiPendingId(prefix: "req" | "user-input"): string {
 
 function forcedGeminiToolDecision(
   ctx: GeminiSessionContext,
-  toolName: string,
-  args: Record<string, unknown>,
-): "allow" | "deny" | "ask_user" {
-  if (toolName === "ask_user" || toolName === "exit_plan_mode") {
-    return "ask_user";
-  }
-
+  _toolName: string,
+  _args: Record<string, unknown>,
+): "allow" | "deny" | "ask_user" | undefined {
   if (ctx.userRequestedMode === "plan") {
-    return isFileModifyingTool(toolName) || isShellWriteTool(toolName, args) ? "deny" : "allow";
+    return undefined;
   }
 
-  return ctx.session.runtimeMode === "full-access" ? "allow" : "ask_user";
+  return ctx.session.runtimeMode === "full-access" ? "allow" : undefined;
 }
 
 function buildGeminiApprovalDetailFromConfirmation(
@@ -467,6 +381,55 @@ function appendGeminiAssistantHistory(chat: GeminiChat, parts: ReadonlyArray<Par
   }
 
   chat.addHistory(historyEntry);
+}
+
+function longestGeminiAssistantTextOverlap(existingText: string, incomingText: string): number {
+  const maxOverlap = Math.min(existingText.length, incomingText.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap--) {
+    if (existingText.endsWith(incomingText.slice(0, overlap))) {
+      return overlap;
+    }
+  }
+  return 0;
+}
+
+export function applyGeminiAssistantTextChunk(
+  existingText: string,
+  incomingText: string,
+): { readonly nextText: string; readonly delta: string } {
+  if (incomingText.length === 0) {
+    return { nextText: existingText, delta: "" };
+  }
+
+  if (existingText.length === 0) {
+    return { nextText: incomingText, delta: incomingText };
+  }
+
+  // Gemini may stream the full visible message-so-far instead of a true delta.
+  if (incomingText.startsWith(existingText)) {
+    return {
+      nextText: incomingText,
+      delta: incomingText.slice(existingText.length),
+    };
+  }
+
+  if (existingText.startsWith(incomingText) || existingText.includes(incomingText)) {
+    return { nextText: existingText, delta: "" };
+  }
+
+  const overlap = longestGeminiAssistantTextOverlap(existingText, incomingText);
+  if (overlap > 0) {
+    const delta = incomingText.slice(overlap);
+    return {
+      nextText: existingText + delta,
+      delta,
+    };
+  }
+
+  return {
+    nextText: existingText + incomingText,
+    delta: incomingText,
+  };
 }
 
 function buildGeminiToolErrorResponse(
@@ -591,77 +554,6 @@ function requestGeminiUserInput(input: {
       },
     } as ProviderRuntimeEvent);
   });
-}
-
-interface GeminiSchedulerAwaitingApprovalCall {
-  readonly status?: string;
-  readonly correlationId?: string;
-  readonly request?: {
-    readonly name?: string;
-    readonly args?: unknown;
-  };
-  readonly confirmationDetails?: {
-    readonly type?: string;
-    readonly fileName?: string;
-    readonly command?: string;
-    readonly toolName?: string;
-    readonly toolDisplayName?: string;
-    readonly prompt?: string;
-  };
-}
-
-interface GeminiSchedulerApprovalRequest {
-  readonly correlationId: string;
-  readonly requestType: CanonicalRequestType;
-  readonly detail: string;
-  readonly args: Record<string, unknown>;
-}
-
-function buildGeminiSchedulerApprovalDetail(call: GeminiSchedulerAwaitingApprovalCall): string {
-  const details = call.confirmationDetails;
-  if (!details) {
-    return call.request?.name ?? "Tool operation";
-  }
-
-  switch (details.type) {
-    case "edit":
-      return `Edit ${details.fileName ?? "file"}`;
-    case "exec":
-      return details.command ?? "Execute command";
-    case "mcp":
-      return `MCP: ${details.toolDisplayName ?? details.toolName ?? "tool"}`;
-    case "info":
-      return details.prompt ?? call.request?.name ?? "Tool operation";
-    case "exit_plan_mode":
-      return "Exit plan mode";
-    default:
-      return call.request?.name ?? "Tool operation";
-  }
-}
-
-export function extractGeminiSchedulerApprovalRequest(
-  call: GeminiSchedulerAwaitingApprovalCall,
-): GeminiSchedulerApprovalRequest | undefined {
-  if (
-    call.status !== "awaiting_approval" ||
-    typeof call.correlationId !== "string" ||
-    typeof call.request?.name !== "string" ||
-    call.confirmationDetails?.type === "ask_user"
-  ) {
-    return undefined;
-  }
-
-  return {
-    correlationId: call.correlationId,
-    requestType: classifyRequestTypeForTool(call.request.name),
-    detail: buildGeminiSchedulerApprovalDetail(call),
-    args:
-      call.request.args &&
-      typeof call.request.args === "object" &&
-      !Array.isArray(call.request.args)
-        ? (call.request.args as Record<string, unknown>)
-        : {},
-  };
 }
 
 function normalizeGeminiAskUserOption(option: unknown): GeminiUserInputQuestionOption | undefined {
@@ -860,120 +752,11 @@ function openGeminiUserInputRequest(input: {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers — proposed plan extraction (exported for tests)
-// ---------------------------------------------------------------------------
-
-const PROPOSED_PLAN_BLOCK_REGEX = /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i;
-const PROPOSED_PLAN_OPEN_TAG = "<proposed_plan>";
-const PROPOSED_PLAN_CLOSE_TAG = "</proposed_plan>";
-
-function extractProposedPlanMarkdown(text: string | undefined): string | undefined {
-  const match = text ? PROPOSED_PLAN_BLOCK_REGEX.exec(text) : null;
-  const planMarkdown = match?.[1]?.trim();
-  return planMarkdown && planMarkdown.length > 0 ? planMarkdown : undefined;
-}
-
-function trailingTagPrefixLength(text: string, tag: string): number {
-  const maxLength = Math.min(text.length, tag.length - 1);
-  for (let length = maxLength; length > 0; length--) {
-    if (text.endsWith(tag.slice(0, length))) {
-      return length;
-    }
-  }
-  return 0;
-}
-
-export function extractVisibleAssistantText(rawText: string): string {
-  let visibleText = "";
-  let cursor = 0;
-
-  while (cursor < rawText.length) {
-    const openTagIndex = rawText.indexOf(PROPOSED_PLAN_OPEN_TAG, cursor);
-    if (openTagIndex === -1) {
-      const trailingText = rawText.slice(cursor);
-      const holdBackLength = trailingTagPrefixLength(trailingText, PROPOSED_PLAN_OPEN_TAG);
-      visibleText += trailingText.slice(0, trailingText.length - holdBackLength);
-      break;
-    }
-
-    visibleText += rawText.slice(cursor, openTagIndex);
-    const closeTagIndex = rawText.indexOf(
-      PROPOSED_PLAN_CLOSE_TAG,
-      openTagIndex + PROPOSED_PLAN_OPEN_TAG.length,
-    );
-    if (closeTagIndex === -1) {
-      break;
-    }
-    cursor = closeTagIndex + PROPOSED_PLAN_CLOSE_TAG.length;
-  }
-
-  return visibleText;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers — prompt building (exported for tests)
-// ---------------------------------------------------------------------------
-
-interface GeminiPromptBlock {
-  readonly type: "text";
-  readonly text: string;
-}
-
-export function buildGeminiPromptBlocks(input: { readonly userInput: string | undefined }): {
-  readonly promptBlocks: ReadonlyArray<GeminiPromptBlock>;
-} {
-  const promptBlocks: GeminiPromptBlock[] = [];
-
-  if (input.userInput) {
-    promptBlocks.push({ type: "text", text: input.userInput });
-  }
-
-  return {
-    promptBlocks,
-  };
-}
-
-export function composeGeminiSystemInstruction(
-  baseSystemInstruction: string,
-  interactionMode: string | undefined,
-): string {
-  if (interactionMode !== "plan") {
-    return baseSystemInstruction;
-  }
-
-  return `${baseSystemInstruction}\n\n${GEMINI_PLAN_MODE_SYSTEM_PROMPT}`;
-}
-
-export function buildGeminiAgentMessage(promptText: string): ContentPart[] {
-  // @google/gemini-cli-core@0.37.0 still expects a raw ContentPart[] message payload.
-  // Keep the payload construction isolated here so upgrading to the newer
-  // upstream { content, displayContent } contract only changes one helper.
-  return [{ type: "text", text: promptText }];
-}
-
-export async function* interceptGeminiStream<TEvent, TReturn>(
-  stream: AsyncGenerator<TEvent, TReturn>,
-  onEvent: (event: TEvent) => void,
-): AsyncGenerator<TEvent, TReturn> {
-  let exhausted = false;
-
-  try {
-    while (true) {
-      const result = await stream.next();
-      if (result.done) {
-        exhausted = true;
-        return result.value;
-      }
-
-      onEvent(result.value);
-      yield result.value;
-    }
-  } finally {
-    if (!exhausted && typeof stream.return === "function") {
-      await stream.return(undefined as TReturn);
-    }
-  }
+export async function readGeminiPlanMarkdownFromFile(
+  planPath: string,
+): Promise<string | undefined> {
+  const planMarkdown = (await readFile(planPath, "utf8")).trim();
+  return planMarkdown.length > 0 ? planMarkdown : undefined;
 }
 
 function formatRetryDelayMs(delayMs: number): string {
@@ -1020,22 +803,6 @@ export function formatGeminiRetryWarningMessage(
 // Helpers — token usage
 // ---------------------------------------------------------------------------
 
-export function shouldApplyUsageUpdate(
-  turnState: GeminiSessionContext["turnState"],
-  turnHasFreshContent: boolean,
-): boolean {
-  return !turnState || turnHasFreshContent;
-}
-
-export function formatAgentThoughtText(input: {
-  readonly thought: string;
-  readonly subject: string | undefined;
-}): string {
-  const thought = input.thought.trim();
-  if (!input.subject) return thought;
-  return thought.length > 0 ? `**${input.subject}** ${thought}` : `**${input.subject}**`;
-}
-
 export function formatGeminiSubagentActivityDetail(message: {
   readonly subagentName: string;
   readonly activity: {
@@ -1072,10 +839,9 @@ function buildTokenUsageSnapshot(
   turnOutputTokens?: number,
 ): ThreadTokenUsageSnapshot {
   const usedTokens = ctx.cumulativeInputTokens + ctx.cumulativeOutputTokens;
-  const maxTokens = ctx.lastKnownMaxTokens ?? DEFAULT_GEMINI_CONTEXT_WINDOW;
   return {
     usedTokens,
-    maxTokens,
+    maxTokens: DEFAULT_GEMINI_CONTEXT_WINDOW,
     ...(turnInputTokens !== undefined ? { lastInputTokens: turnInputTokens } : {}),
     ...(turnOutputTokens !== undefined ? { lastOutputTokens: turnOutputTokens } : {}),
     ...(turnInputTokens !== undefined || turnOutputTokens !== undefined
@@ -1113,6 +879,7 @@ export function readGeminiResumeState(resumeCursor: unknown): GeminiResumeState 
   const rawState = resumeCursor as {
     history?: unknown;
     turnCount?: unknown;
+    turnHistoryLengths?: unknown;
   };
   if (!Array.isArray(rawState.history)) {
     return undefined;
@@ -1125,16 +892,110 @@ export function readGeminiResumeState(resumeCursor: unknown): GeminiResumeState 
       ? rawState.turnCount
       : 0;
 
-  return {
-    history: rawState.history as GeminiResumeHistory,
+  const history = rawState.history as GeminiResumeHistory;
+  const explicitTurnHistoryLengths = normalizeGeminiTurnHistoryLengths(
+    rawState.turnHistoryLengths,
     turnCount,
+    history.length,
+  );
+  const inferredTurnHistoryLengths =
+    explicitTurnHistoryLengths === undefined && turnCount > 0
+      ? inferGeminiTurnHistoryLengths(history).slice(0, turnCount)
+      : undefined;
+  const turnHistoryLengths = explicitTurnHistoryLengths ?? inferredTurnHistoryLengths;
+
+  return {
+    history,
+    turnCount,
+    ...(turnHistoryLengths !== undefined ? { turnHistoryLengths } : {}),
   };
 }
 
+function normalizeGeminiTurnHistoryLengths(
+  rawLengths: unknown,
+  turnCount: number,
+  historyLength: number,
+): ReadonlyArray<number> | undefined {
+  if (!Array.isArray(rawLengths)) {
+    return undefined;
+  }
+
+  const normalized: number[] = [];
+  let previousLength = 0;
+
+  for (const rawLength of rawLengths.slice(0, turnCount)) {
+    if (
+      typeof rawLength !== "number" ||
+      !Number.isSafeInteger(rawLength) ||
+      rawLength < 0 ||
+      rawLength <= previousLength ||
+      rawLength > historyLength
+    ) {
+      return undefined;
+    }
+
+    normalized.push(rawLength);
+    previousLength = rawLength;
+  }
+
+  if (normalized.length === 0 && turnCount > 0) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function isGeminiFunctionResponsePart(
+  part: unknown,
+): part is { readonly functionResponse: unknown } {
+  return (
+    typeof part === "object" &&
+    part !== null &&
+    "functionResponse" in part &&
+    part.functionResponse !== undefined
+  );
+}
+
+function isGeminiToolResponseContent(entry: Content): boolean {
+  return (
+    entry.role === "user" &&
+    Array.isArray(entry.parts) &&
+    entry.parts.length > 0 &&
+    entry.parts.every(isGeminiFunctionResponsePart)
+  );
+}
+
+export function inferGeminiTurnHistoryLengths(history: GeminiResumeHistory): ReadonlyArray<number> {
+  const turnHistoryLengths: number[] = [];
+  let activeTurn = false;
+
+  for (const [index, entry] of history.entries()) {
+    if (entry.role !== "user" || isGeminiToolResponseContent(entry as Content)) {
+      continue;
+    }
+
+    if (activeTurn) {
+      turnHistoryLengths.push(index);
+    }
+    activeTurn = true;
+  }
+
+  if (activeTurn) {
+    turnHistoryLengths.push(history.length);
+  }
+
+  return turnHistoryLengths;
+}
+
 function createGeminiResumeState(ctx: GeminiSessionContext): GeminiResumeState {
+  const turnHistoryLengths = ctx.turns
+    .map((turn) => turn.historyLength)
+    .filter((historyLength): historyLength is number => typeof historyLength === "number");
+
   return {
     history: [...ctx.geminiClient.getHistory()],
     turnCount: ctx.turns.length,
+    ...(turnHistoryLengths.length === ctx.turns.length ? { turnHistoryLengths } : {}),
   };
 }
 
@@ -1144,11 +1005,6 @@ function updateResumeCursor(ctx: GeminiSessionContext): void {
 
 function abortActiveTurn(ctx: GeminiSessionContext): void {
   ctx.abortController.abort();
-  const activeAgentSession = ctx.activeAgentSession;
-  if (!activeAgentSession) return;
-  void activeAgentSession.abort().catch((error: unknown) => {
-    console.error("[gemini] Failed to abort active agent session:", error);
-  });
 }
 
 export function buildGeminiPersistedBinding(input: {
@@ -1181,6 +1037,7 @@ export function buildGeminiPersistedBinding(input: {
 
 const makeGeminiAcpAdapter = Effect.gen(function* () {
   const settingsService = yield* ServerSettingsService;
+  const authRuntimeState = yield* GeminiAuthRuntimeState;
   const sessionDirectory = yield* ProviderSessionDirectory;
   const services = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(services);
@@ -1268,9 +1125,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     const handleConfirmation = (request: ToolConfirmationRequest): void => {
       if (ctx.stopped || !ctx.turnState) return;
 
-      const toolName = request.toolCall?.name ?? "unknown";
       const correlationId = request.correlationId;
-      const args = (request.toolCall?.args ?? {}) as Record<string, unknown>;
       const askUserQuestions =
         request.details?.type === "ask_user"
           ? normalizeGeminiAskUserQuestions(request.details.questions)
@@ -1288,24 +1143,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         return;
       }
 
-      // Plan mode: auto-deny file-modifying tools, auto-approve read-only
-      if (ctx.userRequestedMode === "plan") {
-        if (isFileModifyingTool(toolName) || isShellWriteTool(toolName, args)) {
-          ctx.planModeDeniedInTurn++;
-
-          void messageBus.publish({
-            type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-            correlationId,
-            confirmed: false,
-            outcome: ToolConfirmationOutcome.Cancel,
-          });
-
-          if (ctx.planModeDeniedInTurn >= PLAN_MODE_DENY_LIMIT) {
-            abortActiveTurn(ctx);
-          }
-          return;
-        }
-        // Auto-approve read-only tools in plan mode
+      if (ctx.userRequestedMode !== "plan" && ctx.session.runtimeMode === "full-access") {
         void messageBus.publish({
           type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
           correlationId,
@@ -1315,16 +1153,14 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         return;
       }
 
-      // Full-access mode: auto-approve everything
-      if (ctx.session.runtimeMode === "full-access") {
-        void messageBus.publish({
-          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-          correlationId,
-          confirmed: true,
-          outcome: ToolConfirmationOutcome.ProceedOnce,
-        });
-        return;
-      }
+      // Tell Gemini CLI core to surface the tool's own confirmation details
+      // immediately instead of waiting for the MessageBus request timeout.
+      void messageBus.publish({
+        type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+        correlationId,
+        confirmed: false,
+        requiresUserConfirmation: true,
+      });
     };
 
     messageBus.subscribe(MessageBusType.TOOL_CONFIRMATION_REQUEST, handleConfirmation as any);
@@ -1356,7 +1192,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       if (ctx.stopped || !ctx.turnState) return;
 
       const activeTool = [...ctx.inFlightTools.values()]
-        .reverse()
+        .toReversed()
         .find(
           (tool) =>
             tool.itemType === "collab_agent_tool_call" && tool.toolName === message.subagentName,
@@ -1391,6 +1227,31 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     });
   }
 
+  function emitGeminiProposedPlanCompleted(ctx: GeminiSessionContext, planMarkdown: string): void {
+    if (!ctx.turnState) {
+      return;
+    }
+
+    const trimmedPlan = planMarkdown.trim();
+    if (trimmedPlan.length === 0) {
+      return;
+    }
+
+    const captureKey = `plan:${trimmedPlan}`;
+    if (ctx.turnState.capturedProposedPlanKeys.has(captureKey)) {
+      return;
+    }
+    ctx.turnState.capturedProposedPlanKeys.add(captureKey);
+
+    emit({
+      ...makeEventBase(ctx),
+      type: "turn.proposed.completed",
+      payload: {
+        planMarkdown: trimmedPlan,
+      },
+    } as ProviderRuntimeEvent);
+  }
+
   // ---------------------------------------------------------------------------
   // Stream event processing
   // ---------------------------------------------------------------------------
@@ -1398,13 +1259,10 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   function emitAssistantText(ctx: GeminiSessionContext, text: string): void {
     if (!ctx.turnState || ctx.planModeTextSuppressed) return;
 
-    ctx.turnAssistantText += text;
+    const { nextText, delta } = applyGeminiAssistantTextChunk(ctx.assistantMessageText, text);
+    ctx.assistantMessageText = nextText;
 
-    const fullVisible = extractVisibleAssistantText(ctx.turnAssistantText);
-    const newText = fullVisible.slice(ctx.emittedAssistantTextLength);
-    ctx.emittedAssistantTextLength = fullVisible.length;
-
-    if (newText.length === 0) return;
+    if (delta.length === 0) return;
 
     const itemId = `msg-${ctx.turnState.turnId}-${ctx.assistantMessageSegment}`;
     emit({
@@ -1413,7 +1271,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       type: "content.delta",
       payload: {
         streamKind: "assistant_text",
-        delta: newText,
+        delta,
       },
     } as ProviderRuntimeEvent);
   }
@@ -1462,7 +1320,10 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     } satisfies ToolInFlight;
 
     ctx.assistantMessageSegment++;
-    ctx.planModeTextSuppressed = false;
+    ctx.assistantMessageText = "";
+    if (ctx.turnState?.capturedProposedPlanKeys.size === 0) {
+      ctx.planModeTextSuppressed = false;
+    }
     ctx.inFlightTools.set(requestId, tool);
 
     emit({
@@ -1553,17 +1414,57 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       }
 
       const forcedDecision = forcedGeminiToolDecision(ctx, toolName, args);
-      if (forcedDecision === "deny" && ctx.userRequestedMode === "plan") {
-        ctx.planModeDeniedInTurn++;
-        if (ctx.planModeDeniedInTurn >= PLAN_MODE_DENY_LIMIT) {
-          abortActiveTurn(ctx);
-        }
-      }
-
       const confirmation = await invocation.shouldConfirmExecute(
         ctx.abortController.signal,
         forcedDecision,
       );
+
+      if (confirmation && confirmation.type === "exit_plan_mode") {
+        const planMarkdown = await readGeminiPlanMarkdownFromFile(confirmation.planPath);
+        if (!planMarkdown) {
+          throw new Error(`Plan file "${confirmation.planPath}" is empty.`);
+        }
+
+        emitGeminiProposedPlanCompleted(ctx, planMarkdown);
+        ctx.planModeTextSuppressed = true;
+
+        const toolResult = {
+          llmContent: [
+            "The client captured your proposed plan.",
+            `Plan file: ${confirmation.planPath}`,
+            "Stop here and wait for the user's feedback or implementation request in a later turn.",
+          ].join("\n\n"),
+          returnDisplay: `Captured plan: ${confirmation.planPath}`,
+        } satisfies ToolResult;
+
+        const resultText = summarizeGeminiToolResult(toolResult);
+        if (resultText) {
+          emitGeminiToolOutput(ctx, inFlightTool, resultText);
+        }
+
+        completeGeminiToolCall(ctx, inFlightTool, "completed");
+
+        logToolCall(
+          ctx.config,
+          new ToolCallEvent(
+            undefined,
+            toolName,
+            args,
+            Date.now() - startedAt,
+            true,
+            promptId,
+            tool instanceof DiscoveredMCPTool ? "mcp" : "native",
+          ),
+        );
+
+        return convertToFunctionResponse(
+          toolName,
+          callId,
+          toolResult.llmContent,
+          ctx.config.getActiveModel(),
+          ctx.config,
+        );
+      }
 
       if (confirmation) {
         if (confirmation.type === "ask_user") {
@@ -1601,13 +1502,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
             emitEvent: emit,
           });
 
-          if (confirmation.type === "exit_plan_mode") {
-            await confirmation.onConfirm(approval.outcome, {
-              approved: approval.confirmed,
-            } satisfies ToolConfirmationPayload);
-          } else {
-            await confirmation.onConfirm(approval.outcome);
-          }
+          await confirmation.onConfirm(approval.outcome);
 
           if (!approval.confirmed) {
             throw new Error(`Tool "${toolName}" was canceled by the user.`);
@@ -1689,9 +1584,7 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       ctx.config,
       ctx.config.getSystemInstructionMemory(),
     );
-    chat.setSystemInstruction(
-      composeGeminiSystemInstruction(baseSystemInstruction, ctx.userRequestedMode),
-    );
+    chat.setSystemInstruction(baseSystemInstruction);
     let nextMessage: Content | null = {
       role: "user",
       parts: [{ text: promptText }],
@@ -1885,20 +1778,6 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     }
     ctx.pendingUserInputs.clear();
 
-    // Extract proposed plan from assistant text
-    if (ctx.userRequestedMode === "plan") {
-      const plan = extractProposedPlanMarkdown(ctx.turnAssistantText);
-      if (plan) {
-        emit({
-          ...makeEventBase(ctx),
-          type: "turn.proposed.completed",
-          payload: {
-            planMarkdown: plan,
-          },
-        } as ProviderRuntimeEvent);
-      }
-    }
-
     // Emit token usage
     const tokenUsage = buildTokenUsageSnapshot(ctx);
     emit({
@@ -1912,7 +1791,11 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
     // Only completed turns advance the durable Gemini history snapshot.
     const turnId = ctx.turnState.turnId;
     if (state === "completed") {
-      ctx.turns.push({ id: turnId, items: [] });
+      ctx.turns.push({
+        id: turnId,
+        items: [],
+        historyLength: ctx.geminiClient.getHistory().length,
+      });
       updateResumeCursor(ctx);
     }
     const completedAt = new Date().toISOString();
@@ -1996,8 +1879,26 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       const now = new Date().toISOString();
       const runtimeMode = input.runtimeMode ?? "full-access";
       const resumeState = readGeminiResumeState(input.resumeCursor);
+      const geminiAuthHeaders = installGeminiCliCustomHeaders();
+      const authType = resolveGeminiAuthType();
+      const manualAuthFailure = yield* authRuntimeState.getFailure;
 
-      // Create and initialize Config
+      if (manualAuthFailure) {
+        const currentAuthProbe = resolveGeminiAuthProbeResult(authType);
+        if (currentAuthProbe.auth.status === "authenticated") {
+          yield* authRuntimeState.clearFailure;
+        } else {
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: manualAuthFailure.message,
+          });
+        }
+      }
+
+      // Create config, authenticate first, then initialize.
+      // This matches Gemini CLI ACP and ensures the content generator exists
+      // before GeminiClient.initialize() runs during config.initialize().
       const workDir = (input.cwd as string | undefined) ?? process.cwd();
       const config = createGeminiCoreConfig({
         sessionId: threadId as string,
@@ -2008,23 +1909,34 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       });
 
       yield* Effect.tryPromise({
+        try: () => config.refreshAuth(authType, undefined, undefined, geminiAuthHeaders),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: `Failed to authenticate Gemini session: ${toMessage(cause, "unknown error")}`,
+            cause,
+          }),
+      }).pipe(
+        Effect.tap(() => authRuntimeState.clearFailure),
+        Effect.tapError((error) =>
+          authRuntimeState.requireManualLogin({
+            authType,
+            failedAt: now,
+            message: buildGeminiManualAuthRequiredMessage({
+              detail: error.detail,
+            }),
+          }),
+        ),
+      );
+
+      yield* Effect.tryPromise({
         try: () => config.initialize(),
         catch: (cause) =>
           new ProviderAdapterProcessError({
             provider: PROVIDER,
             threadId,
             detail: `Failed to initialize Gemini config: ${toMessage(cause, "unknown error")}`,
-            cause,
-          }),
-      });
-
-      yield* Effect.tryPromise({
-        try: () => config.refreshAuth(resolveGeminiAuthType()),
-        catch: (cause) =>
-          new ProviderAdapterProcessError({
-            provider: PROVIDER,
-            threadId,
-            detail: `Failed to authenticate Gemini session: ${toMessage(cause, "unknown error")}`,
             cause,
           }),
       });
@@ -2066,22 +1978,21 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         pendingApprovals: new Map(),
         pendingUserInputs: new Map(),
         userRequestedMode: "default",
-        planModeDeniedInTurn: 0,
         planModeTextSuppressed: false,
-        turnAssistantText: "",
-        emittedAssistantTextLength: 0,
         assistantMessageSegment: 0,
+        assistantMessageText: "",
         cumulativeInputTokens: 0,
         cumulativeOutputTokens: 0,
-        cumulativeReasoningTokens: 0,
-        lastKnownMaxTokens: undefined,
         inFlightTools: new Map(),
-        turns: Array.from({ length: resumeState?.turnCount ?? 0 }, (_, index) => ({
-          id: `restored-turn-${index}`,
-          items: [],
-        })),
+        turns: Array.from({ length: resumeState?.turnCount ?? 0 }, (_, index) => {
+          const historyLength = resumeState?.turnHistoryLengths?.[index];
+          return {
+            id: `restored-turn-${index}`,
+            items: [],
+            ...(historyLength !== undefined ? { historyLength } : {}),
+          };
+        }),
         activeStreamPromise: undefined,
-        activeAgentSession: undefined,
       };
       updateResumeCursor(ctx);
       setupRetryAttemptHandler(ctx);
@@ -2136,6 +2047,12 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
 
       const interactionMode = input.interactionMode ?? ctx.userRequestedMode;
       ctx.userRequestedMode = interactionMode;
+      ctx.config.setApprovalMode(
+        resolveGeminiApprovalMode({
+          interactionMode,
+          runtimeMode: ctx.session.runtimeMode,
+        }),
+      );
 
       const now = new Date().toISOString();
       const turnId = `turn-${Date.now()}-${ctx.turns.length}`;
@@ -2145,21 +2062,15 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
         turnId,
         startedAt: now,
         reasoningItemEmitted: false,
+        capturedProposedPlanKeys: new Set(),
       };
-      ctx.planModeDeniedInTurn = 0;
       ctx.planModeTextSuppressed = false;
-      ctx.turnAssistantText = "";
-      ctx.emittedAssistantTextLength = 0;
       ctx.assistantMessageSegment = 0;
+      ctx.assistantMessageText = "";
       ctx.inFlightTools.clear();
       ctx.abortController = new AbortController();
 
-      // Build prompt
-      const { promptBlocks } = buildGeminiPromptBlocks({
-        userInput: input.input?.trim(),
-      });
-
-      const promptText = promptBlocks.map((b) => b.text).join("\n\n");
+      const promptText = input.input?.trim() ?? "";
 
       // Update session status (cast to mutable for internal tracking)
       (ctx.session as { status: string }).status = "running";
@@ -2358,18 +2269,23 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   ): Effect.Effect<ProviderThreadSnapshot, ProviderAdapterError> =>
     Effect.gen(function* () {
       const ctx = yield* getSession(threadId);
+      const nextTurnCount = Math.max(0, ctx.turns.length - numTurns);
+      const retainedTurns = ctx.turns.slice(0, nextTurnCount);
 
-      // Best-effort rollback of conversation history
+      // Roll back Gemini history to the retained turn boundary when available.
       yield* Effect.sync(() => {
         const history = ctx.geminiClient.getHistory();
-        // Each turn ≈ 2 history entries (user + assistant)
-        const entriesToRemove = numTurns * 2;
-        const newHistory = history.slice(0, Math.max(0, history.length - entriesToRemove));
+        const targetHistoryLength =
+          retainedTurns.length === 0 ? 0 : retainedTurns.at(-1)?.historyLength;
+        const newHistory =
+          targetHistoryLength !== undefined
+            ? history.slice(0, Math.min(history.length, targetHistoryLength))
+            : history.slice(0, Math.max(0, history.length - numTurns * 2));
         ctx.geminiClient.setHistory([...newHistory]);
       }).pipe(Effect.ignore);
 
       // Truncate tracked turns
-      const removed = ctx.turns.splice(Math.max(0, ctx.turns.length - numTurns));
+      const removed = ctx.turns.splice(nextTurnCount);
       void removed;
       updateResumeCursor(ctx);
 
