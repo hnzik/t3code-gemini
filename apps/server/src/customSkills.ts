@@ -394,7 +394,7 @@ const makeCustomSkills = Effect.gen(function* () {
   const importSkill = (input: CustomSkillImportInput) =>
     Effect.gen(function* () {
       if (input.files.length === 0) {
-        return yield* Effect.fail(toSkillError("Select a skill folder to import."));
+        return yield* toSkillError("Select a skill folder to import.");
       }
 
       const normalizedFiles = input.files
@@ -409,8 +409,8 @@ const makeCustomSkills = Effect.gen(function* () {
         })
         .filter((file): file is CustomSkillImportFile => file !== null);
       if (normalizedFiles.length !== input.files.length) {
-        return yield* Effect.fail(
-          toSkillError("Skill imports cannot contain absolute or parent-relative paths."),
+        return yield* toSkillError(
+          "Skill imports cannot contain absolute or parent-relative paths.",
         );
       }
 
@@ -418,28 +418,26 @@ const makeCustomSkills = Effect.gen(function* () {
         normalizedFiles.map((file) => file.relativePath.split("/")[0]).filter(Boolean),
       );
       if (rootNames.size !== 1) {
-        return yield* Effect.fail(toSkillError("Import exactly one skill folder at a time."));
+        return yield* toSkillError("Import exactly one skill folder at a time.");
       }
       const uploadedRoot = Array.from(rootNames)[0];
       if (!uploadedRoot) {
-        return yield* Effect.fail(toSkillError("Selected folder did not include any files."));
+        return yield* toSkillError("Selected folder did not include any files.");
       }
 
       const skillMarkdownFile = normalizedFiles.find(
         (file) => file.relativePath === `${uploadedRoot}/${SKILL_FILE_NAME}`,
       );
       if (!skillMarkdownFile) {
-        return yield* Effect.fail(
-          toSkillError("The selected folder must include a top-level SKILL.md file."),
-        );
+        return yield* toSkillError("The selected folder must include a top-level SKILL.md file.");
       }
 
       const markdown = Buffer.from(skillMarkdownFile.dataBase64, "base64").toString("utf8");
       const metadata = parseSkillMetadata(markdown, uploadedRoot);
       const skillSlug = normalizeSkillSlug(metadata.slug);
       if (!skillSlug) {
-        return yield* Effect.fail(
-          toSkillError("Could not determine a valid skill slug from the imported folder."),
+        return yield* toSkillError(
+          "Could not determine a valid skill slug from the imported folder.",
         );
       }
 
@@ -447,7 +445,7 @@ const makeCustomSkills = Effect.gen(function* () {
       const targetEnabledPath = path.join(skillsPath, skillSlug);
       const targetDisabledPath = path.join(disabledSkillsPath, skillSlug);
       if ((yield* exists(targetEnabledPath)) || (yield* exists(targetDisabledPath))) {
-        return yield* Effect.fail(toSkillError(`A skill named '${skillSlug}' already exists.`));
+        return yield* toSkillError(`A skill named '${skillSlug}' already exists.`);
       }
 
       yield* fileSystem
@@ -510,10 +508,10 @@ const makeCustomSkills = Effect.gen(function* () {
         if (yield* exists(targetPath)) {
           return yield* getState;
         }
-        return yield* Effect.fail(toSkillError(`Could not find a skill named '${input.slug}'.`));
+        return yield* toSkillError(`Could not find a skill named '${input.slug}'.`);
       }
       if (yield* exists(targetPath)) {
-        return yield* Effect.fail(toSkillError(`A skill already exists at '${targetPath}'.`));
+        return yield* toSkillError(`A skill already exists at '${targetPath}'.`);
       }
 
       yield* fileSystem
@@ -532,7 +530,7 @@ const makeCustomSkills = Effect.gen(function* () {
       const disabledExists = yield* exists(disabledPath);
 
       if (!enabledExists && !disabledExists) {
-        return yield* Effect.fail(toSkillError(`Could not find a skill named '${input.slug}'.`));
+        return yield* toSkillError(`Could not find a skill named '${input.slug}'.`);
       }
 
       yield* Effect.all(

@@ -9,10 +9,13 @@
 import { readFile } from "node:fs/promises";
 
 import type {
+  ProviderApprovalDecision,
   CanonicalItemType,
   CanonicalRequestType,
   ProviderRuntimeEvent,
+  ProviderSendTurnInput,
   ProviderSession,
+  ProviderTurnStartResult,
   ProviderUserInputAnswers,
   ThreadId,
   ThreadTokenUsageSnapshot,
@@ -128,6 +131,7 @@ interface PendingUserInput {
 }
 
 interface ToolInFlight {
+  readonly requestId: string;
   readonly itemId: string;
   readonly itemType: CanonicalItemType;
   readonly toolName: string;
@@ -877,6 +881,31 @@ function toMessage(cause: unknown, fallback: string): string {
   return fallback;
 }
 
+function toGeminiAdapterError(
+  threadId: ThreadId,
+  operation: string,
+  cause: unknown,
+): ProviderAdapterError {
+  const errorTag =
+    typeof cause === "object" && cause !== null ? (cause as { _tag?: unknown })._tag : undefined;
+  if (
+    errorTag === "ProviderAdapterProcessError" ||
+    errorTag === "ProviderAdapterRequestError" ||
+    errorTag === "ProviderAdapterSessionClosedError" ||
+    errorTag === "ProviderAdapterSessionNotFoundError" ||
+    errorTag === "ProviderAdapterValidationError"
+  ) {
+    return cause as ProviderAdapterError;
+  }
+
+  return new ProviderAdapterProcessError({
+    provider: PROVIDER,
+    threadId,
+    detail: `${operation}: ${toMessage(cause, "unknown error")}`,
+    cause,
+  });
+}
+
 export function readGeminiResumeState(resumeCursor: unknown): GeminiResumeState | undefined {
   if (!resumeCursor || typeof resumeCursor !== "object" || Array.isArray(resumeCursor)) {
     return undefined;
@@ -1049,409 +1078,822 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* () {
   const runFork = Effect.runForkWith(services);
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
 
-  const sessions = new Map<string, GeminiSessionContext>();
-
   // Emit events to the unbounded queue. We use unsafeOffer via runSync
   // because events are emitted from both Effect fibers and plain JS callbacks
   // (MessageBus handlers). For an unbounded queue, offer never blocks.
   const emit = (event: ProviderRuntimeEvent): void => {
     Effect.runSyncWith(services)(Queue.offer(runtimeEventQueue, event));
   };
+  interface QueuedGeminiTurn {
+    readonly promptText: string;
+  }
 
-  const setupRetryAttemptHandler = (ctx: GeminiSessionContext): void => {
-    const onRetryAttempt = (payload: RetryAttemptPayload): void => {
-      if (!ctx.turnState || !ctx.activeStreamPromise || ctx.stopped) {
-        return;
-      }
-      if (payload.model !== ctx.session.model) {
-        return;
-      }
+  class GeminiRuntimeSession implements GeminiSessionContext {
+    readonly messageBusUnsubscribers: Array<() => void> = [];
+    turnState: GeminiTurnState | undefined = undefined;
+    stopped = false;
+    readonly pendingApprovals = new Map<string, PendingApproval>();
+    readonly pendingUserInputs = new Map<string, PendingUserInput>();
+    userRequestedMode = "default";
+    planModeTextSuppressed = false;
+    assistantMessageSegment = 0;
+    assistantMessageText = "";
+    cumulativeInputTokens = 0;
+    cumulativeOutputTokens = 0;
+    readonly inFlightTools = new Map<string, ToolInFlight>();
+    readonly turns: Array<GeminiTrackedTurn>;
+    activeStreamPromise: Promise<void> | undefined = undefined;
 
-      const activeMatchingSessions = [...sessions.values()].filter(
-        (candidate) =>
-          !candidate.stopped &&
-          candidate.turnState !== undefined &&
-          candidate.activeStreamPromise !== undefined &&
-          candidate.session.model === payload.model,
-      );
-      if (activeMatchingSessions.length !== 1 || activeMatchingSessions[0] !== ctx) {
-        return;
-      }
+    private readonly messageBus: MessageBus;
+    private queuedTurn: QueuedGeminiTurn | undefined = undefined;
+    private turnQueueWaiter: (() => void) | undefined = undefined;
+    private readonly workerPromise: Promise<void>;
 
-      const message = formatGeminiRetryWarningMessage(payload);
-      emit({
-        ...makeEventBase(ctx),
-        type: "runtime.warning",
-        payload: {
-          message,
-          detail: {
-            attempt: payload.attempt,
-            maxAttempts: payload.maxAttempts,
-            delayMs: payload.delayMs,
-            error: payload.error,
-            model: payload.model,
-          },
-        },
-      } as ProviderRuntimeEvent);
-    };
+    constructor(
+      readonly session: ProviderSession,
+      readonly config: Config,
+      readonly geminiClient: GeminiClient,
+      resumeState: GeminiResumeState | undefined,
+    ) {
+      this.abortController = new AbortController();
+      this.turns = Array.from({ length: resumeState?.turnCount ?? 0 }, (_, index) => {
+        const historyLength = resumeState?.turnHistoryLengths?.[index];
+        return {
+          id: `restored-turn-${index}`,
+          items: [],
+          ...(historyLength !== undefined ? { historyLength } : {}),
+        };
+      });
+      updateResumeCursor(this);
+      this.messageBus = config.getMessageBus();
+      this.setupRetryAttemptHandler();
+      this.setupMessageBusHandlers();
+      this.workerPromise = this.runWorker().catch((error) => {
+        if (this.stopped) {
+          return;
+        }
 
-    coreEvents.on(CoreEvent.RetryAttempt, onRetryAttempt);
-    ctx.messageBusUnsubscribers.push(() => {
-      coreEvents.off(CoreEvent.RetryAttempt, onRetryAttempt);
-    });
-  };
+        console.error("[gemini] Session worker crashed:", error);
+        if (this.turnState) {
+          this.completeTurn("failed", "error", toMessage(error, "Session worker error"));
+        }
+      });
+    }
 
-  // ---------------------------------------------------------------------------
-  // Session lookup
-  // ---------------------------------------------------------------------------
+    abortController: AbortController;
 
-  const getSession = (
-    threadId: ThreadId,
-  ): Effect.Effect<GeminiSessionContext, ProviderAdapterError> => {
-    const ctx = sessions.get(threadId);
-    if (!ctx) {
-      return Effect.fail(
-        new ProviderAdapterSessionNotFoundError({
+    startTurn(input: ProviderSendTurnInput): ProviderTurnStartResult {
+      if (this.turnState || this.queuedTurn || this.activeStreamPromise) {
+        throw new ProviderAdapterRequestError({
           provider: PROVIDER,
-          threadId,
+          method: "sendTurn",
+          detail: `Session "${this.session.threadId}" already has an active turn.`,
+        });
+      }
+
+      try {
+        restoreGeminiHistoryFromResumeCursor(this);
+      } catch (cause) {
+        throw new ProviderAdapterProcessError({
+          provider: PROVIDER,
+          threadId: input.threadId,
+          detail: `Failed to restore Gemini history before turn start: ${toMessage(cause, "unknown error")}`,
+          cause,
+        });
+      }
+
+      const interactionMode = input.interactionMode ?? this.userRequestedMode;
+      this.userRequestedMode = interactionMode;
+      this.config.setApprovalMode(
+        resolveGeminiApprovalMode({
+          interactionMode,
+          runtimeMode: this.session.runtimeMode,
         }),
       );
+
+      const now = new Date().toISOString();
+      const turnId = `turn-${Date.now()}-${this.turns.length}`;
+
+      this.turnState = {
+        turnId,
+        startedAt: now,
+        reasoningItemEmitted: false,
+        capturedProposedPlanKeys: new Set(),
+      };
+      this.planModeTextSuppressed = false;
+      this.assistantMessageSegment = 0;
+      this.assistantMessageText = "";
+      this.inFlightTools.clear();
+      this.abortController = new AbortController();
+
+      const promptText = input.input?.trim() ?? "";
+
+      const mutableSession = this.session as {
+        status: ProviderSession["status"];
+        activeTurnId?: TurnId;
+        updatedAt: string;
+      };
+      mutableSession.status = "running";
+      mutableSession.activeTurnId = TurnIdBrand.makeUnsafe(turnId);
+      mutableSession.updatedAt = now;
+
+      emit({
+        ...makeEventBase(this),
+        type: "turn.started",
+        payload: { model: this.session.model },
+      } as ProviderRuntimeEvent);
+      emit({
+        ...makeEventBase(this),
+        type: "session.state.changed",
+        payload: { state: "running" },
+      } as ProviderRuntimeEvent);
+
+      this.queuedTurn = { promptText };
+      this.notifyTurnWorker();
+
+      return {
+        threadId: input.threadId,
+        turnId: TurnIdBrand.makeUnsafe(turnId),
+        ...(this.session.resumeCursor !== undefined
+          ? { resumeCursor: this.session.resumeCursor }
+          : {}),
+      };
     }
-    if (ctx.stopped) {
-      return Effect.fail(new ProviderAdapterSessionClosedError({ provider: PROVIDER, threadId }));
+
+    interrupt(): void {
+      abortActiveTurn(this);
     }
-    return Effect.succeed(ctx);
-  };
 
-  // ---------------------------------------------------------------------------
-  // MessageBus tool confirmation handler
-  // ---------------------------------------------------------------------------
-
-  function setupMessageBusHandlers(ctx: GeminiSessionContext, messageBus: MessageBus): void {
-    const handleConfirmation = (request: ToolConfirmationRequest): void => {
-      if (ctx.stopped || !ctx.turnState) return;
-
-      const correlationId = request.correlationId;
-      const askUserQuestions =
-        request.details?.type === "ask_user"
-          ? normalizeGeminiAskUserQuestions(request.details.questions)
-          : undefined;
-
-      if (askUserQuestions && askUserQuestions.length > 0) {
-        openGeminiUserInputRequest({
-          ctx,
-          messageBus,
-          emitEvent: emit,
-          correlationId,
-          rawQuestions: askUserQuestions,
-          responseChannel: "tool_confirmation",
+    resolveApproval(requestId: string, decision: ProviderApprovalDecision): void {
+      const pending = this.pendingApprovals.get(requestId);
+      if (!pending) {
+        throw new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "respondToRequest",
+          detail: `No pending approval for requestId "${requestId}"`,
         });
+      }
+
+      this.pendingApprovals.delete(requestId);
+
+      const confirmed = decision === "accept" || decision === "acceptForSession";
+      const outcome = confirmed
+        ? decision === "acceptForSession"
+          ? ToolConfirmationOutcome.ProceedAlways
+          : ToolConfirmationOutcome.ProceedOnce
+        : ToolConfirmationOutcome.Cancel;
+
+      pending.resolve({ confirmed, outcome });
+
+      emit({
+        ...makeEventBase(this),
+        requestId: RuntimeRequestId.makeUnsafe(requestId),
+        type: "request.resolved",
+        payload: {
+          requestType: pending.requestType,
+          decision,
+        },
+      } as ProviderRuntimeEvent);
+    }
+
+    resolveUserInput(requestId: string, answers: ProviderUserInputAnswers): void {
+      const pending = this.pendingUserInputs.get(requestId);
+      if (!pending) {
+        throw new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "respondToUserInput",
+          detail: `No pending user input for requestId "${requestId}"`,
+        });
+      }
+
+      this.pendingUserInputs.delete(requestId);
+      pending.resolve(answers);
+
+      emit({
+        ...makeEventBase(this),
+        requestId: RuntimeRequestId.makeUnsafe(requestId),
+        type: "user-input.resolved",
+        payload: {
+          answers,
+        },
+      } as ProviderRuntimeEvent);
+    }
+
+    async stop(): Promise<void> {
+      if (this.stopped) {
         return;
       }
 
-      if (ctx.userRequestedMode !== "plan" && ctx.session.runtimeMode === "full-access") {
-        void messageBus.publish({
+      this.stopped = true;
+      this.queuedTurn = undefined;
+      abortActiveTurn(this);
+      if (this.turnState && !this.activeStreamPromise) {
+        this.completeTurn("interrupted", "aborted");
+      }
+
+      this.notifyTurnWorker();
+      for (const unsubscribe of this.messageBusUnsubscribers.splice(0)) {
+        try {
+          unsubscribe();
+        } catch {
+          // ignore cleanup failures while stopping
+        }
+      }
+
+      for (const [, pending] of this.pendingApprovals) {
+        pending.resolve({
+          confirmed: false,
+          outcome: ToolConfirmationOutcome.Cancel,
+        });
+      }
+      this.pendingApprovals.clear();
+
+      for (const [requestId, pending] of this.pendingUserInputs) {
+        pending.resolve(undefined);
+        emit({
+          ...makeEventBase(this),
+          requestId: RuntimeRequestId.makeUnsafe(requestId),
+          type: "user-input.resolved",
+          payload: {
+            answers: {},
+          },
+        } as ProviderRuntimeEvent);
+      }
+      this.pendingUserInputs.clear();
+
+      await this.activeStreamPromise?.catch(() => undefined);
+      await this.workerPromise;
+
+      try {
+        await this.config.dispose();
+      } catch {
+        // swallow shutdown errors
+      }
+
+      (this.session as { status: ProviderSession["status"] }).status = "closed";
+
+      emit({
+        ...makeEventBase(this),
+        type: "session.exited",
+        payload: {
+          reason: "stopped",
+          exitKind: "graceful",
+        },
+      } as ProviderRuntimeEvent);
+    }
+
+    readThreadSnapshot() {
+      return {
+        threadId: this.session.threadId,
+        turns: this.turns.map((turn) => ({
+          id: TurnIdBrand.makeUnsafe(turn.id),
+          items: turn.items,
+        })),
+      };
+    }
+
+    rollbackThread(numTurns: number) {
+      const nextTurnCount = Math.max(0, this.turns.length - numTurns);
+      const retainedTurns = this.turns.slice(0, nextTurnCount);
+
+      const history = this.geminiClient.getHistory();
+      const targetHistoryLength =
+        retainedTurns.length === 0 ? 0 : retainedTurns.at(-1)?.historyLength;
+      const newHistory =
+        targetHistoryLength !== undefined
+          ? history.slice(0, Math.min(history.length, targetHistoryLength))
+          : history.slice(0, Math.max(0, history.length - numTurns * 2));
+      this.geminiClient.setHistory([...newHistory]);
+
+      void this.turns.splice(nextTurnCount);
+      updateResumeCursor(this);
+
+      return this.readThreadSnapshot();
+    }
+
+    private notifyTurnWorker(): void {
+      const waiter = this.turnQueueWaiter;
+      this.turnQueueWaiter = undefined;
+      waiter?.();
+    }
+
+    private async waitForQueuedTurn(): Promise<QueuedGeminiTurn | undefined> {
+      while (!this.stopped) {
+        if (this.queuedTurn) {
+          const queuedTurn = this.queuedTurn;
+          this.queuedTurn = undefined;
+          return queuedTurn;
+        }
+
+        await new Promise<void>((resolve) => {
+          this.turnQueueWaiter = resolve;
+        });
+      }
+
+      return undefined;
+    }
+
+    private async runWorker(): Promise<void> {
+      while (!this.stopped) {
+        const queuedTurn = await this.waitForQueuedTurn();
+        if (!queuedTurn) {
+          return;
+        }
+
+        this.activeStreamPromise = this.runStreamLoop(queuedTurn.promptText);
+        try {
+          await this.activeStreamPromise;
+        } finally {
+          this.activeStreamPromise = undefined;
+        }
+      }
+    }
+
+    private setupRetryAttemptHandler(): void {
+      const onRetryAttempt = (payload: RetryAttemptPayload): void => {
+        if (!this.turnState || !this.activeStreamPromise || this.stopped) {
+          return;
+        }
+        if (payload.model !== this.session.model) {
+          return;
+        }
+
+        const activeMatchingSessions = [...sessions.values()].filter(
+          (candidate) =>
+            !candidate.stopped &&
+            candidate.turnState !== undefined &&
+            candidate.activeStreamPromise !== undefined &&
+            candidate.session.model === payload.model,
+        );
+        if (activeMatchingSessions.length !== 1 || activeMatchingSessions[0] !== this) {
+          return;
+        }
+
+        emit({
+          ...makeEventBase(this),
+          type: "runtime.warning",
+          payload: {
+            message: formatGeminiRetryWarningMessage(payload),
+            detail: {
+              attempt: payload.attempt,
+              maxAttempts: payload.maxAttempts,
+              delayMs: payload.delayMs,
+              error: payload.error,
+              model: payload.model,
+            },
+          },
+        } as ProviderRuntimeEvent);
+      };
+
+      coreEvents.on(CoreEvent.RetryAttempt, onRetryAttempt);
+      this.messageBusUnsubscribers.push(() => {
+        coreEvents.off(CoreEvent.RetryAttempt, onRetryAttempt);
+      });
+    }
+
+    private setupMessageBusHandlers(): void {
+      const handleConfirmation = (request: ToolConfirmationRequest): void => {
+        if (this.stopped || !this.turnState) {
+          return;
+        }
+
+        const correlationId = request.correlationId;
+        const askUserQuestions =
+          request.details?.type === "ask_user"
+            ? normalizeGeminiAskUserQuestions(request.details.questions)
+            : undefined;
+
+        if (askUserQuestions && askUserQuestions.length > 0) {
+          this.openUserInputRequest({
+            correlationId,
+            rawQuestions: askUserQuestions,
+            responseChannel: "tool_confirmation",
+          });
+          return;
+        }
+
+        if (this.userRequestedMode !== "plan" && this.session.runtimeMode === "full-access") {
+          void this.messageBus.publish({
+            type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+            correlationId,
+            confirmed: true,
+            outcome: ToolConfirmationOutcome.ProceedOnce,
+          });
+          return;
+        }
+
+        // Surface the tool's native confirmation details immediately rather
+        // than waiting for the MessageBus request timeout.
+        void this.messageBus.publish({
           type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
           correlationId,
-          confirmed: true,
-          outcome: ToolConfirmationOutcome.ProceedOnce,
+          confirmed: false,
+          requiresUserConfirmation: true,
         });
-        return;
-      }
+      };
 
-      // Tell Gemini CLI core to surface the tool's own confirmation details
-      // immediately instead of waiting for the MessageBus request timeout.
-      void messageBus.publish({
-        type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-        correlationId,
-        confirmed: false,
-        requiresUserConfirmation: true,
-      });
-    };
-
-    messageBus.subscribe(MessageBusType.TOOL_CONFIRMATION_REQUEST, handleConfirmation as any);
-    ctx.messageBusUnsubscribers.push(() => {
-      messageBus.unsubscribe(MessageBusType.TOOL_CONFIRMATION_REQUEST, handleConfirmation as any);
-    });
-
-    // Handle ask_user requests
-    const handleAskUser = (request: any): void => {
-      if (ctx.stopped || !ctx.turnState) return;
-
-      const correlationId = request.correlationId as string;
-      openGeminiUserInputRequest({
-        ctx,
-        messageBus,
-        emitEvent: emit,
-        correlationId,
-        rawQuestions: request.questions,
-        responseChannel: "ask_user",
-      });
-    };
-
-    messageBus.subscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
-    ctx.messageBusUnsubscribers.push(() => {
-      messageBus.unsubscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
-    });
-
-    const handleSubagentActivity = (message: SubagentActivityMessage): void => {
-      if (ctx.stopped || !ctx.turnState) return;
-
-      const activeTool = [...ctx.inFlightTools.values()]
-        .toReversed()
-        .find(
-          (tool) =>
-            tool.itemType === "collab_agent_tool_call" && tool.toolName === message.subagentName,
+      this.messageBus.subscribe(
+        MessageBusType.TOOL_CONFIRMATION_REQUEST,
+        handleConfirmation as any,
+      );
+      this.messageBusUnsubscribers.push(() => {
+        this.messageBus.unsubscribe(
+          MessageBusType.TOOL_CONFIRMATION_REQUEST,
+          handleConfirmation as any,
         );
-      if (!activeTool) {
+      });
+
+      const handleAskUser = (request: { correlationId: string; questions: unknown }): void => {
+        if (this.stopped || !this.turnState) {
+          return;
+        }
+
+        this.openUserInputRequest({
+          correlationId: request.correlationId,
+          rawQuestions: request.questions,
+          responseChannel: "ask_user",
+        });
+      };
+
+      this.messageBus.subscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
+      this.messageBusUnsubscribers.push(() => {
+        this.messageBus.unsubscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as any);
+      });
+
+      const handleSubagentActivity = (message: SubagentActivityMessage): void => {
+        if (this.stopped || !this.turnState) {
+          return;
+        }
+
+        const activeTool = [...this.inFlightTools.values()]
+          .toReversed()
+          .find(
+            (tool) =>
+              tool.itemType === "collab_agent_tool_call" && tool.toolName === message.subagentName,
+          );
+        if (!activeTool) {
+          return;
+        }
+
+        emit({
+          ...makeEventBase(this),
+          itemId: RuntimeItemId.makeUnsafe(activeTool.itemId),
+          type: "item.updated",
+          payload: {
+            itemType: activeTool.itemType,
+            title: activeTool.toolName,
+            detail: formatGeminiSubagentActivityDetail({
+              subagentName: message.subagentName,
+              activity: message.activity,
+            }),
+            data: {
+              subagentName: message.subagentName,
+              activityType: message.activity.type,
+              status: message.activity.status,
+            },
+          },
+        } as ProviderRuntimeEvent);
+      };
+
+      this.messageBus.subscribe(MessageBusType.SUBAGENT_ACTIVITY, handleSubagentActivity as any);
+      this.messageBusUnsubscribers.push(() => {
+        this.messageBus.unsubscribe(
+          MessageBusType.SUBAGENT_ACTIVITY,
+          handleSubagentActivity as any,
+        );
+      });
+    }
+
+    private requestApproval(input: {
+      readonly toolName: string;
+      readonly args: Record<string, unknown>;
+      readonly confirmation: Exclude<ToolCallConfirmationDetails, { type: "ask_user" }>;
+    }): Promise<{ confirmed: boolean; outcome: ToolConfirmationOutcome }> {
+      return requestGeminiApproval({
+        ctx: this,
+        toolName: input.toolName,
+        args: input.args,
+        confirmation: input.confirmation,
+        emitEvent: emit,
+      });
+    }
+
+    private requestUserInput(rawQuestions: unknown): Promise<ProviderUserInputAnswers | undefined> {
+      return requestGeminiUserInput({
+        ctx: this,
+        rawQuestions,
+        emitEvent: emit,
+      });
+    }
+
+    private openUserInputRequest(input: {
+      readonly correlationId: string;
+      readonly rawQuestions: unknown;
+      readonly responseChannel: "tool_confirmation" | "ask_user";
+    }): boolean {
+      return openGeminiUserInputRequest({
+        ctx: this,
+        messageBus: this.messageBus,
+        emitEvent: emit,
+        correlationId: input.correlationId,
+        rawQuestions: input.rawQuestions,
+        responseChannel: input.responseChannel,
+      });
+    }
+
+    private emitProposedPlanCompleted(planMarkdown: string): void {
+      if (!this.turnState) {
         return;
       }
+
+      const trimmedPlan = planMarkdown.trim();
+      if (trimmedPlan.length === 0) {
+        return;
+      }
+
+      const captureKey = `plan:${trimmedPlan}`;
+      if (this.turnState.capturedProposedPlanKeys.has(captureKey)) {
+        return;
+      }
+      this.turnState.capturedProposedPlanKeys.add(captureKey);
 
       emit({
-        ...makeEventBase(ctx),
-        itemId: RuntimeItemId.makeUnsafe(activeTool.itemId),
-        type: "item.updated",
+        ...makeEventBase(this),
+        type: "turn.proposed.completed",
         payload: {
-          itemType: activeTool.itemType,
-          title: activeTool.toolName,
-          detail: formatGeminiSubagentActivityDetail({
-            subagentName: message.subagentName,
-            activity: message.activity,
-          }),
-          data: {
-            subagentName: message.subagentName,
-            activityType: message.activity.type,
-            status: message.activity.status,
-          },
+          planMarkdown: trimmedPlan,
         },
       } as ProviderRuntimeEvent);
-    };
-
-    messageBus.subscribe(MessageBusType.SUBAGENT_ACTIVITY, handleSubagentActivity as any);
-    ctx.messageBusUnsubscribers.push(() => {
-      messageBus.unsubscribe(MessageBusType.SUBAGENT_ACTIVITY, handleSubagentActivity as any);
-    });
-  }
-
-  function emitGeminiProposedPlanCompleted(ctx: GeminiSessionContext, planMarkdown: string): void {
-    if (!ctx.turnState) {
-      return;
     }
 
-    const trimmedPlan = planMarkdown.trim();
-    if (trimmedPlan.length === 0) {
-      return;
-    }
+    private emitAssistantText(text: string): void {
+      if (!this.turnState || this.planModeTextSuppressed) {
+        return;
+      }
 
-    const captureKey = `plan:${trimmedPlan}`;
-    if (ctx.turnState.capturedProposedPlanKeys.has(captureKey)) {
-      return;
-    }
-    ctx.turnState.capturedProposedPlanKeys.add(captureKey);
+      const { nextText, delta } = applyGeminiAssistantTextChunk(this.assistantMessageText, text);
+      this.assistantMessageText = nextText;
 
-    emit({
-      ...makeEventBase(ctx),
-      type: "turn.proposed.completed",
-      payload: {
-        planMarkdown: trimmedPlan,
-      },
-    } as ProviderRuntimeEvent);
-  }
+      if (delta.length === 0) {
+        return;
+      }
 
-  // ---------------------------------------------------------------------------
-  // Stream event processing
-  // ---------------------------------------------------------------------------
-
-  function emitAssistantText(ctx: GeminiSessionContext, text: string): void {
-    if (!ctx.turnState || ctx.planModeTextSuppressed) return;
-
-    const { nextText, delta } = applyGeminiAssistantTextChunk(ctx.assistantMessageText, text);
-    ctx.assistantMessageText = nextText;
-
-    if (delta.length === 0) return;
-
-    const itemId = `msg-${ctx.turnState.turnId}-${ctx.assistantMessageSegment}`;
-    emit({
-      ...makeEventBase(ctx),
-      itemId: RuntimeItemId.makeUnsafe(itemId),
-      type: "content.delta",
-      payload: {
-        streamKind: "assistant_text",
-        delta,
-      },
-    } as ProviderRuntimeEvent);
-  }
-
-  function emitReasoningText(ctx: GeminiSessionContext, thoughtText: string): void {
-    if (!ctx.turnState) return;
-
-    if (!ctx.turnState.reasoningItemEmitted) {
-      ctx.turnState.reasoningItemEmitted = true;
-      const itemId = `reasoning-${ctx.turnState.turnId}`;
       emit({
-        ...makeEventBase(ctx),
-        itemId: RuntimeItemId.makeUnsafe(itemId),
+        ...makeEventBase(this),
+        itemId: RuntimeItemId.makeUnsafe(
+          `msg-${this.turnState.turnId}-${this.assistantMessageSegment}`,
+        ),
+        type: "content.delta",
+        payload: {
+          streamKind: "assistant_text",
+          delta,
+        },
+      } as ProviderRuntimeEvent);
+    }
+
+    private emitReasoningText(thoughtText: string): void {
+      if (!this.turnState) {
+        return;
+      }
+
+      if (!this.turnState.reasoningItemEmitted) {
+        this.turnState.reasoningItemEmitted = true;
+        emit({
+          ...makeEventBase(this),
+          itemId: RuntimeItemId.makeUnsafe(`reasoning-${this.turnState.turnId}`),
+          type: "item.started",
+          payload: {
+            itemType: "reasoning",
+            title: "Thinking",
+          },
+        } as ProviderRuntimeEvent);
+      }
+
+      emit({
+        ...makeEventBase(this),
+        itemId: RuntimeItemId.makeUnsafe(`reasoning-${this.turnState.turnId}`),
+        type: "content.delta",
+        payload: {
+          streamKind: "reasoning_text",
+          delta: thoughtText,
+        },
+      } as ProviderRuntimeEvent);
+    }
+
+    private beginToolCall(
+      requestId: string,
+      toolName: string,
+      args: Record<string, unknown>,
+    ): ToolInFlight {
+      const itemType = classifyToolName(toolName);
+      const tool = {
+        requestId,
+        itemId: `tool-${requestId}`,
+        itemType,
+        toolName,
+        title: titleForToolType(itemType),
+        input: args,
+      } satisfies ToolInFlight;
+
+      this.assistantMessageSegment++;
+      this.assistantMessageText = "";
+      if (this.turnState?.capturedProposedPlanKeys.size === 0) {
+        this.planModeTextSuppressed = false;
+      }
+      this.inFlightTools.set(requestId, tool);
+
+      emit({
+        ...makeEventBase(this),
+        itemId: RuntimeItemId.makeUnsafe(tool.itemId),
         type: "item.started",
         payload: {
-          itemType: "reasoning",
-          title: "Thinking",
+          itemType,
+          title: tool.title,
+          detail: toolName,
+          data: args,
+        },
+      } as ProviderRuntimeEvent);
+
+      return tool;
+    }
+
+    private emitToolOutput(tool: ToolInFlight, output: string): void {
+      const trimmed = output.trim();
+      if (trimmed.length === 0) {
+        return;
+      }
+
+      emit({
+        ...makeEventBase(this),
+        itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+        type: "content.delta",
+        payload: {
+          streamKind:
+            tool.itemType === "command_execution" ? "command_output" : "file_change_output",
+          delta: trimmed,
         },
       } as ProviderRuntimeEvent);
     }
 
-    emit({
-      ...makeEventBase(ctx),
-      itemId: RuntimeItemId.makeUnsafe(`reasoning-${ctx.turnState.turnId}`),
-      type: "content.delta",
-      payload: {
-        streamKind: "reasoning_text",
-        delta: thoughtText,
-      },
-    } as ProviderRuntimeEvent);
-  }
-
-  function beginGeminiToolCall(
-    ctx: GeminiSessionContext,
-    requestId: string,
-    toolName: string,
-    args: Record<string, unknown>,
-  ): ToolInFlight {
-    const itemType = classifyToolName(toolName);
-    const tool = {
-      itemId: `tool-${requestId}`,
-      itemType,
-      toolName,
-      title: titleForToolType(itemType),
-      input: args,
-    } satisfies ToolInFlight;
-
-    ctx.assistantMessageSegment++;
-    ctx.assistantMessageText = "";
-    if (ctx.turnState?.capturedProposedPlanKeys.size === 0) {
-      ctx.planModeTextSuppressed = false;
-    }
-    ctx.inFlightTools.set(requestId, tool);
-
-    emit({
-      ...makeEventBase(ctx),
-      itemId: RuntimeItemId.makeUnsafe(tool.itemId),
-      type: "item.started",
-      payload: {
-        itemType,
-        title: tool.title,
-        detail: toolName,
-        data: args,
-      },
-    } as ProviderRuntimeEvent);
-
-    return tool;
-  }
-
-  function emitGeminiToolOutput(
-    ctx: GeminiSessionContext,
-    tool: ToolInFlight,
-    output: string,
-  ): void {
-    const trimmed = output.trim();
-    if (trimmed.length === 0) {
-      return;
+    private completeToolCall(tool: ToolInFlight, status: "completed" | "failed"): void {
+      this.inFlightTools.delete(tool.requestId);
+      emit({
+        ...makeEventBase(this),
+        itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+        type: "item.completed",
+        payload: {
+          itemType: tool.itemType,
+          status,
+        },
+      } as ProviderRuntimeEvent);
     }
 
-    emit({
-      ...makeEventBase(ctx),
-      itemId: RuntimeItemId.makeUnsafe(tool.itemId),
-      type: "content.delta",
-      payload: {
-        streamKind: tool.itemType === "command_execution" ? "command_output" : "file_change_output",
-        delta: trimmed,
-      },
-    } as ProviderRuntimeEvent);
-  }
+    private async runTool(
+      promptId: string,
+      functionCall: FunctionCall,
+    ): Promise<ReadonlyArray<Part>> {
+      const callId =
+        functionCall.id ??
+        `tool-${Date.now()}-${this.inFlightTools.size + this.pendingApprovals.size}`;
+      const toolName = functionCall.name ?? "";
+      const args = (functionCall.args ?? {}) as Record<string, unknown>;
+      const startedAt = Date.now();
 
-  function completeGeminiToolCall(
-    ctx: GeminiSessionContext,
-    tool: ToolInFlight,
-    status: "completed" | "failed",
-  ): void {
-    ctx.inFlightTools.delete(tool.itemId.replace(/^tool-/, ""));
-    emit({
-      ...makeEventBase(ctx),
-      itemId: RuntimeItemId.makeUnsafe(tool.itemId),
-      type: "item.completed",
-      payload: {
-        itemType: tool.itemType,
-        status,
-      },
-    } as ProviderRuntimeEvent);
-  }
-
-  async function runGeminiTool(
-    ctx: GeminiSessionContext,
-    promptId: string,
-    functionCall: FunctionCall,
-  ): Promise<ReadonlyArray<Part>> {
-    const callId =
-      functionCall.id ?? `tool-${Date.now()}-${ctx.inFlightTools.size + ctx.pendingApprovals.size}`;
-    const toolName = functionCall.name ?? "";
-    const args = (functionCall.args ?? {}) as Record<string, unknown>;
-    const startedAt = Date.now();
-
-    if (!toolName) {
-      return buildGeminiToolErrorResponse("unknown", callId, new Error("Missing function name"));
-    }
-
-    const tool = ctx.config.getToolRegistry().getTool(toolName);
-    if (!tool) {
-      return buildGeminiToolErrorResponse(
-        toolName,
-        callId,
-        new Error(`Tool "${toolName}" not found in registry.`),
-      );
-    }
-
-    const inFlightTool = beginGeminiToolCall(ctx, callId, toolName, args);
-
-    try {
-      const invocation = tool.build(args);
-      const explanation =
-        typeof invocation.getExplanation === "function" ? invocation.getExplanation() : "";
-      if (explanation) {
-        emitReasoningText(ctx, explanation);
+      if (!toolName) {
+        return buildGeminiToolErrorResponse("unknown", callId, new Error("Missing function name"));
       }
 
-      const forcedDecision = forcedGeminiToolDecision(ctx, toolName, args);
-      const confirmation = await invocation.shouldConfirmExecute(
-        ctx.abortController.signal,
-        forcedDecision,
-      );
+      const tool = this.config.getToolRegistry().getTool(toolName);
+      if (!tool) {
+        return buildGeminiToolErrorResponse(
+          toolName,
+          callId,
+          new Error(`Tool "${toolName}" not found in registry.`),
+        );
+      }
 
-      if (confirmation && confirmation.type === "exit_plan_mode") {
-        const planMarkdown = await readGeminiPlanMarkdownFromFile(confirmation.planPath);
-        if (!planMarkdown) {
-          throw new Error(`Plan file "${confirmation.planPath}" is empty.`);
+      const inFlightTool = this.beginToolCall(callId, toolName, args);
+
+      try {
+        const invocation = tool.build(args);
+        const explanation =
+          typeof invocation.getExplanation === "function" ? invocation.getExplanation() : "";
+        if (explanation) {
+          this.emitReasoningText(explanation);
         }
 
-        emitGeminiProposedPlanCompleted(ctx, planMarkdown);
-        ctx.planModeTextSuppressed = true;
+        const forcedDecision = forcedGeminiToolDecision(this, toolName, args);
+        const confirmation = await invocation.shouldConfirmExecute(
+          this.abortController.signal,
+          forcedDecision,
+        );
 
-        const toolResult = {
-          llmContent: [
-            "The client captured your proposed plan.",
-            `Plan file: ${confirmation.planPath}`,
-            "Stop here and wait for the user's feedback or implementation request in a later turn.",
-          ].join("\n\n"),
-          returnDisplay: `Captured plan: ${confirmation.planPath}`,
-        } satisfies ToolResult;
+        if (confirmation && confirmation.type === "exit_plan_mode") {
+          const planMarkdown = await readGeminiPlanMarkdownFromFile(confirmation.planPath);
+          if (!planMarkdown) {
+            throw new Error(`Plan file "${confirmation.planPath}" is empty.`);
+          }
+
+          this.emitProposedPlanCompleted(planMarkdown);
+          this.planModeTextSuppressed = true;
+
+          const toolResult = {
+            llmContent: [
+              "The client captured your proposed plan.",
+              `Plan file: ${confirmation.planPath}`,
+              "Stop here and wait for the user's feedback or implementation request in a later turn.",
+            ].join("\n\n"),
+            returnDisplay: `Captured plan: ${confirmation.planPath}`,
+          } satisfies ToolResult;
+
+          const resultText = summarizeGeminiToolResult(toolResult);
+          if (resultText) {
+            this.emitToolOutput(inFlightTool, resultText);
+          }
+
+          this.completeToolCall(inFlightTool, "completed");
+
+          logToolCall(
+            this.config,
+            new ToolCallEvent(
+              undefined,
+              toolName,
+              args,
+              Date.now() - startedAt,
+              true,
+              promptId,
+              tool instanceof DiscoveredMCPTool ? "mcp" : "native",
+            ),
+          );
+
+          return convertToFunctionResponse(
+            toolName,
+            callId,
+            toolResult.llmContent,
+            this.config.getActiveModel(),
+            this.config,
+          );
+        }
+
+        if (confirmation) {
+          if (confirmation.type === "ask_user") {
+            const answers = await this.requestUserInput(confirmation.questions);
+            const payload =
+              answers === undefined
+                ? undefined
+                : ({
+                    answers: buildGeminiAskUserResponseAnswers({
+                      questions: normalizeGeminiAskUserQuestions(confirmation.questions),
+                      answers,
+                    }),
+                  } satisfies ToolConfirmationPayload);
+
+            await confirmation.onConfirm(
+              answers === undefined
+                ? ToolConfirmationOutcome.Cancel
+                : ToolConfirmationOutcome.ProceedOnce,
+              payload,
+            );
+
+            if (answers === undefined) {
+              throw new Error(`Tool "${toolName}" was canceled by the user.`);
+            }
+          } else {
+            const approval = await this.requestApproval({
+              toolName,
+              args,
+              confirmation,
+            });
+
+            await confirmation.onConfirm(approval.outcome);
+
+            if (!approval.confirmed) {
+              throw new Error(`Tool "${toolName}" was canceled by the user.`);
+            }
+          }
+        }
+
+        let liveOutputBuffer = "";
+        const toolResult = await invocation.execute(
+          this.abortController.signal,
+          (output: ToolLiveOutput) => {
+            if (typeof output !== "string") {
+              return;
+            }
+            liveOutputBuffer += output;
+            this.emitToolOutput(inFlightTool, output);
+          },
+        );
 
         const resultText = summarizeGeminiToolResult(toolResult);
-        if (resultText) {
-          emitGeminiToolOutput(ctx, inFlightTool, resultText);
+        if (resultText && liveOutputBuffer.trim().length === 0) {
+          this.emitToolOutput(inFlightTool, resultText);
         }
 
-        completeGeminiToolCall(ctx, inFlightTool, "completed");
+        this.completeToolCall(inFlightTool, "completed");
 
         logToolCall(
-          ctx.config,
+          this.config,
           new ToolCallEvent(
             undefined,
             toolName,
@@ -1467,401 +1909,321 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* () {
           toolName,
           callId,
           toolResult.llmContent,
-          ctx.config.getActiveModel(),
-          ctx.config,
+          this.config.getActiveModel(),
+          this.config,
         );
-      }
+      } catch (error) {
+        const toolError = error instanceof Error ? error : new Error(String(error));
 
-      if (confirmation) {
-        if (confirmation.type === "ask_user") {
-          const answers = await requestGeminiUserInput({
-            ctx,
-            rawQuestions: confirmation.questions,
-            emitEvent: emit,
-          });
-          const payload =
-            answers === undefined
-              ? undefined
-              : ({
-                  answers: buildGeminiAskUserResponseAnswers({
-                    questions: normalizeGeminiAskUserQuestions(confirmation.questions),
-                    answers,
-                  }),
-                } satisfies ToolConfirmationPayload);
+        this.emitToolOutput(inFlightTool, toolError.message);
+        this.completeToolCall(inFlightTool, "failed");
 
-          await confirmation.onConfirm(
-            answers === undefined
-              ? ToolConfirmationOutcome.Cancel
-              : ToolConfirmationOutcome.ProceedOnce,
-            payload,
-          );
-
-          if (answers === undefined) {
-            throw new Error(`Tool "${toolName}" was canceled by the user.`);
-          }
-        } else {
-          const approval = await requestGeminiApproval({
-            ctx,
+        logToolCall(
+          this.config,
+          new ToolCallEvent(
+            undefined,
             toolName,
             args,
-            confirmation,
-            emitEvent: emit,
-          });
-
-          await confirmation.onConfirm(approval.outcome);
-
-          if (!approval.confirmed) {
-            throw new Error(`Tool "${toolName}" was canceled by the user.`);
-          }
-        }
-      }
-
-      let liveOutputBuffer = "";
-      const toolResult = await invocation.execute(
-        ctx.abortController.signal,
-        (output: ToolLiveOutput) => {
-          if (typeof output !== "string") {
-            return;
-          }
-          liveOutputBuffer += output;
-          emitGeminiToolOutput(ctx, inFlightTool, output);
-        },
-      );
-
-      const resultText = summarizeGeminiToolResult(toolResult);
-      if (resultText && liveOutputBuffer.trim().length === 0) {
-        emitGeminiToolOutput(ctx, inFlightTool, resultText);
-      }
-
-      completeGeminiToolCall(ctx, inFlightTool, "completed");
-
-      logToolCall(
-        ctx.config,
-        new ToolCallEvent(
-          undefined,
-          toolName,
-          args,
-          Date.now() - startedAt,
-          true,
-          promptId,
-          tool instanceof DiscoveredMCPTool ? "mcp" : "native",
-        ),
-      );
-
-      return convertToFunctionResponse(
-        toolName,
-        callId,
-        toolResult.llmContent,
-        ctx.config.getActiveModel(),
-        ctx.config,
-      );
-    } catch (error) {
-      const toolError = error instanceof Error ? error : new Error(String(error));
-
-      emitGeminiToolOutput(ctx, inFlightTool, toolError.message);
-      completeGeminiToolCall(ctx, inFlightTool, "failed");
-
-      logToolCall(
-        ctx.config,
-        new ToolCallEvent(
-          undefined,
-          toolName,
-          args,
-          Date.now() - startedAt,
-          false,
-          promptId,
-          tool instanceof DiscoveredMCPTool ? "mcp" : "native",
-          toolError.message,
-        ),
-      );
-
-      return buildGeminiToolErrorResponse(toolName, callId, toolError);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Stream loop — background turn processing
-  // ---------------------------------------------------------------------------
-
-  async function runStreamLoop(ctx: GeminiSessionContext, promptText: string): Promise<void> {
-    const promptId = `prompt-${Date.now()}`;
-    const chat = ctx.geminiClient.getChat();
-    const baseSystemInstruction = getCoreSystemPrompt(
-      ctx.config,
-      ctx.config.getSystemInstructionMemory(),
-    );
-    chat.setSystemInstruction(baseSystemInstruction);
-    let nextMessage: Content | null = {
-      role: "user",
-      parts: [{ text: promptText }],
-    };
-
-    try {
-      while (nextMessage !== null && ctx.turnState && !ctx.stopped) {
-        if (ctx.abortController.signal.aborted) {
-          completeTurn(ctx, "interrupted", "aborted");
-          return;
-        }
-
-        const functionCalls: FunctionCall[] = [];
-        const modelParts: Part[] = [];
-        const routingContext: RoutingContext = {
-          history: chat.getHistory(true),
-          request: nextMessage.parts ?? [],
-          signal: ctx.abortController.signal,
-          requestedModel: ctx.config.getModel(),
-        };
-        const { model } = await ctx.config.getModelRouterService().route(routingContext);
-
-        let responseStream: AsyncGenerator<any>;
-        try {
-          responseStream = await chat.sendMessageStream(
-            { model },
-            nextMessage.parts ?? [],
+            Date.now() - startedAt,
+            false,
             promptId,
-            ctx.abortController.signal,
-            LlmRole.MAIN,
-          );
-        } catch (error) {
-          if (ctx.abortController.signal.aborted) {
-            completeTurn(ctx, "interrupted", "aborted");
+            tool instanceof DiscoveredMCPTool ? "mcp" : "native",
+            toolError.message,
+          ),
+        );
+
+        return buildGeminiToolErrorResponse(toolName, callId, toolError);
+      }
+    }
+
+    private async runStreamLoop(promptText: string): Promise<void> {
+      const promptId = `prompt-${Date.now()}`;
+      const chat = this.geminiClient.getChat();
+      const baseSystemInstruction = getCoreSystemPrompt(
+        this.config,
+        this.config.getSystemInstructionMemory(),
+      );
+      chat.setSystemInstruction(baseSystemInstruction);
+      let nextMessage: Content | null = {
+        role: "user",
+        parts: [{ text: promptText }],
+      };
+
+      try {
+        while (nextMessage !== null && this.turnState && !this.stopped) {
+          if (this.abortController.signal.aborted) {
+            this.completeTurn("interrupted", "aborted");
             return;
           }
-          throw error;
-        }
 
-        nextMessage = null;
+          const functionCalls: FunctionCall[] = [];
+          const modelParts: Part[] = [];
+          const routingContext: RoutingContext = {
+            history: chat.getHistory(true),
+            request: nextMessage.parts ?? [],
+            signal: this.abortController.signal,
+            requestedModel: this.config.getModel(),
+          };
+          const { model } = await this.config.getModelRouterService().route(routingContext);
 
-        try {
-          for await (const response of responseStream) {
-            if (ctx.abortController.signal.aborted) {
-              completeTurn(ctx, "interrupted", "aborted");
+          let responseStream: AsyncGenerator<any>;
+          try {
+            responseStream = await chat.sendMessageStream(
+              { model },
+              nextMessage.parts ?? [],
+              promptId,
+              this.abortController.signal,
+              LlmRole.MAIN,
+            );
+          } catch (error) {
+            if (this.abortController.signal.aborted) {
+              this.completeTurn("interrupted", "aborted");
               return;
             }
+            throw error;
+          }
 
-            if (response.type !== StreamEventType.CHUNK) {
-              continue;
-            }
+          nextMessage = null;
 
-            const usage = response.value?.usageMetadata;
-            if (usage) {
-              ctx.cumulativeInputTokens += usage.promptTokenCount ?? 0;
-              ctx.cumulativeOutputTokens += usage.candidatesTokenCount ?? 0;
-            }
+          try {
+            for await (const response of responseStream) {
+              if (this.abortController.signal.aborted) {
+                this.completeTurn("interrupted", "aborted");
+                return;
+              }
 
-            if (Array.isArray(response.value?.functionCalls)) {
-              functionCalls.push(...response.value.functionCalls);
-            }
-
-            const candidate = response.value?.candidates?.[0];
-            for (const part of candidate?.content?.parts ?? []) {
-              if (part.thought && typeof part.text === "string") {
-                emitReasoningText(ctx, part.text);
+              if (response.type !== StreamEventType.CHUNK) {
                 continue;
               }
 
-              if (typeof part.text === "string") {
-                modelParts.push(part);
-                emitAssistantText(ctx, part.text);
+              const usage = response.value?.usageMetadata;
+              if (usage) {
+                this.cumulativeInputTokens += usage.promptTokenCount ?? 0;
+                this.cumulativeOutputTokens += usage.candidatesTokenCount ?? 0;
+              }
+
+              if (Array.isArray(response.value?.functionCalls)) {
+                functionCalls.push(...response.value.functionCalls);
+              }
+
+              const candidate = response.value?.candidates?.[0];
+              for (const part of candidate?.content?.parts ?? []) {
+                if (part.thought && typeof part.text === "string") {
+                  this.emitReasoningText(part.text);
+                  continue;
+                }
+
+                if (typeof part.text === "string") {
+                  modelParts.push(part);
+                  this.emitAssistantText(part.text);
+                }
               }
             }
-          }
-        } catch (error) {
-          if (ctx.abortController.signal.aborted) {
-            completeTurn(ctx, "interrupted", "aborted");
-            return;
+          } catch (error) {
+            if (this.abortController.signal.aborted) {
+              this.completeTurn("interrupted", "aborted");
+              return;
+            }
+
+            if (functionCalls.length === 0 && isGracefulGeminiTurnError(error)) {
+              appendGeminiAssistantHistory(chat, modelParts);
+              break;
+            }
+
+            throw error;
           }
 
-          if (functionCalls.length === 0 && isGracefulGeminiTurnError(error)) {
-            appendGeminiAssistantHistory(chat, modelParts);
+          if (functionCalls.length === 0) {
             break;
           }
 
-          throw error;
+          const toolResponseParts: Part[] = [];
+          for (const functionCall of functionCalls) {
+            const responses = await this.runTool(promptId, functionCall);
+            toolResponseParts.push(...responses);
+          }
+
+          if (this.abortController.signal.aborted) {
+            this.completeTurn("interrupted", "aborted");
+            return;
+          }
+
+          nextMessage = {
+            role: "user",
+            parts: toolResponseParts,
+          };
         }
 
-        if (functionCalls.length === 0) {
-          break;
+        if (this.turnState) {
+          this.completeTurn(
+            this.abortController.signal.aborted ? "interrupted" : "completed",
+            this.abortController.signal.aborted ? "aborted" : "completed",
+          );
         }
-
-        const toolResponseParts: Part[] = [];
-        for (const functionCall of functionCalls) {
-          const responses = await runGeminiTool(ctx, promptId, functionCall);
-          toolResponseParts.push(...responses);
-        }
-
-        if (ctx.abortController.signal.aborted) {
-          completeTurn(ctx, "interrupted", "aborted");
+      } catch (error) {
+        if (this.abortController.signal.aborted) {
+          this.completeTurn("interrupted", "interrupted");
           return;
         }
 
-        nextMessage = {
-          role: "user",
-          parts: toolResponseParts,
-        };
+        console.error("[gemini] Stream error:", error);
+        this.completeTurn("failed", "error", toMessage(error, "Stream error"));
+      }
+    }
+
+    private completeTurn(
+      state: "completed" | "failed" | "interrupted" | "cancelled",
+      stopReason: string,
+      errorMessage?: string,
+    ): void {
+      if (!this.turnState) {
+        return;
       }
 
-      if (ctx.turnState) {
-        completeTurn(
-          ctx,
-          ctx.abortController.signal.aborted ? "interrupted" : "completed",
-          ctx.abortController.signal.aborted ? "aborted" : "completed",
+      for (const [, tool] of this.inFlightTools) {
+        emit({
+          ...makeEventBase(this),
+          itemId: RuntimeItemId.makeUnsafe(tool.itemId),
+          type: "item.completed",
+          payload: {
+            itemType: tool.itemType,
+            status: "failed",
+          },
+        } as ProviderRuntimeEvent);
+      }
+      this.inFlightTools.clear();
+
+      if (this.turnState.reasoningItemEmitted) {
+        emit({
+          ...makeEventBase(this),
+          itemId: RuntimeItemId.makeUnsafe(`reasoning-${this.turnState.turnId}`),
+          type: "item.completed",
+          payload: {
+            itemType: "reasoning",
+            status: "completed",
+          },
+        } as ProviderRuntimeEvent);
+      }
+
+      for (const [, pending] of this.pendingApprovals) {
+        pending.resolve({
+          confirmed: false,
+          outcome: ToolConfirmationOutcome.Cancel,
+        });
+      }
+      this.pendingApprovals.clear();
+
+      for (const [requestId, pending] of this.pendingUserInputs) {
+        pending.resolve(undefined);
+        emit({
+          ...makeEventBase(this),
+          requestId: RuntimeRequestId.makeUnsafe(requestId),
+          type: "user-input.resolved",
+          payload: {
+            answers: {},
+          },
+        } as ProviderRuntimeEvent);
+      }
+      this.pendingUserInputs.clear();
+
+      const tokenUsage = buildTokenUsageSnapshot(this);
+      emit({
+        ...makeEventBase(this),
+        type: "thread.token-usage.updated",
+        payload: {
+          usage: tokenUsage,
+        },
+      } as ProviderRuntimeEvent);
+
+      const turnId = this.turnState.turnId;
+      if (state === "completed") {
+        this.turns.push({
+          id: turnId,
+          items: [],
+          historyLength: this.geminiClient.getHistory().length,
+        });
+        updateResumeCursor(this);
+      }
+
+      const completedAt = new Date().toISOString();
+      const mutableSession = this.session as {
+        status: ProviderSession["status"];
+        activeTurnId: TurnId | undefined;
+        updatedAt: string;
+        lastError?: string;
+      };
+      mutableSession.status = this.stopped ? "closed" : state === "failed" ? "error" : "ready";
+      mutableSession.activeTurnId = undefined;
+      mutableSession.updatedAt = completedAt;
+      if (errorMessage) {
+        mutableSession.lastError = errorMessage;
+      }
+
+      if (!this.stopped) {
+        runFork(
+          sessionDirectory
+            .upsert(
+              buildGeminiPersistedBinding({
+                session: this.session,
+                status: state === "failed" ? "error" : "running",
+                lastRuntimeEvent: "turn.completed",
+                lastRuntimeEventAt: completedAt,
+              }),
+            )
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("failed to persist Gemini session after turn completion", {
+                  threadId: this.session.threadId,
+                  status: state,
+                  cause,
+                }),
+              ),
+            ),
         );
       }
-    } catch (error) {
-      if (ctx.stopped) {
-        return;
-      }
 
-      if (ctx.abortController.signal.aborted) {
-        completeTurn(ctx, "interrupted", "interrupted");
-        return;
-      }
+      emit({
+        ...makeEventBase(this),
+        type: "turn.completed",
+        payload: {
+          state,
+          stopReason,
+          usage: tokenUsage,
+          ...(errorMessage ? { errorMessage } : {}),
+        },
+      } as ProviderRuntimeEvent);
 
-      console.error("[gemini] Stream error:", error);
-      completeTurn(ctx, "failed", "error", toMessage(error, "Stream error"));
+      this.turnState = undefined;
+
+      if (!this.stopped) {
+        emit({
+          ...makeEventBase(this),
+          type: "session.state.changed",
+          payload: { state: "ready" },
+        } as ProviderRuntimeEvent);
+      }
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Turn completion
-  // ---------------------------------------------------------------------------
+  const sessions = new Map<string, GeminiRuntimeSession>();
 
-  function completeTurn(
-    ctx: GeminiSessionContext,
-    state: "completed" | "failed" | "interrupted" | "cancelled",
-    stopReason: string,
-    errorMessage?: string,
-  ): void {
-    if (!ctx.turnState) return;
-
-    // Complete remaining in-flight tools
-    for (const [, tool] of ctx.inFlightTools) {
-      emit({
-        ...makeEventBase(ctx),
-        itemId: RuntimeItemId.makeUnsafe(tool.itemId),
-        type: "item.completed",
-        payload: {
-          itemType: tool.itemType,
-          status: "failed",
-        },
-      } as ProviderRuntimeEvent);
+  const getSession = (
+    threadId: ThreadId,
+  ): Effect.Effect<GeminiRuntimeSession, ProviderAdapterError> => {
+    const session = sessions.get(threadId);
+    if (!session) {
+      return Effect.fail(
+        new ProviderAdapterSessionNotFoundError({
+          provider: PROVIDER,
+          threadId,
+        }),
+      );
     }
-    ctx.inFlightTools.clear();
-
-    // Complete reasoning item if open
-    if (ctx.turnState.reasoningItemEmitted) {
-      emit({
-        ...makeEventBase(ctx),
-        itemId: RuntimeItemId.makeUnsafe(`reasoning-${ctx.turnState.turnId}`),
-        type: "item.completed",
-        payload: {
-          itemType: "reasoning",
-          status: "completed",
-        },
-      } as ProviderRuntimeEvent);
+    if (session.stopped) {
+      return Effect.fail(new ProviderAdapterSessionClosedError({ provider: PROVIDER, threadId }));
     }
-
-    // Cancel pending approvals
-    for (const [, pending] of ctx.pendingApprovals) {
-      pending.resolve({
-        confirmed: false,
-        outcome: ToolConfirmationOutcome.Cancel,
-      });
-    }
-    ctx.pendingApprovals.clear();
-
-    for (const [requestId, pending] of ctx.pendingUserInputs) {
-      pending.resolve(undefined);
-      emit({
-        ...makeEventBase(ctx),
-        requestId: RuntimeRequestId.makeUnsafe(requestId),
-        type: "user-input.resolved",
-        payload: {
-          answers: {},
-        },
-      } as ProviderRuntimeEvent);
-    }
-    ctx.pendingUserInputs.clear();
-
-    // Emit token usage
-    const tokenUsage = buildTokenUsageSnapshot(ctx);
-    emit({
-      ...makeEventBase(ctx),
-      type: "thread.token-usage.updated",
-      payload: {
-        usage: tokenUsage,
-      },
-    } as ProviderRuntimeEvent);
-
-    // Only completed turns advance the durable Gemini history snapshot.
-    const turnId = ctx.turnState.turnId;
-    if (state === "completed") {
-      ctx.turns.push({
-        id: turnId,
-        items: [],
-        historyLength: ctx.geminiClient.getHistory().length,
-      });
-      updateResumeCursor(ctx);
-    }
-    const completedAt = new Date().toISOString();
-    const mutableSession = ctx.session as {
-      status: ProviderSession["status"];
-      activeTurnId: TurnId | undefined;
-      updatedAt: string;
-      lastError?: string;
-    };
-    mutableSession.status = state === "failed" ? "error" : "ready";
-    mutableSession.activeTurnId = undefined;
-    mutableSession.updatedAt = completedAt;
-    if (errorMessage) {
-      mutableSession.lastError = errorMessage;
-    }
-    runFork(
-      sessionDirectory
-        .upsert(
-          buildGeminiPersistedBinding({
-            session: ctx.session,
-            status: state === "failed" ? "error" : "running",
-            lastRuntimeEvent: "turn.completed",
-            lastRuntimeEventAt: completedAt,
-          }),
-        )
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("failed to persist Gemini session after turn completion", {
-              threadId: ctx.session.threadId,
-              status: state,
-              cause,
-            }),
-          ),
-        ),
-    );
-
-    emit({
-      ...makeEventBase(ctx),
-      type: "turn.completed",
-      payload: {
-        state,
-        stopReason,
-        usage: tokenUsage,
-        ...(errorMessage ? { errorMessage } : {}),
-      },
-    } as ProviderRuntimeEvent);
-
-    ctx.turnState = undefined;
-
-    // Return to ready state
-    emit({
-      ...makeEventBase(ctx),
-      type: "session.state.changed",
-      payload: { state: "ready" },
-    } as ProviderRuntimeEvent);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Adapter methods
-  // ---------------------------------------------------------------------------
+    return Effect.succeed(session);
+  };
 
   const startSession: GeminiAcpAdapterShape["startSession"] = Effect.fn("startSession")(
     function* (input) {
@@ -1981,55 +2343,22 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* () {
         updatedAt: now,
       };
 
-      const ctx: GeminiSessionContext = {
-        session,
-        config,
-        geminiClient,
-        abortController: new AbortController(),
-        messageBusUnsubscribers: [],
-        turnState: undefined,
-        stopped: false,
-        pendingApprovals: new Map(),
-        pendingUserInputs: new Map(),
-        userRequestedMode: "default",
-        planModeTextSuppressed: false,
-        assistantMessageSegment: 0,
-        assistantMessageText: "",
-        cumulativeInputTokens: 0,
-        cumulativeOutputTokens: 0,
-        inFlightTools: new Map(),
-        turns: Array.from({ length: resumeState?.turnCount ?? 0 }, (_, index) => {
-          const historyLength = resumeState?.turnHistoryLengths?.[index];
-          return {
-            id: `restored-turn-${index}`,
-            items: [],
-            ...(historyLength !== undefined ? { historyLength } : {}),
-          };
-        }),
-        activeStreamPromise: undefined,
-      };
-      updateResumeCursor(ctx);
-      setupRetryAttemptHandler(ctx);
-
-      // Wire up MessageBus for tool confirmations
-      const messageBus = config.getMessageBus();
-      setupMessageBusHandlers(ctx, messageBus);
-
-      sessions.set(threadId, ctx);
+      const runtimeSession = new GeminiRuntimeSession(session, config, geminiClient, resumeState);
+      sessions.set(threadId, runtimeSession);
 
       // Emit session lifecycle events
       emit({
-        ...makeEventBase(ctx),
+        ...makeEventBase(runtimeSession),
         type: "session.started",
         payload: {},
       } as ProviderRuntimeEvent);
       emit({
-        ...makeEventBase(ctx),
+        ...makeEventBase(runtimeSession),
         type: "session.configured",
         payload: { config: { model: modelId } },
       } as ProviderRuntimeEvent);
       emit({
-        ...makeEventBase(ctx),
+        ...makeEventBase(runtimeSession),
         type: "session.state.changed",
         payload: { state: "ready" },
       } as ProviderRuntimeEvent);
@@ -2039,261 +2368,88 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* () {
   );
 
   const sendTurn: GeminiAcpAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
-    const ctx = yield* getSession(input.threadId);
-    yield* Effect.sync(() => {
-      restoreGeminiHistoryFromResumeCursor(ctx);
-    }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderAdapterProcessError({
-            provider: PROVIDER,
-            threadId: input.threadId,
-            detail: `Failed to restore Gemini history before turn start: ${toMessage(cause, "unknown error")}`,
-            cause,
-          }),
-      ),
-    );
-
-    const interactionMode = input.interactionMode ?? ctx.userRequestedMode;
-    ctx.userRequestedMode = interactionMode;
-    ctx.config.setApprovalMode(
-      resolveGeminiApprovalMode({
-        interactionMode,
-        runtimeMode: ctx.session.runtimeMode,
-      }),
-    );
-
-    const now = new Date().toISOString();
-    const turnId = `turn-${Date.now()}-${ctx.turns.length}`;
-
-    // Reset turn state
-    ctx.turnState = {
-      turnId,
-      startedAt: now,
-      reasoningItemEmitted: false,
-      capturedProposedPlanKeys: new Set(),
-    };
-    ctx.planModeTextSuppressed = false;
-    ctx.assistantMessageSegment = 0;
-    ctx.assistantMessageText = "";
-    ctx.inFlightTools.clear();
-    ctx.abortController = new AbortController();
-
-    const promptText = input.input?.trim() ?? "";
-
-    // Update session status (cast to mutable for internal tracking)
-    (ctx.session as { status: string }).status = "running";
-    (ctx.session as { activeTurnId?: TurnId }).activeTurnId = TurnIdBrand.makeUnsafe(turnId);
-    (ctx.session as { updatedAt: string }).updatedAt = now;
-
-    // Emit turn started
-    emit({
-      ...makeEventBase(ctx),
-      type: "turn.started",
-      payload: { model: ctx.session.model },
-    } as ProviderRuntimeEvent);
-    emit({
-      ...makeEventBase(ctx),
-      type: "session.state.changed",
-      payload: { state: "running" },
-    } as ProviderRuntimeEvent);
-
-    // Start stream loop in background
-    ctx.activeStreamPromise = runStreamLoop(ctx, promptText);
-    ctx.activeStreamPromise.catch((err) => {
-      if (!ctx.stopped) {
-        console.error("[gemini] Unhandled stream loop error:", err);
-      }
+    const session = yield* getSession(input.threadId);
+    return yield* Effect.try({
+      try: () => session.startTurn(input),
+      catch: (cause) => toGeminiAdapterError(input.threadId, "Failed to start Gemini turn", cause),
     });
-
-    return {
-      threadId: input.threadId,
-      turnId: TurnIdBrand.makeUnsafe(turnId),
-      resumeCursor: ctx.session.resumeCursor,
-    };
   });
 
   const interruptTurn: GeminiAcpAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
     function* (threadId, _turnId) {
-      const ctx = yield* getSession(threadId);
-      abortActiveTurn(ctx);
+      const session = yield* getSession(threadId);
+      yield* Effect.try({
+        try: () => session.interrupt(),
+        catch: (cause) => toGeminiAdapterError(threadId, "Failed to interrupt Gemini turn", cause),
+      });
     },
   );
 
   const respondToRequest: GeminiAcpAdapterShape["respondToRequest"] = Effect.fn("respondToRequest")(
     function* (threadId, requestId, decision) {
-      const ctx = yield* getSession(threadId);
-      const pending = ctx.pendingApprovals.get(requestId);
-      if (!pending) {
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "respondToRequest",
-          detail: `No pending approval for requestId "${requestId}"`,
-        });
-      }
-
-      ctx.pendingApprovals.delete(requestId);
-
-      const confirmed = decision === "accept" || decision === "acceptForSession";
-      const outcome = confirmed
-        ? decision === "acceptForSession"
-          ? ToolConfirmationOutcome.ProceedAlways
-          : ToolConfirmationOutcome.ProceedOnce
-        : ToolConfirmationOutcome.Cancel;
-
-      pending.resolve({ confirmed, outcome });
-
-      emit({
-        ...makeEventBase(ctx),
-        requestId: RuntimeRequestId.makeUnsafe(requestId),
-        type: "request.resolved",
-        payload: {
-          requestType: pending.requestType,
-          decision,
-        },
-      } as ProviderRuntimeEvent);
+      const session = yield* getSession(threadId);
+      yield* Effect.try({
+        try: () => session.resolveApproval(requestId, decision),
+        catch: (cause) =>
+          toGeminiAdapterError(threadId, "Failed to resolve Gemini approval", cause),
+      });
     },
   );
 
   const respondToUserInput: GeminiAcpAdapterShape["respondToUserInput"] = Effect.fn(
     "respondToUserInput",
   )(function* (threadId, requestId, answers) {
-    const ctx = yield* getSession(threadId);
-    const pending = ctx.pendingUserInputs.get(requestId);
-    if (!pending) {
-      return yield* new ProviderAdapterRequestError({
-        provider: PROVIDER,
-        method: "respondToUserInput",
-        detail: `No pending user input for requestId "${requestId}"`,
-      });
-    }
-
-    ctx.pendingUserInputs.delete(requestId);
-    pending.resolve(answers);
-
-    emit({
-      ...makeEventBase(ctx),
-      requestId: RuntimeRequestId.makeUnsafe(requestId),
-      type: "user-input.resolved",
-      payload: {
-        answers,
-      },
-    } as ProviderRuntimeEvent);
+    const session = yield* getSession(threadId);
+    yield* Effect.try({
+      try: () => session.resolveUserInput(requestId, answers),
+      catch: (cause) =>
+        toGeminiAdapterError(threadId, "Failed to resolve Gemini user input", cause),
+    });
   });
 
   const stopSession: GeminiAcpAdapterShape["stopSession"] = Effect.fn("stopSession")(
     function* (threadId) {
-      const ctx = sessions.get(threadId);
-      if (!ctx) return;
-
-      ctx.stopped = true;
-      abortActiveTurn(ctx);
-
-      // Clean up MessageBus subscriptions
-      for (const unsub of ctx.messageBusUnsubscribers) {
-        yield* Effect.sync(() => {
-          unsub();
-        }).pipe(Effect.ignore);
+      const session = sessions.get(threadId);
+      if (!session) {
+        return;
       }
 
-      // Cancel pending approvals
-      for (const [, pending] of ctx.pendingApprovals) {
-        pending.resolve({
-          confirmed: false,
-          outcome: ToolConfirmationOutcome.Cancel,
-        });
-      }
-      ctx.pendingApprovals.clear();
-
-      for (const [requestId, pending] of ctx.pendingUserInputs) {
-        pending.resolve(undefined);
-        emit({
-          ...makeEventBase(ctx),
-          requestId: RuntimeRequestId.makeUnsafe(requestId),
-          type: "user-input.resolved",
-          payload: {
-            answers: {},
-          },
-        } as ProviderRuntimeEvent);
-      }
-      ctx.pendingUserInputs.clear();
-
-      // Dispose config (handles client cleanup internally)
       yield* Effect.tryPromise({
-        try: () => ctx.config.dispose(),
-        catch: () => undefined as never, // swallow errors
-      }).pipe(Effect.ignore);
-
+        try: () => session.stop(),
+        catch: (cause) => toGeminiAdapterError(threadId, "Failed to stop Gemini session", cause),
+      });
       sessions.delete(threadId);
-      (ctx.session as { status: string }).status = "closed";
-
-      emit({
-        ...makeEventBase(ctx),
-        type: "session.exited",
-        payload: {
-          reason: "stopped",
-          exitKind: "graceful",
-        },
-      } as ProviderRuntimeEvent);
     },
   );
 
   const listSessions = (): Effect.Effect<ReadonlyArray<ProviderSession>> =>
     Effect.sync(() =>
       Array.from(sessions.values())
-        .filter((ctx) => !ctx.stopped)
-        .map((ctx) => ctx.session),
+        .filter((session) => !session.stopped)
+        .map((session) => session.session),
     );
 
   const hasSession = (threadId: ThreadId): Effect.Effect<boolean> =>
     Effect.sync(() => {
-      const ctx = sessions.get(threadId);
-      return !!ctx && !ctx.stopped;
+      const session = sessions.get(threadId);
+      return !!session && !session.stopped;
     });
 
   const readThread: GeminiAcpAdapterShape["readThread"] = Effect.fn("readThread")(
     function* (threadId) {
-      const ctx = yield* getSession(threadId);
-      return {
-        threadId,
-        turns: ctx.turns.map((t) => ({
-          id: TurnIdBrand.makeUnsafe(t.id),
-          items: t.items,
-        })),
-      };
+      const session = yield* getSession(threadId);
+      return session.readThreadSnapshot();
     },
   );
 
   const rollbackThread: GeminiAcpAdapterShape["rollbackThread"] = Effect.fn("rollbackThread")(
     function* (threadId, numTurns) {
-      const ctx = yield* getSession(threadId);
-      const nextTurnCount = Math.max(0, ctx.turns.length - numTurns);
-      const retainedTurns = ctx.turns.slice(0, nextTurnCount);
-
-      // Roll back Gemini history to the retained turn boundary when available.
-      yield* Effect.sync(() => {
-        const history = ctx.geminiClient.getHistory();
-        const targetHistoryLength =
-          retainedTurns.length === 0 ? 0 : retainedTurns.at(-1)?.historyLength;
-        const newHistory =
-          targetHistoryLength !== undefined
-            ? history.slice(0, Math.min(history.length, targetHistoryLength))
-            : history.slice(0, Math.max(0, history.length - numTurns * 2));
-        ctx.geminiClient.setHistory([...newHistory]);
-      }).pipe(Effect.ignore);
-
-      // Truncate tracked turns
-      const removed = ctx.turns.splice(nextTurnCount);
-      void removed;
-      updateResumeCursor(ctx);
-
-      return {
-        threadId,
-        turns: ctx.turns.map((t) => ({
-          id: TurnIdBrand.makeUnsafe(t.id),
-          items: t.items,
-        })),
-      };
+      const session = yield* getSession(threadId);
+      return yield* Effect.try({
+        try: () => session.rollbackThread(numTurns),
+        catch: (cause) =>
+          toGeminiAdapterError(threadId, "Failed to roll back Gemini thread", cause),
+      });
     },
   );
 
