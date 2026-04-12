@@ -15,6 +15,7 @@ import { Cache, Cause, Duration, Effect, Equal, Layer, Option, Schema, Stream } 
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
+import { CustomSkillsService } from "../../customSkills.ts";
 import { GitCore } from "../../git/Services/GitCore.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
 import { ProviderAdapterRequestError, ProviderServiceError } from "../../provider/Errors.ts";
@@ -149,6 +150,7 @@ function buildGeneratedWorktreeBranchName(raw: string): string {
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
+  const customSkills = yield* CustomSkillsService;
   const git = yield* GitCore;
   const textGeneration = yield* TextGeneration;
   const serverSettingsService = yield* ServerSettingsService;
@@ -375,7 +377,8 @@ const make = Effect.gen(function* () {
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
-    const normalizedInput = toNonEmptyProviderInput(input.messageText);
+    const resolvedPrompt = yield* customSkills.resolvePrompt({ prompt: input.messageText });
+    const normalizedInput = toNonEmptyProviderInput(resolvedPrompt.prompt);
     const normalizedAttachments = input.attachments ?? [];
     const activeSession = yield* providerService
       .listSessions()

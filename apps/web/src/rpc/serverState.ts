@@ -1,6 +1,7 @@
 import { useAtomSubscribe, useAtomValue } from "@effect/atom-react";
 import {
   DEFAULT_SERVER_SETTINGS,
+  type CustomSkillsState,
   type EditorId,
   type ServerConfig,
   type ServerConfigStreamEvent,
@@ -37,6 +38,7 @@ function toServerConfigUpdatedPayload(config: ServerConfig): ServerConfigUpdated
   return {
     issues: config.issues,
     providers: config.providers,
+    customSkills: config.customSkills,
     settings: config.settings,
   };
 }
@@ -53,6 +55,8 @@ const selectKeybindingsConfigPath = (config: ServerConfig | null) =>
 const selectObservability = (config: ServerConfig | null) => config?.observability ?? null;
 const selectProviders = (config: ServerConfig | null) =>
   config?.providers ?? EMPTY_SERVER_PROVIDERS;
+const selectCustomSkills = (config: ServerConfig | null): CustomSkillsState | null =>
+  config?.customSkills ?? null;
 const selectSettings = (config: ServerConfig | null): ServerSettings =>
   config?.settings ?? DEFAULT_SERVER_SETTINGS;
 
@@ -111,6 +115,10 @@ export function applyServerConfigEvent(event: ServerConfigStreamEvent): void {
       applySettingsUpdated(event.payload.settings);
       return;
     }
+    case "customSkillsUpdated": {
+      applyCustomSkillsUpdated(event.payload.customSkills);
+      return;
+    }
   }
 }
 
@@ -142,6 +150,20 @@ export function applySettingsUpdated(settings: ServerSettings): void {
   } satisfies ServerConfig;
   resolveServerConfig(nextConfig);
   emitServerConfigUpdated(toServerConfigUpdatedPayload(nextConfig), "settingsUpdated");
+}
+
+export function applyCustomSkillsUpdated(customSkills: CustomSkillsState): void {
+  const latestServerConfig = getServerConfig();
+  if (!latestServerConfig) {
+    return;
+  }
+
+  const nextConfig = {
+    ...latestServerConfig,
+    customSkills,
+  } satisfies ServerConfig;
+  resolveServerConfig(nextConfig);
+  emitServerConfigUpdated(toServerConfigUpdatedPayload(nextConfig), "customSkillsUpdated");
 }
 
 export function emitWelcome(payload: ServerLifecycleWelcomePayload): void {
@@ -284,6 +306,10 @@ export function useServerKeybindingsConfigPath(): string | null {
 
 export function useServerObservability(): ServerConfig["observability"] | null {
   return useAtomValue(serverConfigAtom, selectObservability);
+}
+
+export function useServerCustomSkills(): CustomSkillsState | null {
+  return useAtomValue(serverConfigAtom, selectCustomSkills);
 }
 
 export function useServerWelcomeSubscription(

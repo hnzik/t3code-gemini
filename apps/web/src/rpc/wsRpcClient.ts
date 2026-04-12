@@ -92,6 +92,9 @@ export interface WsRpcClient {
     readonly getConfig: RpcUnaryNoArgMethod<typeof WS_METHODS.serverGetConfig>;
     readonly refreshProviders: RpcUnaryNoArgMethod<typeof WS_METHODS.serverRefreshProviders>;
     readonly upsertKeybinding: RpcUnaryMethod<typeof WS_METHODS.serverUpsertKeybinding>;
+    readonly importCustomSkill: RpcUnaryMethod<typeof WS_METHODS.serverImportCustomSkill>;
+    readonly setCustomSkillEnabled: RpcUnaryMethod<typeof WS_METHODS.serverSetCustomSkillEnabled>;
+    readonly removeCustomSkill: RpcUnaryMethod<typeof WS_METHODS.serverRemoveCustomSkill>;
     readonly getSettings: RpcUnaryNoArgMethod<typeof WS_METHODS.serverGetSettings>;
     readonly updateSettings: (
       patch: ServerSettingsPatch,
@@ -196,6 +199,12 @@ export function createWsRpcClient(transport: WsTransport): WsRpcClient {
         transport.request((client) => client[WS_METHODS.serverRefreshProviders]({})),
       upsertKeybinding: (input) =>
         transport.request((client) => client[WS_METHODS.serverUpsertKeybinding](input)),
+      importCustomSkill: (input) =>
+        transport.request((client) => client[WS_METHODS.serverImportCustomSkill](input)),
+      setCustomSkillEnabled: (input) =>
+        transport.request((client) => client[WS_METHODS.serverSetCustomSkillEnabled](input)),
+      removeCustomSkill: (input) =>
+        transport.request((client) => client[WS_METHODS.serverRemoveCustomSkill](input)),
       getSettings: () => transport.request((client) => client[WS_METHODS.serverGetSettings]({})),
       updateSettings: (patch) =>
         transport.request((client) => client[WS_METHODS.serverUpdateSettings]({ patch })),

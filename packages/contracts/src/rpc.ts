@@ -72,6 +72,13 @@ import {
   ServerUpsertKeybindingInput,
   ServerUpsertKeybindingResult,
 } from "./server";
+import {
+  CustomSkillError,
+  CustomSkillImportInput,
+  CustomSkillRemoveInput,
+  CustomSkillsState,
+  CustomSkillSetEnabledInput,
+} from "./customSkills";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings";
 
 export const WS_METHODS = {
@@ -110,6 +117,9 @@ export const WS_METHODS = {
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
   serverUpsertKeybinding: "server.upsertKeybinding",
+  serverImportCustomSkill: "server.importCustomSkill",
+  serverSetCustomSkillEnabled: "server.setCustomSkillEnabled",
+  serverRemoveCustomSkill: "server.removeCustomSkill",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
 
@@ -143,6 +153,24 @@ export const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
   payload: Schema.Struct({}),
   success: ServerSettings,
   error: ServerSettingsError,
+});
+
+export const WsServerImportCustomSkillRpc = Rpc.make(WS_METHODS.serverImportCustomSkill, {
+  payload: CustomSkillImportInput,
+  success: CustomSkillsState,
+  error: CustomSkillError,
+});
+
+export const WsServerSetCustomSkillEnabledRpc = Rpc.make(WS_METHODS.serverSetCustomSkillEnabled, {
+  payload: CustomSkillSetEnabledInput,
+  success: CustomSkillsState,
+  error: CustomSkillError,
+});
+
+export const WsServerRemoveCustomSkillRpc = Rpc.make(WS_METHODS.serverRemoveCustomSkill, {
+  payload: CustomSkillRemoveInput,
+  success: CustomSkillsState,
+  error: CustomSkillError,
 });
 
 export const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSettings, {
@@ -346,6 +374,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpsertKeybindingRpc,
+  WsServerImportCustomSkillRpc,
+  WsServerSetCustomSkillEnabledRpc,
+  WsServerRemoveCustomSkillRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
   WsProjectsSearchEntriesRpc,

@@ -1,7 +1,7 @@
 import { type ProjectEntry, type ProviderKind } from "@t3tools/contracts";
 import { memo, useLayoutEffect, useRef } from "react";
 import { type ComposerSlashCommand, type ComposerTriggerKind } from "../../composer-logic";
-import { BotIcon } from "lucide-react";
+import { BotIcon, PuzzleIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 import { Badge } from "../ui/badge";
 import { Command, CommandItem, CommandList } from "../ui/command";
@@ -21,6 +21,14 @@ export type ComposerCommandItem =
       type: "slash-command";
       command: ComposerSlashCommand;
       label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "skill";
+      slug: string;
+      label: string;
+      name: string;
       description: string;
     }
   | {
@@ -83,7 +91,9 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
               ? "Searching workspace files..."
               : props.triggerKind === "path"
                 ? "No matching files or folders."
-                : "No matching command."}
+                : props.triggerKind === "skill"
+                  ? "No matching skill."
+                  : "No matching command."}
           </p>
         )}
       </div>
@@ -126,15 +136,27 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
       {props.item.type === "slash-command" ? (
         <BotIcon className="size-4 text-muted-foreground/80" />
       ) : null}
+      {props.item.type === "skill" ? (
+        <PuzzleIcon className="size-4 text-muted-foreground/80" />
+      ) : null}
       {props.item.type === "model" ? (
         <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
           model
         </Badge>
       ) : null}
-      <span className="flex min-w-0 items-center gap-1.5 truncate">
-        <span className="truncate">{props.item.label}</span>
-      </span>
-      <span className="truncate text-muted-foreground/70 text-xs">{props.item.description}</span>
+      <div className="flex min-w-0 flex-1 flex-col justify-center">
+        <span className="flex items-center gap-1.5 truncate">
+          <span className="truncate font-medium">{props.item.label}</span>
+          {props.item.type === "skill" && props.item.name ? (
+            <span className="truncate text-muted-foreground/70 text-xs">{props.item.name}</span>
+          ) : null}
+        </span>
+        {props.item.description && (
+          <span className="truncate text-muted-foreground/50 text-xs">
+            {props.item.description}
+          </span>
+        )}
+      </div>
     </CommandItem>
   );
 });

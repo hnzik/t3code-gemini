@@ -34,6 +34,7 @@ import { Keybindings } from "./keybindings";
 import { Open, resolveAvailableEditors } from "./open";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine";
+import { CustomSkillsService } from "./customSkills";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import {
   observeRpcEffect,
@@ -118,6 +119,7 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
       const config = yield* ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents;
       const serverSettings = yield* ServerSettingsService;
+      const customSkills = yield* CustomSkillsService;
       const startup = yield* ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem;
@@ -438,6 +440,7 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
         const keybindingsConfig = yield* keybindings.loadConfigState;
         const providers = yield* providerRegistry.getProviders;
         const settings = yield* serverSettings.getSettings;
+        const customSkillsState = yield* customSkills.getState;
         const environment = yield* serverEnvironment.getDescriptor;
         const auth = yield* serverAuth.getDescriptor();
 
@@ -460,6 +463,7 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
               : {}),
             otlpMetricsEnabled: config.otlpMetricsUrl !== undefined,
           },
+          customSkills: customSkillsState,
           settings,
         };
       });
@@ -646,6 +650,22 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
             }),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.serverImportCustomSkill]: (input) =>
+          observeRpcEffect(WS_METHODS.serverImportCustomSkill, customSkills.importSkill(input), {
+            "rpc.aggregate": "server",
+          }),
+        [WS_METHODS.serverSetCustomSkillEnabled]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverSetCustomSkillEnabled,
+            customSkills.setSkillEnabled(input),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
+        [WS_METHODS.serverRemoveCustomSkill]: (input) =>
+          observeRpcEffect(WS_METHODS.serverRemoveCustomSkill, customSkills.removeSkill(input), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverGetSettings]: (_input) =>
           observeRpcEffect(WS_METHODS.serverGetSettings, serverSettings.getSettings, {
             "rpc.aggregate": "server",
@@ -849,6 +869,13 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                   payload: { settings },
                 })),
               );
+              const customSkillUpdates = customSkills.streamChanges.pipe(
+                Stream.map((customSkillsState) => ({
+                  version: 1 as const,
+                  type: "customSkillsUpdated" as const,
+                  payload: { customSkills: customSkillsState },
+                })),
+              );
 
               return Stream.concat(
                 Stream.make({
@@ -856,7 +883,10 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
                   type: "snapshot" as const,
                   config: yield* loadServerConfig,
                 }),
-                Stream.merge(keybindingsUpdates, Stream.merge(providerStatuses, settingsUpdates)),
+                Stream.merge(
+                  keybindingsUpdates,
+                  Stream.merge(providerStatuses, Stream.merge(settingsUpdates, customSkillUpdates)),
+                ),
               );
             }),
             { "rpc.aggregate": "server" },

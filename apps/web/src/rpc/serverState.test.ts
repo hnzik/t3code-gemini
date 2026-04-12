@@ -64,6 +64,13 @@ const baseEnvironment = {
   },
 };
 
+const baseCustomSkills = {
+  revision: 1,
+  skillsPath: "/tmp/workspace/.config/custom-skills",
+  disabledSkillsPath: "/tmp/workspace/.config/custom-skills.disabled",
+  skills: [],
+} as const;
+
 const baseServerConfig: ServerConfig = {
   environment: baseEnvironment,
   auth: {
@@ -84,6 +91,7 @@ const baseServerConfig: ServerConfig = {
     otlpTracesEnabled: false,
     otlpMetricsEnabled: false,
   },
+  customSkills: baseCustomSkills,
   settings: DEFAULT_SERVER_SETTINGS,
 };
 
@@ -154,6 +162,7 @@ describe("serverState", () => {
       {
         issues: [],
         providers: defaultProviders,
+        customSkills: baseCustomSkills,
         settings: DEFAULT_SERVER_SETTINGS,
       },
       "snapshot",
@@ -165,6 +174,7 @@ describe("serverState", () => {
       {
         issues: [],
         providers: defaultProviders,
+        customSkills: baseCustomSkills,
         settings: DEFAULT_SERVER_SETTINGS,
       },
       "snapshot",
@@ -290,12 +300,42 @@ describe("serverState", () => {
         },
       },
     });
+    emitServerConfigEvent({
+      version: 1,
+      type: "customSkillsUpdated",
+      payload: {
+        customSkills: {
+          ...baseCustomSkills,
+          revision: 2,
+          skills: [
+            {
+              slug: "repo-maintainer",
+              name: "Repo Maintainer",
+              description: "Helps with repository maintenance tasks.",
+              enabled: true,
+            },
+          ],
+        },
+      },
+    });
 
     await waitFor(() => {
       expect(getServerConfig()).toEqual({
         ...baseServerConfig,
         issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
         providers: nextProviders,
+        customSkills: {
+          ...baseCustomSkills,
+          revision: 2,
+          skills: [
+            {
+              slug: "repo-maintainer",
+              name: "Repo Maintainer",
+              description: "Helps with repository maintenance tasks.",
+              enabled: true,
+            },
+          ],
+        },
         settings: {
           ...DEFAULT_SERVER_SETTINGS,
           enableAssistantStreaming: true,
@@ -309,6 +349,7 @@ describe("serverState", () => {
       {
         issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
         providers: defaultProviders,
+        customSkills: baseCustomSkills,
         settings: DEFAULT_SERVER_SETTINGS,
       },
       "keybindingsUpdated",
@@ -318,20 +359,46 @@ describe("serverState", () => {
       {
         issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
         providers: nextProviders,
+        customSkills: baseCustomSkills,
         settings: DEFAULT_SERVER_SETTINGS,
       },
       "providerStatuses",
     );
-    expect(configListener).toHaveBeenLastCalledWith(
+    expect(configListener).toHaveBeenNthCalledWith(
+      4,
       {
         issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
         providers: nextProviders,
+        customSkills: baseCustomSkills,
         settings: {
           ...DEFAULT_SERVER_SETTINGS,
           enableAssistantStreaming: true,
         },
       },
       "settingsUpdated",
+    );
+    expect(configListener).toHaveBeenLastCalledWith(
+      {
+        issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
+        providers: nextProviders,
+        customSkills: {
+          ...baseCustomSkills,
+          revision: 2,
+          skills: [
+            {
+              slug: "repo-maintainer",
+              name: "Repo Maintainer",
+              description: "Helps with repository maintenance tasks.",
+              enabled: true,
+            },
+          ],
+        },
+        settings: {
+          ...DEFAULT_SERVER_SETTINGS,
+          enableAssistantStreaming: true,
+        },
+      },
+      "customSkillsUpdated",
     );
 
     unsubscribeProviders();

@@ -1,4 +1,11 @@
-import { ApprovalMode, AuthType, Config, getAuthTypeFromEnv } from "@google/gemini-cli-core";
+import {
+  ApprovalMode,
+  AuthType,
+  Config,
+  createPolicyEngineConfig,
+  getAuthTypeFromEnv,
+  type PolicySettings,
+} from "@google/gemini-cli-core";
 
 export const GEMINI_CORE_CLIENT_VERSION = "0.37.1";
 export const DEFAULT_GEMINI_MODEL = "gemini-2.5-pro";
@@ -96,15 +103,28 @@ export function resolveGeminiApprovalMode(input: {
   }
 }
 
-export function createGeminiCoreConfig(input: {
+export async function createGeminiCoreConfig(input: {
   readonly sessionId: string;
   readonly cwd: string;
   readonly model?: string | null | undefined;
+  readonly interactionMode?: string | null | undefined;
   readonly runtimeMode?: string | null | undefined;
   readonly interactive?: boolean | undefined;
   readonly noBrowser?: boolean | undefined;
-}): Config {
+  readonly policySettings?: PolicySettings | undefined;
+}): Promise<Config> {
   const workDir = input.cwd;
+  const approvalMode = resolveGeminiApprovalMode({
+    interactionMode: input.interactionMode,
+    runtimeMode: input.runtimeMode,
+  });
+  const interactive = input.interactive ?? true;
+  const policyEngineConfig = await createPolicyEngineConfig(
+    input.policySettings ?? {},
+    approvalMode,
+    undefined,
+    interactive,
+  );
 
   return new Config({
     sessionId: input.sessionId,
@@ -113,11 +133,11 @@ export function createGeminiCoreConfig(input: {
     model: input.model ?? DEFAULT_GEMINI_MODEL,
     clientVersion: GEMINI_CORE_CLIENT_VERSION,
     debugMode: false,
-    approvalMode: resolveGeminiApprovalMode({
-      runtimeMode: input.runtimeMode,
-    }),
-    interactive: input.interactive ?? true,
+    approvalMode,
+    policyEngineConfig,
+    interactive,
     ptyInfo: "node-pty",
     acpMode: false,
+    ...(input.noBrowser !== undefined ? { noBrowser: input.noBrowser } : {}),
   });
 }

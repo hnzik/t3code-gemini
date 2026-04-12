@@ -9,14 +9,10 @@
 import { readFile } from "node:fs/promises";
 
 import type {
-  ApprovalRequestId,
   CanonicalItemType,
   CanonicalRequestType,
-  ProviderApprovalDecision,
   ProviderRuntimeEvent,
-  ProviderSendTurnInput,
   ProviderSession,
-  ProviderSessionStartInput,
   ProviderUserInputAnswers,
   ThreadId,
   ThreadTokenUsageSnapshot,
@@ -42,7 +38,6 @@ import {
 } from "../Errors";
 import { GeminiAcpAdapter, type GeminiAcpAdapterShape } from "../Services/GeminiAcpAdapter";
 import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState";
-import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter";
 import {
   type ProviderRuntimeBinding,
   ProviderSessionDirectory,
@@ -202,36 +197,45 @@ function makeEventBase(ctx: GeminiSessionContext): Omit<ProviderRuntimeEvent, "t
 // Helpers — tool classification by name
 // ---------------------------------------------------------------------------
 
+function isGeminiReadOnlyToolName(name: string): boolean {
+  return (
+    name.includes("read") ||
+    name.includes("list") ||
+    name.includes("glob") ||
+    name.includes("grep") ||
+    name.includes("search_file") ||
+    name.includes("ls")
+  );
+}
+
+function isGeminiFileMutationToolName(name: string): boolean {
+  return (
+    name.includes("edit") ||
+    name.includes("write") ||
+    name.includes("patch") ||
+    name.includes("replace") ||
+    name.includes("delete_file") ||
+    name.includes("move_file") ||
+    name.includes("rename")
+  );
+}
+
+function isGeminiCommandToolName(name: string): boolean {
+  return (
+    name.includes("shell") ||
+    name.includes("command") ||
+    name.includes("exec") ||
+    name.includes("bash") ||
+    name.includes("terminal")
+  );
+}
+
 function classifyToolName(name: string): CanonicalItemType {
   const lower = name.toLowerCase();
-  if (
-    lower.includes("read") ||
-    lower.includes("list") ||
-    lower.includes("glob") ||
-    lower.includes("grep") ||
-    lower.includes("search_file") ||
-    lower.includes("ls")
-  ) {
+  if (isGeminiReadOnlyToolName(lower) || isGeminiFileMutationToolName(lower)) {
     return "file_change";
   }
-  if (
-    lower.includes("edit") ||
-    lower.includes("write") ||
-    lower.includes("patch") ||
-    lower.includes("replace") ||
-    lower.includes("delete_file") ||
-    lower.includes("move_file") ||
-    lower.includes("rename")
-  ) {
-    return "file_change";
-  }
-  if (
-    lower.includes("shell") ||
-    lower.includes("command") ||
-    lower.includes("exec") ||
-    lower.includes("bash") ||
-    lower.includes("terminal")
-  ) {
+  if (isGeminiCommandToolName(lower)) {
     return "command_execution";
   }
   if (
@@ -254,16 +258,18 @@ function classifyToolName(name: string): CanonicalItemType {
   return "dynamic_tool_call";
 }
 
-function classifyRequestTypeForTool(name: string): CanonicalRequestType {
-  const type = classifyToolName(name);
-  switch (type) {
-    case "file_change":
-      return "file_change_approval";
-    case "command_execution":
-      return "exec_command_approval";
-    default:
-      return "command_execution_approval";
+export function classifyRequestTypeForTool(name: string): CanonicalRequestType {
+  const lower = name.toLowerCase();
+  if (isGeminiReadOnlyToolName(lower)) {
+    return "file_read_approval";
   }
+  if (isGeminiFileMutationToolName(lower)) {
+    return "file_change_approval";
+  }
+  if (isGeminiCommandToolName(lower)) {
+    return "exec_command_approval";
+  }
+  return "command_execution_approval";
 }
 
 function titleForToolType(type: CanonicalItemType): string {
@@ -1035,7 +1041,7 @@ export function buildGeminiPersistedBinding(input: {
 // Adapter factory
 // ---------------------------------------------------------------------------
 
-const makeGeminiAcpAdapter = Effect.gen(function* () {
+const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* () {
   const settingsService = yield* ServerSettingsService;
   const authRuntimeState = yield* GeminiAuthRuntimeState;
   const sessionDirectory = yield* ProviderSessionDirectory;
@@ -1857,10 +1863,8 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   // Adapter methods
   // ---------------------------------------------------------------------------
 
-  const startSession = (
-    input: ProviderSessionStartInput,
-  ): Effect.Effect<ProviderSession, ProviderAdapterError> =>
-    Effect.gen(function* () {
+  const startSession: GeminiAcpAdapterShape["startSession"] = Effect.fn("startSession")(
+    function* (input) {
       if (input.provider && input.provider !== PROVIDER) {
         return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
@@ -1900,12 +1904,22 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       // This matches Gemini CLI ACP and ensures the content generator exists
       // before GeminiClient.initialize() runs during config.initialize().
       const workDir = (input.cwd as string | undefined) ?? process.cwd();
-      const config = createGeminiCoreConfig({
-        sessionId: threadId as string,
-        cwd: workDir,
-        model: modelId,
-        runtimeMode,
-        interactive: true,
+      const config = yield* Effect.tryPromise({
+        try: () =>
+          createGeminiCoreConfig({
+            sessionId: threadId as string,
+            cwd: workDir,
+            model: modelId,
+            runtimeMode,
+            interactive: true,
+          }),
+        catch: (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: `Failed to create Gemini config: ${toMessage(cause, "unknown error")}`,
+            cause,
+          }),
       });
 
       yield* Effect.tryPromise({
@@ -2021,104 +2035,93 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       } as ProviderRuntimeEvent);
 
       return session;
+    },
+  );
+
+  const sendTurn: GeminiAcpAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
+    const ctx = yield* getSession(input.threadId);
+    yield* Effect.sync(() => {
+      restoreGeminiHistoryFromResumeCursor(ctx);
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+            detail: `Failed to restore Gemini history before turn start: ${toMessage(cause, "unknown error")}`,
+            cause,
+          }),
+      ),
+    );
+
+    const interactionMode = input.interactionMode ?? ctx.userRequestedMode;
+    ctx.userRequestedMode = interactionMode;
+    ctx.config.setApprovalMode(
+      resolveGeminiApprovalMode({
+        interactionMode,
+        runtimeMode: ctx.session.runtimeMode,
+      }),
+    );
+
+    const now = new Date().toISOString();
+    const turnId = `turn-${Date.now()}-${ctx.turns.length}`;
+
+    // Reset turn state
+    ctx.turnState = {
+      turnId,
+      startedAt: now,
+      reasoningItemEmitted: false,
+      capturedProposedPlanKeys: new Set(),
+    };
+    ctx.planModeTextSuppressed = false;
+    ctx.assistantMessageSegment = 0;
+    ctx.assistantMessageText = "";
+    ctx.inFlightTools.clear();
+    ctx.abortController = new AbortController();
+
+    const promptText = input.input?.trim() ?? "";
+
+    // Update session status (cast to mutable for internal tracking)
+    (ctx.session as { status: string }).status = "running";
+    (ctx.session as { activeTurnId?: TurnId }).activeTurnId = TurnIdBrand.makeUnsafe(turnId);
+    (ctx.session as { updatedAt: string }).updatedAt = now;
+
+    // Emit turn started
+    emit({
+      ...makeEventBase(ctx),
+      type: "turn.started",
+      payload: { model: ctx.session.model },
+    } as ProviderRuntimeEvent);
+    emit({
+      ...makeEventBase(ctx),
+      type: "session.state.changed",
+      payload: { state: "running" },
+    } as ProviderRuntimeEvent);
+
+    // Start stream loop in background
+    ctx.activeStreamPromise = runStreamLoop(ctx, promptText);
+    ctx.activeStreamPromise.catch((err) => {
+      if (!ctx.stopped) {
+        console.error("[gemini] Unhandled stream loop error:", err);
+      }
     });
 
-  const sendTurn = (
-    input: ProviderSendTurnInput,
-  ): Effect.Effect<
-    { threadId: ThreadId; turnId: TurnId; resumeCursor?: unknown },
-    ProviderAdapterError
-  > =>
-    Effect.gen(function* () {
-      const ctx = yield* getSession(input.threadId);
-      yield* Effect.sync(() => {
-        restoreGeminiHistoryFromResumeCursor(ctx);
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterProcessError({
-              provider: PROVIDER,
-              threadId: input.threadId,
-              detail: `Failed to restore Gemini history before turn start: ${toMessage(cause, "unknown error")}`,
-              cause,
-            }),
-        ),
-      );
+    return {
+      threadId: input.threadId,
+      turnId: TurnIdBrand.makeUnsafe(turnId),
+      resumeCursor: ctx.session.resumeCursor,
+    };
+  });
 
-      const interactionMode = input.interactionMode ?? ctx.userRequestedMode;
-      ctx.userRequestedMode = interactionMode;
-      ctx.config.setApprovalMode(
-        resolveGeminiApprovalMode({
-          interactionMode,
-          runtimeMode: ctx.session.runtimeMode,
-        }),
-      );
-
-      const now = new Date().toISOString();
-      const turnId = `turn-${Date.now()}-${ctx.turns.length}`;
-
-      // Reset turn state
-      ctx.turnState = {
-        turnId,
-        startedAt: now,
-        reasoningItemEmitted: false,
-        capturedProposedPlanKeys: new Set(),
-      };
-      ctx.planModeTextSuppressed = false;
-      ctx.assistantMessageSegment = 0;
-      ctx.assistantMessageText = "";
-      ctx.inFlightTools.clear();
-      ctx.abortController = new AbortController();
-
-      const promptText = input.input?.trim() ?? "";
-
-      // Update session status (cast to mutable for internal tracking)
-      (ctx.session as { status: string }).status = "running";
-      (ctx.session as { activeTurnId?: TurnId }).activeTurnId = TurnIdBrand.makeUnsafe(turnId);
-      (ctx.session as { updatedAt: string }).updatedAt = now;
-
-      // Emit turn started
-      emit({
-        ...makeEventBase(ctx),
-        type: "turn.started",
-        payload: { model: ctx.session.model },
-      } as ProviderRuntimeEvent);
-      emit({
-        ...makeEventBase(ctx),
-        type: "session.state.changed",
-        payload: { state: "running" },
-      } as ProviderRuntimeEvent);
-
-      // Start stream loop in background
-      ctx.activeStreamPromise = runStreamLoop(ctx, promptText);
-      ctx.activeStreamPromise.catch((err) => {
-        if (!ctx.stopped) {
-          console.error("[gemini] Unhandled stream loop error:", err);
-        }
-      });
-
-      return {
-        threadId: input.threadId,
-        turnId: TurnIdBrand.makeUnsafe(turnId),
-        resumeCursor: ctx.session.resumeCursor,
-      };
-    });
-
-  const interruptTurn = (
-    threadId: ThreadId,
-    _turnId?: TurnId,
-  ): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
+  const interruptTurn: GeminiAcpAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
+    function* (threadId, _turnId) {
       const ctx = yield* getSession(threadId);
       abortActiveTurn(ctx);
-    });
+    },
+  );
 
-  const respondToRequest = (
-    threadId: ThreadId,
-    requestId: ApprovalRequestId,
-    decision: ProviderApprovalDecision,
-  ): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
+  const respondToRequest: GeminiAcpAdapterShape["respondToRequest"] = Effect.fn("respondToRequest")(
+    function* (threadId, requestId, decision) {
       const ctx = yield* getSession(threadId);
       const pending = ctx.pendingApprovals.get(requestId);
       if (!pending) {
@@ -2149,39 +2152,37 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           decision,
         },
       } as ProviderRuntimeEvent);
-    });
+    },
+  );
 
-  const respondToUserInput = (
-    threadId: ThreadId,
-    requestId: ApprovalRequestId,
-    answers: ProviderUserInputAnswers,
-  ): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
-      const ctx = yield* getSession(threadId);
-      const pending = ctx.pendingUserInputs.get(requestId);
-      if (!pending) {
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "respondToUserInput",
-          detail: `No pending user input for requestId "${requestId}"`,
-        });
-      }
+  const respondToUserInput: GeminiAcpAdapterShape["respondToUserInput"] = Effect.fn(
+    "respondToUserInput",
+  )(function* (threadId, requestId, answers) {
+    const ctx = yield* getSession(threadId);
+    const pending = ctx.pendingUserInputs.get(requestId);
+    if (!pending) {
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "respondToUserInput",
+        detail: `No pending user input for requestId "${requestId}"`,
+      });
+    }
 
-      ctx.pendingUserInputs.delete(requestId);
-      pending.resolve(answers);
+    ctx.pendingUserInputs.delete(requestId);
+    pending.resolve(answers);
 
-      emit({
-        ...makeEventBase(ctx),
-        requestId: RuntimeRequestId.makeUnsafe(requestId),
-        type: "user-input.resolved",
-        payload: {
-          answers,
-        },
-      } as ProviderRuntimeEvent);
-    });
+    emit({
+      ...makeEventBase(ctx),
+      requestId: RuntimeRequestId.makeUnsafe(requestId),
+      type: "user-input.resolved",
+      payload: {
+        answers,
+      },
+    } as ProviderRuntimeEvent);
+  });
 
-  const stopSession = (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
+  const stopSession: GeminiAcpAdapterShape["stopSession"] = Effect.fn("stopSession")(
+    function* (threadId) {
       const ctx = sessions.get(threadId);
       if (!ctx) return;
 
@@ -2234,7 +2235,8 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           exitKind: "graceful",
         },
       } as ProviderRuntimeEvent);
-    });
+    },
+  );
 
   const listSessions = (): Effect.Effect<ReadonlyArray<ProviderSession>> =>
     Effect.sync(() =>
@@ -2249,10 +2251,8 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
       return !!ctx && !ctx.stopped;
     });
 
-  const readThread = (
-    threadId: ThreadId,
-  ): Effect.Effect<ProviderThreadSnapshot, ProviderAdapterError> =>
-    Effect.gen(function* () {
+  const readThread: GeminiAcpAdapterShape["readThread"] = Effect.fn("readThread")(
+    function* (threadId) {
       const ctx = yield* getSession(threadId);
       return {
         threadId,
@@ -2261,13 +2261,11 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           items: t.items,
         })),
       };
-    });
+    },
+  );
 
-  const rollbackThread = (
-    threadId: ThreadId,
-    numTurns: number,
-  ): Effect.Effect<ProviderThreadSnapshot, ProviderAdapterError> =>
-    Effect.gen(function* () {
+  const rollbackThread: GeminiAcpAdapterShape["rollbackThread"] = Effect.fn("rollbackThread")(
+    function* (threadId, numTurns) {
       const ctx = yield* getSession(threadId);
       const nextTurnCount = Math.max(0, ctx.turns.length - numTurns);
       const retainedTurns = ctx.turns.slice(0, nextTurnCount);
@@ -2296,15 +2294,15 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
           items: t.items,
         })),
       };
-    });
+    },
+  );
 
-  const stopAll = (): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.gen(function* () {
-      const threadIds = Array.from(sessions.keys());
-      for (const threadId of threadIds) {
-        yield* stopSession(threadId as ThreadId);
-      }
-    });
+  const stopAll: GeminiAcpAdapterShape["stopAll"] = Effect.fn("stopAll")(function* () {
+    const threadIds = Array.from(sessions.keys());
+    for (const threadId of threadIds) {
+      yield* stopSession(threadId as ThreadId);
+    }
+  });
 
   return {
     provider: PROVIDER,
@@ -2328,4 +2326,4 @@ const makeGeminiAcpAdapter = Effect.gen(function* () {
   } satisfies GeminiAcpAdapterShape;
 });
 
-export const GeminiAcpAdapterLive = Layer.effect(GeminiAcpAdapter, makeGeminiAcpAdapter);
+export const GeminiAcpAdapterLive = Layer.effect(GeminiAcpAdapter, makeGeminiAcpAdapter());

@@ -360,6 +360,98 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("cascades project deletion across active project threads", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const createdAt = now();
+
+    await system.run(
+      engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-cascade-create"),
+        projectId: asProjectId("project-cascade"),
+        title: "Cascade Project",
+        workspaceRoot: "/tmp/project-cascade",
+        defaultModelSelection: {
+          provider: "codex",
+          model: "gpt-5-codex",
+        },
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-cascade-1"),
+        threadId: ThreadId.make("thread-cascade-1"),
+        projectId: asProjectId("project-cascade"),
+        title: "Cascade 1",
+        modelSelection: {
+          provider: "codex",
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-thread-cascade-2"),
+        threadId: ThreadId.make("thread-cascade-2"),
+        projectId: asProjectId("project-cascade"),
+        title: "Cascade 2",
+        modelSelection: {
+          provider: "codex",
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt,
+      }),
+    );
+    await system.run(
+      engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("cmd-project-cascade-delete"),
+        projectId: asProjectId("project-cascade"),
+      }),
+    );
+
+    const events = await system.run(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+    expect(events.map((event) => event.type)).toEqual([
+      "project.created",
+      "thread.created",
+      "thread.created",
+      "thread.deleted",
+      "thread.deleted",
+      "project.deleted",
+    ]);
+
+    const readModel = await system.run(engine.getReadModel());
+    expect(
+      readModel.projects.find((project) => project.id === asProjectId("project-cascade")),
+    ).toMatchObject({
+      deletedAt: expect.any(String),
+    });
+    expect(
+      readModel.threads
+        .filter((thread) => thread.projectId === asProjectId("project-cascade"))
+        .map((thread) => thread.deletedAt),
+    ).toEqual([expect.any(String), expect.any(String)]);
+
+    await system.dispose();
+  });
+
   it("streams persisted domain events in order", async () => {
     const system = await createOrchestrationSystem();
     const { engine } = system;

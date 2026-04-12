@@ -50,6 +50,7 @@ import { WorkspacePathsLive } from "./workspace/Layers/WorkspacePaths";
 import { ProjectSetupScriptRunnerLive } from "./project/Layers/ProjectSetupScriptRunner";
 import { ObservabilityLive } from "./observability/Layers/Observability";
 import { ServerEnvironmentLive } from "./environment/Layers/ServerEnvironment";
+import { CustomSkillsLive } from "./customSkills";
 import {
   authBearerBootstrapRouteLayer,
   authBootstrapRouteLayer,
@@ -213,6 +214,7 @@ const RuntimeDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(KeybindingsLive),
   Layer.provideMerge(ProviderRegistryLive.pipe(Layer.provideMerge(GeminiAuthLayerLive))),
   Layer.provideMerge(ServerSettingsLive),
+  Layer.provideMerge(CustomSkillsLive),
   Layer.provideMerge(WorkspaceLayerLive),
   Layer.provideMerge(ProjectFaviconResolverLive),
   Layer.provideMerge(RepositoryIdentityResolverLive),

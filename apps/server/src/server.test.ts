@@ -77,6 +77,7 @@ import {
 import { ServerLifecycleEvents, type ServerLifecycleEventsShape } from "./serverLifecycleEvents.ts";
 import { ServerRuntimeStartup, type ServerRuntimeStartupShape } from "./serverRuntimeStartup.ts";
 import { ServerSettingsService, type ServerSettingsShape } from "./serverSettings.ts";
+import { CustomSkillsService } from "./customSkills.ts";
 import { TerminalManager, type TerminalManagerShape } from "./terminal/Services/Manager.ts";
 import {
   BrowserTraceCollector,
@@ -338,6 +339,12 @@ const buildAppUnderTest = (options?: {
       ...options?.config,
     };
     const layerConfig = Layer.succeed(ServerConfig, config);
+    const emptyCustomSkillsState = {
+      revision: 1,
+      skillsPath: `${config.stateDir}/${"custom-skills"}`,
+      disabledSkillsPath: `${config.stateDir}/${"custom-skills.disabled"}`,
+      skills: [],
+    } as const;
     const gitManagerLayer = Layer.mock(GitManager)({
       ...options?.layers?.gitManager,
     });
@@ -373,6 +380,16 @@ const buildAppUnderTest = (options?: {
           updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
           streamChanges: Stream.empty,
           ...options?.layers?.serverSettings,
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(CustomSkillsService)({
+          getState: Effect.succeed(emptyCustomSkillsState),
+          importSkill: () => Effect.succeed(emptyCustomSkillsState),
+          setSkillEnabled: () => Effect.succeed(emptyCustomSkillsState),
+          removeSkill: () => Effect.succeed(emptyCustomSkillsState),
+          resolvePrompt: ({ prompt }) => Effect.succeed({ prompt, skills: [] }),
+          streamChanges: Stream.empty,
         }),
       ),
       Layer.provide(

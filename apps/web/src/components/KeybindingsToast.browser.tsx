@@ -89,6 +89,12 @@ function createBaseServerConfig(): ServerConfig {
       otlpTracesEnabled: false,
       otlpMetricsEnabled: false,
     },
+    customSkills: {
+      revision: 1,
+      skillsPath: "/repo/project/.t3/custom-skills",
+      disabledSkillsPath: "/repo/project/.t3/custom-skills.disabled",
+      skills: [],
+    },
     settings: {
       ...DEFAULT_SERVER_SETTINGS,
       enableAssistantStreaming: false,

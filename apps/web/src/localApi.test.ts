@@ -75,6 +75,9 @@ const rpcClientMock = {
     getConfig: vi.fn(),
     refreshProviders: vi.fn(),
     upsertKeybinding: vi.fn(),
+    importCustomSkill: vi.fn(),
+    setCustomSkillEnabled: vi.fn(),
+    removeCustomSkill: vi.fn(),
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
     subscribeConfig: vi.fn(),
@@ -226,6 +229,13 @@ const baseEnvironment = {
   },
 };
 
+const baseCustomSkills = {
+  revision: 1,
+  skillsPath: "/tmp/workspace/.config/custom-skills",
+  disabledSkillsPath: "/tmp/workspace/.config/custom-skills.disabled",
+  skills: [],
+} as const;
+
 const baseServerConfig: ServerConfig = {
   environment: baseEnvironment,
   auth: {
@@ -246,6 +256,7 @@ const baseServerConfig: ServerConfig = {
     otlpTracesEnabled: false,
     otlpMetricsEnabled: false,
   },
+  customSkills: baseCustomSkills,
   settings: DEFAULT_SERVER_SETTINGS,
 };
 

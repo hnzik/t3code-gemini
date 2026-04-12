@@ -40,6 +40,7 @@ import { ProviderUnsupportedError } from "../src/provider/Errors.ts";
 import { ProviderAdapterRegistry } from "../src/provider/Services/ProviderAdapterRegistry.ts";
 import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSessionDirectory.ts";
 import { ServerSettingsService } from "../src/serverSettings.ts";
+import { CustomSkillsService } from "../src/customSkills.ts";
 import { makeProviderServiceLive } from "../src/provider/Layers/ProviderService.ts";
 import { makeCodexAdapterLive } from "../src/provider/Layers/CodexAdapter.ts";
 import { CodexAdapter } from "../src/provider/Services/CodexAdapter.ts";
@@ -302,6 +303,37 @@ export const makeOrchestrationIntegrationHarness = (
       RuntimeReceiptBusTest,
     );
     const serverSettingsLayer = ServerSettingsService.layerTest();
+    const customSkillsLayer = Layer.mock(CustomSkillsService)({
+      getState: Effect.succeed({
+        revision: 1,
+        skillsPath: path.join(stateDir, "custom-skills"),
+        disabledSkillsPath: path.join(stateDir, "custom-skills.disabled"),
+        skills: [],
+      }),
+      importSkill: () =>
+        Effect.succeed({
+          revision: 1,
+          skillsPath: path.join(stateDir, "custom-skills"),
+          disabledSkillsPath: path.join(stateDir, "custom-skills.disabled"),
+          skills: [],
+        }),
+      setSkillEnabled: () =>
+        Effect.succeed({
+          revision: 1,
+          skillsPath: path.join(stateDir, "custom-skills"),
+          disabledSkillsPath: path.join(stateDir, "custom-skills.disabled"),
+          skills: [],
+        }),
+      removeSkill: () =>
+        Effect.succeed({
+          revision: 1,
+          skillsPath: path.join(stateDir, "custom-skills"),
+          disabledSkillsPath: path.join(stateDir, "custom-skills.disabled"),
+          skills: [],
+        }),
+      resolvePrompt: ({ prompt }) => Effect.succeed({ prompt, skills: [] }),
+      streamChanges: Stream.empty,
+    });
     const runtimeIngestionLayer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(serverSettingsLayer),
@@ -319,6 +351,7 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(gitCoreLayer),
       Layer.provideMerge(textGenerationLayer),
       Layer.provideMerge(serverSettingsLayer),
+      Layer.provideMerge(customSkillsLayer),
     );
     const checkpointReactorLayer = CheckpointReactorLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),

@@ -30,6 +30,12 @@ import type {
   ServerUpsertKeybindingResult,
 } from "./server";
 import type {
+  CustomSkillImportInput,
+  CustomSkillRemoveInput,
+  CustomSkillsState,
+  CustomSkillSetEnabledInput,
+} from "./customSkills";
+import type {
   TerminalClearInput,
   TerminalCloseInput,
   TerminalEvent,
@@ -199,6 +205,9 @@ export interface LocalApi {
     getConfig: () => Promise<ServerConfig>;
     refreshProviders: () => Promise<ServerProviderUpdatedPayload>;
     upsertKeybinding: (input: ServerUpsertKeybindingInput) => Promise<ServerUpsertKeybindingResult>;
+    importCustomSkill: (input: CustomSkillImportInput) => Promise<CustomSkillsState>;
+    setCustomSkillEnabled: (input: CustomSkillSetEnabledInput) => Promise<CustomSkillsState>;
+    removeCustomSkill: (input: CustomSkillRemoveInput) => Promise<CustomSkillsState>;
     getSettings: () => Promise<ServerSettings>;
     updateSettings: (patch: ServerSettingsPatch) => Promise<ServerSettings>;
   };

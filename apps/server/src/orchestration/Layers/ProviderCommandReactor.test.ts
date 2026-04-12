@@ -37,6 +37,7 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { CustomSkillsService } from "../../customSkills.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
@@ -104,6 +105,12 @@ describe("ProviderCommandReactor", () => {
     const { stateDir } = deriveServerPathsSync(baseDir, undefined);
     createdStateDirs.add(stateDir);
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+    const emptyCustomSkillsState = {
+      revision: 1,
+      skillsPath: path.join(stateDir, "custom-skills"),
+      disabledSkillsPath: path.join(stateDir, "custom-skills.disabled"),
+      skills: [],
+    } as const;
     let nextSessionIndex = 1;
     const runtimeSessions: Array<ProviderSession> = [];
     const modelSelection = input?.threadModelSelection ?? {
@@ -232,6 +239,16 @@ describe("ProviderCommandReactor", () => {
         }),
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(
+        Layer.mock(CustomSkillsService)({
+          getState: Effect.succeed(emptyCustomSkillsState),
+          importSkill: () => Effect.succeed(emptyCustomSkillsState),
+          setSkillEnabled: () => Effect.succeed(emptyCustomSkillsState),
+          removeSkill: () => Effect.succeed(emptyCustomSkillsState),
+          resolvePrompt: ({ prompt }) => Effect.succeed({ prompt, skills: [] }),
+          streamChanges: Stream.empty,
+        }),
+      ),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
     );

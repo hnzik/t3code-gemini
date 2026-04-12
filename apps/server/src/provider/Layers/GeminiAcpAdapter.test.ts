@@ -11,6 +11,7 @@ import {
   buildGeminiPersistedBinding,
   buildGeminiAssistantHistoryEntry,
   buildGeminiAskUserResponseAnswers,
+  classifyRequestTypeForTool,
   formatGeminiRetryWarningMessage,
   formatGeminiSubagentActivityDetail,
   inferGeminiTurnHistoryLengths,
@@ -50,6 +51,14 @@ describe("GeminiAcpAdapter agent-event helpers", () => {
       }),
       'codebase_investigator: Search code - Looking for the WebSocket handlers. - {"pattern":"websocket"} - status=completed',
     );
+  });
+
+  it("classifies Gemini read-only tools as file reads for approval routing", () => {
+    assert.equal(classifyRequestTypeForTool("glob"), "file_read_approval");
+    assert.equal(classifyRequestTypeForTool("read_file"), "file_read_approval");
+    assert.equal(classifyRequestTypeForTool("list_directory"), "file_read_approval");
+    assert.equal(classifyRequestTypeForTool("replace"), "file_change_approval");
+    assert.equal(classifyRequestTypeForTool("run_shell_command"), "exec_command_approval");
   });
 });
 

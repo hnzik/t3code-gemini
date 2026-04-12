@@ -934,6 +934,7 @@ interface SidebarProjectItemProps {
   newThreadShortcutLabel: string | null;
   handleNewThread: ReturnType<typeof useNewThreadHandler>["handleNewThread"];
   archiveThread: ReturnType<typeof useThreadActions>["archiveThread"];
+  deleteProject: ReturnType<typeof useThreadActions>["deleteProject"];
   deleteThread: ReturnType<typeof useThreadActions>["deleteThread"];
   threadJumpLabelByKey: ReadonlyMap<string, string>;
   attachThreadListAutoAnimateRef: (node: HTMLElement | null) => void;
@@ -954,6 +955,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     newThreadShortcutLabel,
     handleNewThread,
     archiveThread,
+    deleteProject,
     deleteThread,
     threadJumpLabelByKey,
     attachThreadListAutoAnimateRef,
@@ -986,13 +988,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const removeFromSelection = useThreadSelectionStore((state) => state.removeFromSelection);
   const setSelectionAnchor = useThreadSelectionStore((state) => state.setAnchor);
   const selectedThreadCount = useThreadSelectionStore((state) => state.selectedThreadKeys.size);
-  const clearComposerDraftForThread = useComposerDraftStore((state) => state.clearDraftThread);
-  const getDraftThreadByProjectRef = useComposerDraftStore(
-    (state) => state.getDraftThreadByProjectRef,
-  );
-  const clearProjectDraftThreadId = useComposerDraftStore(
-    (state) => state.clearProjectDraftThreadId,
-  );
   const { copyToClipboard: copyThreadIdToClipboard } = useCopyToClipboard<{
     threadId: ThreadId;
   }>({
@@ -1101,6 +1096,14 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   // All threads from the representative + other member environments are
   // already fetched into allSidebarThreads, so we can use them directly.
   const projectThreads = allSidebarThreads;
+  const removableProjectThreadCount = useMemo(
+    () =>
+      projectThreads.filter(
+        (thread) =>
+          thread.environmentId === project.environmentId && thread.projectId === project.id,
+      ).length,
+    [project.environmentId, project.id, projectThreads],
+  );
   const projectExpanded = useUiStateStore(
     (state) => state.projectExpandedById[project.projectKey] ?? true,
   );
@@ -1318,35 +1321,17 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         }
         if (clicked !== "delete") return;
 
-        if (projectThreads.length > 0) {
-          toastManager.add({
-            type: "warning",
-            title: "Project is not empty",
-            description: "Delete all threads in this project before removing it.",
-          });
-          return;
-        }
-
-        const confirmed = await api.dialogs.confirm(`Remove project "${project.name}"?`);
+        const confirmed = await api.dialogs.confirm(
+          removableProjectThreadCount === 0
+            ? `Remove project "${project.name}"?`
+            : `Remove project "${project.name}" and ${removableProjectThreadCount} ${
+                removableProjectThreadCount === 1 ? "thread" : "threads"
+              }?`,
+        );
         if (!confirmed) return;
 
         try {
-          const projectDraftThread = getDraftThreadByProjectRef(
-            scopeProjectRef(project.environmentId, project.id),
-          );
-          if (projectDraftThread) {
-            clearComposerDraftForThread(projectDraftThread.draftId);
-          }
-          clearProjectDraftThreadId(scopeProjectRef(project.environmentId, project.id));
-          const projectApi = readEnvironmentApi(project.environmentId);
-          if (!projectApi) {
-            throw new Error("Project API unavailable.");
-          }
-          await projectApi.orchestration.dispatchCommand({
-            type: "project.delete",
-            commandId: newCommandId(),
-            projectId: project.id,
-          });
+          await deleteProject(scopeProjectRef(project.environmentId, project.id));
         } catch (error) {
           const message =
             error instanceof Error ? error.message : "Unknown error removing project.";
@@ -1360,15 +1345,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       })();
     },
     [
-      clearComposerDraftForThread,
-      clearProjectDraftThreadId,
       copyPathToClipboard,
-      getDraftThreadByProjectRef,
+      deleteProject,
       project.cwd,
       project.environmentId,
       project.id,
       project.name,
-      projectThreads.length,
+      removableProjectThreadCount,
       suppressProjectClickForContextMenuRef,
     ],
   );
@@ -2035,6 +2018,7 @@ interface SidebarProjectsContentProps {
   handleProjectDragCancel: (event: DragCancelEvent) => void;
   handleNewThread: ReturnType<typeof useNewThreadHandler>["handleNewThread"];
   archiveThread: ReturnType<typeof useThreadActions>["archiveThread"];
+  deleteProject: ReturnType<typeof useThreadActions>["deleteProject"];
   deleteThread: ReturnType<typeof useThreadActions>["deleteThread"];
   sortedProjects: readonly SidebarProjectSnapshot[];
   expandedThreadListsByProject: ReadonlySet<string>;
@@ -2086,6 +2070,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     handleProjectDragCancel,
     handleNewThread,
     archiveThread,
+    deleteProject,
     deleteThread,
     sortedProjects,
     expandedThreadListsByProject,
@@ -2267,6 +2252,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                         newThreadShortcutLabel={newThreadShortcutLabel}
                         handleNewThread={handleNewThread}
                         archiveThread={archiveThread}
+                        deleteProject={deleteProject}
                         deleteThread={deleteThread}
                         threadJumpLabelByKey={threadJumpLabelByKey}
                         attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
@@ -2299,6 +2285,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 newThreadShortcutLabel={newThreadShortcutLabel}
                 handleNewThread={handleNewThread}
                 archiveThread={archiveThread}
+                deleteProject={deleteProject}
                 deleteThread={deleteThread}
                 threadJumpLabelByKey={threadJumpLabelByKey}
                 attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
@@ -2339,7 +2326,7 @@ export default function Sidebar() {
   const defaultThreadEnvMode = useSettings((s) => s.defaultThreadEnvMode);
   const { updateSettings } = useUpdateSettings();
   const { handleNewThread } = useNewThreadHandler();
-  const { archiveThread, deleteThread } = useThreadActions();
+  const { archiveThread, deleteProject, deleteThread } = useThreadActions();
   const routeThreadRef = useParams({
     strict: false,
     select: (params) => resolveThreadRouteRef(params),
@@ -3159,6 +3146,7 @@ export default function Sidebar() {
             handleProjectDragCancel={handleProjectDragCancel}
             handleNewThread={handleNewThread}
             archiveThread={archiveThread}
+            deleteProject={deleteProject}
             deleteThread={deleteThread}
             sortedProjects={sortedProjects}
             expandedThreadListsByProject={expandedThreadListsByProject}

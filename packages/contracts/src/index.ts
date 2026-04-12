@@ -6,6 +6,7 @@ export * from "./terminal";
 export * from "./provider";
 export * from "./providerRuntime";
 export * from "./model";
+export * from "./customSkills";
 export * from "./keybindings";
 export * from "./server";
 export * from "./settings";

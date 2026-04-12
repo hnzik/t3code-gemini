@@ -1,5 +1,5 @@
 import { parseScopedThreadKey, scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime";
-import { type ScopedThreadRef, ThreadId } from "@t3tools/contracts";
+import { type ScopedProjectRef, type ScopedThreadRef, ThreadId } from "@t3tools/contracts";
 import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { useCallback } from "react";
@@ -27,6 +27,9 @@ export function useThreadActions() {
   const sidebarThreadSortOrder = useSettings((settings) => settings.sidebarThreadSortOrder);
   const confirmThreadDelete = useSettings((settings) => settings.confirmThreadDelete);
   const clearComposerDraftForThread = useComposerDraftStore((store) => store.clearDraftThread);
+  const clearProjectDraftThreadId = useComposerDraftStore(
+    (store) => store.clearProjectDraftThreadId,
+  );
   const clearProjectDraftThreadById = useComposerDraftStore(
     (store) => store.clearProjectDraftThreadById,
   );
@@ -50,6 +53,43 @@ export function useThreadActions() {
     const currentRouteParams = router.state.matches[router.state.matches.length - 1]?.params ?? {};
     return resolveThreadRouteRef(currentRouteParams);
   }, [router]);
+  const prepareThreadForDelete = useCallback(
+    async (input: {
+      readonly threadRef: ScopedThreadRef;
+      readonly session: { readonly status: string } | null | undefined;
+    }) => {
+      const api = readEnvironmentApi(input.threadRef.environmentId);
+      if (!api) {
+        return;
+      }
+
+      if (input.session && input.session.status !== "closed") {
+        await api.orchestration
+          .dispatchCommand({
+            type: "thread.session.stop",
+            commandId: newCommandId(),
+            threadId: input.threadRef.threadId,
+            createdAt: new Date().toISOString(),
+          })
+          .catch(() => undefined);
+      }
+
+      try {
+        await api.terminal.close({ threadId: input.threadRef.threadId, deleteHistory: true });
+      } catch {
+        // Terminal may already be closed.
+      }
+    },
+    [],
+  );
+  const clearThreadDeleteClientState = useCallback(
+    (threadRef: ScopedThreadRef, projectRef: ScopedProjectRef) => {
+      clearComposerDraftForThread(threadRef);
+      clearProjectDraftThreadById(projectRef, threadRef);
+      clearTerminalState(threadRef);
+    },
+    [clearComposerDraftForThread, clearProjectDraftThreadById, clearTerminalState],
+  );
 
   const archiveThread = useCallback(
     async (target: ScopedThreadRef) => {
@@ -136,22 +176,10 @@ export function useThreadActions() {
           ].join("\n"),
         ));
 
-      if (thread.session && thread.session.status !== "closed") {
-        await api.orchestration
-          .dispatchCommand({
-            type: "thread.session.stop",
-            commandId: newCommandId(),
-            threadId: threadRef.threadId,
-            createdAt: new Date().toISOString(),
-          })
-          .catch(() => undefined);
-      }
-
-      try {
-        await api.terminal.close({ threadId: threadRef.threadId, deleteHistory: true });
-      } catch {
-        // Terminal may already be closed.
-      }
+      await prepareThreadForDelete({
+        threadRef,
+        session: thread.session,
+      });
 
       const deletedThreadIds = deletedIds ?? new Set<ThreadId>();
       const currentRouteThreadRef = getCurrentRouteThreadRef();
@@ -169,12 +197,10 @@ export function useThreadActions() {
         commandId: newCommandId(),
         threadId: threadRef.threadId,
       });
-      clearComposerDraftForThread(threadRef);
-      clearProjectDraftThreadById(
-        scopeProjectRef(threadRef.environmentId, thread.projectId),
+      clearThreadDeleteClientState(
         threadRef,
+        scopeProjectRef(threadRef.environmentId, thread.projectId),
       );
-      clearTerminalState(threadRef);
 
       if (shouldNavigateToFallback) {
         if (fallbackThreadId) {
@@ -227,13 +253,89 @@ export function useThreadActions() {
       }
     },
     [
-      clearComposerDraftForThread,
-      clearProjectDraftThreadById,
-      clearTerminalState,
+      clearThreadDeleteClientState,
       getCurrentRouteThreadRef,
-      router,
+      prepareThreadForDelete,
       queryClient,
       resolveThreadTarget,
+      router,
+      sidebarThreadSortOrder,
+    ],
+  );
+
+  const deleteProject = useCallback(
+    async (target: ScopedProjectRef) => {
+      const api = readEnvironmentApi(target.environmentId);
+      if (!api) return;
+
+      const state = useStore.getState();
+      const project = selectProjectByRef(state, target);
+      if (!project) return;
+
+      const threads = selectThreadsForEnvironment(state, target.environmentId);
+      const projectThreads = threads.filter((thread) => thread.projectId === project.id);
+      const deletedThreadIds = new Set(projectThreads.map((thread) => thread.id));
+      const currentRouteThreadRef = getCurrentRouteThreadRef();
+      const shouldNavigateToFallback =
+        currentRouteThreadRef?.environmentId === target.environmentId &&
+        deletedThreadIds.has(currentRouteThreadRef.threadId);
+      const fallbackThreadId =
+        shouldNavigateToFallback && currentRouteThreadRef
+          ? getFallbackThreadIdAfterDelete({
+              threads,
+              deletedThreadId: currentRouteThreadRef.threadId,
+              deletedThreadIds,
+              sortOrder: sidebarThreadSortOrder,
+            })
+          : null;
+
+      for (const thread of projectThreads) {
+        await prepareThreadForDelete({
+          threadRef: scopeThreadRef(thread.environmentId, thread.id),
+          session: thread.session,
+        });
+      }
+
+      await api.orchestration.dispatchCommand({
+        type: "project.delete",
+        commandId: newCommandId(),
+        projectId: target.projectId,
+      });
+
+      for (const thread of projectThreads) {
+        clearThreadDeleteClientState(scopeThreadRef(thread.environmentId, thread.id), target);
+      }
+      clearProjectDraftThreadId(target);
+
+      if (!shouldNavigateToFallback) {
+        return;
+      }
+
+      if (fallbackThreadId) {
+        const fallbackThread = selectThreadByRef(
+          useStore.getState(),
+          scopeThreadRef(target.environmentId, fallbackThreadId),
+        );
+        if (fallbackThread) {
+          await router.navigate({
+            to: "/$environmentId/$threadId",
+            params: buildThreadRouteParams(
+              scopeThreadRef(fallbackThread.environmentId, fallbackThread.id),
+            ),
+            replace: true,
+          });
+          return;
+        }
+      }
+
+      await router.navigate({ to: "/", replace: true });
+    },
+    [
+      clearProjectDraftThreadId,
+      clearThreadDeleteClientState,
+      getCurrentRouteThreadRef,
+      prepareThreadForDelete,
+      router,
       sidebarThreadSortOrder,
     ],
   );
@@ -268,6 +370,7 @@ export function useThreadActions() {
     archiveThread,
     unarchiveThread,
     deleteThread,
+    deleteProject,
     confirmAndDeleteThread,
   };
 }
