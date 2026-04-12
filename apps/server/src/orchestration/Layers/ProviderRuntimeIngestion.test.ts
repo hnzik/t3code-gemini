@@ -1799,6 +1799,43 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBeNull();
   });
 
+  it("projects model.rerouted into a thread activity", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    harness.emit({
+      type: "model.rerouted",
+      eventId: asEventId("evt-model-rerouted"),
+      provider: "geminiAcp",
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-model-rerouted"),
+      payload: {
+        fromModel: "gemini-2.5-pro",
+        toModel: "gemini-2.5-flash",
+        reason: "gemini_client_model_selection",
+      },
+    });
+
+    const thread = await waitForThread(harness.engine, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) =>
+          activity.id === "evt-model-rerouted" && activity.kind === "model.rerouted",
+      ),
+    );
+    const activity = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === "evt-model-rerouted",
+    );
+    const activityPayload =
+      activity?.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(activity?.summary).toBe("Using gemini-2.5-flash");
+    expect(activityPayload?.fromModel).toBe("gemini-2.5-pro");
+    expect(activityPayload?.toModel).toBe("gemini-2.5-flash");
+  });
+
   it("maps session/thread lifecycle and item.started into session/activity projections", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();

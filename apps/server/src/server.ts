@@ -21,7 +21,7 @@ import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionD
 import { ProviderSessionRuntimeRepositoryLive } from "./persistence/Layers/ProviderSessionRuntime";
 import { makeCodexAdapterLive } from "./provider/Layers/CodexAdapter";
 import { makeClaudeAdapterLive } from "./provider/Layers/ClaudeAdapter";
-import { GeminiAcpAdapterLive } from "./provider/Layers/GeminiAcpAdapter";
+import { makeGeminiAcpAdapterLive } from "./provider/Layers/GeminiAcpAdapter";
 import { GeminiAuthRuntimeStateLive } from "./provider/Layers/GeminiAuthRuntimeState";
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry";
 import { makeProviderServiceLive } from "./provider/Layers/ProviderService";
@@ -157,9 +157,9 @@ const ProviderLayerLive = Layer.unwrap(
     const claudeAdapterLayer = makeClaudeAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
-    const geminiAcpAdapterLayer = GeminiAcpAdapterLive.pipe(
-      Layer.provideMerge(GeminiAuthLayerLive),
-    );
+    const geminiAcpAdapterLayer = makeGeminiAcpAdapterLive(
+      nativeEventLogger ? { nativeEventLogger } : undefined,
+    ).pipe(Layer.provideMerge(GeminiAuthLayerLive));
     const adapterRegistryLayer = ProviderAdapterRegistryLive.pipe(
       Layer.provide(codexAdapterLayer),
       Layer.provide(claudeAdapterLayer),

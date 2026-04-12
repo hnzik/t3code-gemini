@@ -262,6 +262,25 @@ function runtimeEventToActivities(
       ];
     }
 
+    case "model.rerouted": {
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "model.rerouted",
+          summary: `Using ${event.payload.toModel}`,
+          payload: {
+            fromModel: event.payload.fromModel,
+            toModel: event.payload.toModel,
+            reason: event.payload.reason,
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "turn.plan.updated": {
       return [
         {
