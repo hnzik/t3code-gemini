@@ -17,6 +17,7 @@ import {
   type RetryAttemptPayload,
   type ServerGeminiStreamEvent,
   type ThoughtSummary,
+  tokenLimit,
 } from "@google/gemini-cli-core";
 import type { ProviderRuntimeBinding } from "../Services/ProviderSessionDirectory";
 
@@ -76,6 +77,15 @@ export interface GeminiResumeState {
   readonly history: GeminiResumeHistory;
   readonly turnCount: number;
   readonly turnHistoryLengths?: ReadonlyArray<number>;
+}
+
+export interface GeminiUsageCounts {
+  readonly promptTokens: number;
+  readonly cachedInputTokens: number;
+  readonly toolUsePromptTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+  readonly totalTokens: number;
 }
 
 export interface GeminiTrackedTurn {
@@ -589,23 +599,38 @@ export function buildGeminiToolStreamKind(
   return itemType === "command_execution" ? "command_output" : "file_change_output";
 }
 
-export function buildTokenUsageSnapshot(
-  input: {
-    readonly cumulativeInputTokens: number;
-    readonly cumulativeOutputTokens: number;
-  },
-  turnInputTokens?: number,
-  turnOutputTokens?: number,
-): ThreadTokenUsageSnapshot {
-  const usedTokens = input.cumulativeInputTokens + input.cumulativeOutputTokens;
+export function buildTokenUsageSnapshot(input: {
+  readonly usage: GeminiUsageCounts;
+  readonly totalProcessedTokens?: number | undefined;
+  readonly model?: string | null | undefined;
+}): ThreadTokenUsageSnapshot | undefined {
+  const inputTokens = input.usage.promptTokens + input.usage.toolUsePromptTokens;
+  const outputTokens = input.usage.outputTokens;
+  const reasoningOutputTokens = input.usage.reasoningOutputTokens;
+  const usedTokens = inputTokens + outputTokens;
+  if (usedTokens <= 0) {
+    return undefined;
+  }
+
   return {
     usedTokens,
-    maxTokens: DEFAULT_GEMINI_CONTEXT_WINDOW,
-    ...(turnInputTokens !== undefined ? { lastInputTokens: turnInputTokens } : {}),
-    ...(turnOutputTokens !== undefined ? { lastOutputTokens: turnOutputTokens } : {}),
-    ...(turnInputTokens !== undefined || turnOutputTokens !== undefined
-      ? { lastUsedTokens: (turnInputTokens ?? 0) + (turnOutputTokens ?? 0) }
+    ...(input.totalProcessedTokens !== undefined && input.totalProcessedTokens > usedTokens
+      ? { totalProcessedTokens: input.totalProcessedTokens }
       : {}),
+    maxTokens: tokenLimit(input.model ?? "") || DEFAULT_GEMINI_CONTEXT_WINDOW,
+    ...(inputTokens > 0 ? { inputTokens } : {}),
+    ...(input.usage.cachedInputTokens > 0
+      ? { cachedInputTokens: input.usage.cachedInputTokens }
+      : {}),
+    ...(outputTokens > 0 ? { outputTokens } : {}),
+    ...(reasoningOutputTokens > 0 ? { reasoningOutputTokens } : {}),
+    lastUsedTokens: usedTokens,
+    ...(inputTokens > 0 ? { lastInputTokens: inputTokens } : {}),
+    ...(input.usage.cachedInputTokens > 0
+      ? { lastCachedInputTokens: input.usage.cachedInputTokens }
+      : {}),
+    ...(outputTokens > 0 ? { lastOutputTokens: outputTokens } : {}),
+    ...(reasoningOutputTokens > 0 ? { lastReasoningOutputTokens: reasoningOutputTokens } : {}),
   };
 }
 

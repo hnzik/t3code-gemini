@@ -5,6 +5,7 @@ import {
   type ServerGeminiStreamEvent,
   type ToolCallRequestInfo,
 } from "@google/gemini-cli-core";
+import { Data, Effect, Stream } from "effect";
 
 import {
   DEFAULT_GEMINI_CONTEXT_WINDOW,
@@ -13,6 +14,7 @@ import {
   formatGeminiContextWindowOverflowMessage,
   formatGeminiFinishReasonMessage,
   formatGeminiThoughtSummary,
+  type GeminiUsageCounts,
   type GeminiTurnState,
 } from "./GeminiRuntimeHelpers";
 
@@ -41,219 +43,278 @@ export interface GeminiStreamProcessorInput {
     detail?: unknown,
     event?: ServerGeminiStreamEvent,
   ) => void;
-  readonly onUsage: (inputTokens: number, outputTokens: number) => void;
+  readonly onUsage: (usage: GeminiUsageCounts) => void;
 }
 
-export async function processGeminiStreamEvents(
+export class GeminiStreamProcessorError extends Data.TaggedError("GeminiStreamProcessorError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+function toGeminiStreamError(cause: unknown): GeminiStreamProcessorError {
+  if (cause instanceof Error && cause.message.length > 0) {
+    return new GeminiStreamProcessorError({
+      message: cause.message,
+      cause,
+    });
+  }
+  if (typeof cause === "string" && cause.length > 0) {
+    return new GeminiStreamProcessorError({
+      message: cause,
+      cause,
+    });
+  }
+  return new GeminiStreamProcessorError({
+    message: "Gemini stream failed.",
+    cause,
+  });
+}
+
+export function processGeminiStreamEvents(
   input: GeminiStreamProcessorInput,
-): Promise<GeminiStreamProcessingResult> {
+): Effect.Effect<GeminiStreamProcessingResult, GeminiStreamProcessorError> {
   const toolCallRequests: ToolCallRequestInfo[] = [];
   let terminalTurnResult: GeminiStreamTerminalTurnResult | undefined;
 
-  for await (const event of input.stream) {
-    input.onNativeEvent?.(event);
+  const processEvent = (event: ServerGeminiStreamEvent) =>
+    Effect.try({
+      try: () => {
+        input.onNativeEvent?.(event);
 
-    switch (event.type) {
-      case GeminiEventType.Thought: {
-        const thoughtText = formatGeminiThoughtSummary(event.value);
-        if (thoughtText.length > 0) {
-          input.onThought(thoughtText);
+        switch (event.type) {
+          case GeminiEventType.Thought: {
+            const thoughtText = formatGeminiThoughtSummary(event.value);
+            if (thoughtText.length > 0) {
+              input.onThought(thoughtText);
+            }
+            break;
+          }
+
+          case GeminiEventType.Content:
+            input.onContent(event.value);
+            break;
+
+          case GeminiEventType.ToolCallRequest:
+            toolCallRequests.push(event.value);
+            break;
+
+          case GeminiEventType.ToolCallConfirmation:
+          case GeminiEventType.ToolCallResponse:
+          case GeminiEventType.Retry:
+            break;
+
+          case GeminiEventType.Citation:
+            input.onRuntimeWarning(event.value, { geminiEventType: event.type }, event);
+            break;
+
+          case GeminiEventType.ChatCompressed: {
+            if (event.value) {
+              const limit =
+                tokenLimit(input.turnState?.activeModel ?? input.sessionModel ?? "") ||
+                DEFAULT_GEMINI_CONTEXT_WINDOW;
+              input.onRuntimeWarning(
+                formatGeminiChatCompressionMessage({
+                  originalTokenCount: event.value.originalTokenCount,
+                  newTokenCount: event.value.newTokenCount,
+                  limit,
+                }),
+                {
+                  geminiEventType: event.type,
+                  originalTokenCount: event.value.originalTokenCount,
+                  newTokenCount: event.value.newTokenCount,
+                  limit,
+                },
+                event,
+              );
+            }
+            break;
+          }
+
+          case GeminiEventType.Finished: {
+            const usage = event.value.usageMetadata;
+            if (usage) {
+              const promptTokens = usage.promptTokenCount ?? 0;
+              const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
+              const toolUsePromptTokens = usage.toolUsePromptTokenCount ?? 0;
+              const outputTokens = usage.candidatesTokenCount ?? 0;
+              const reasoningOutputTokens = usage.thoughtsTokenCount ?? 0;
+              const totalTokens =
+                usage.totalTokenCount ??
+                promptTokens + toolUsePromptTokens + outputTokens + reasoningOutputTokens;
+
+              if (
+                promptTokens > 0 ||
+                cachedInputTokens > 0 ||
+                toolUsePromptTokens > 0 ||
+                outputTokens > 0 ||
+                reasoningOutputTokens > 0 ||
+                totalTokens > 0
+              ) {
+                input.onUsage({
+                  promptTokens,
+                  cachedInputTokens,
+                  toolUsePromptTokens,
+                  outputTokens,
+                  reasoningOutputTokens,
+                  totalTokens,
+                });
+              }
+            }
+
+            const finishMessage = formatGeminiFinishReasonMessage(event.value.reason);
+            if (finishMessage) {
+              input.onRuntimeWarning(
+                finishMessage,
+                {
+                  geminiEventType: event.type,
+                  finishReason: event.value.reason,
+                  usageMetadata: usage,
+                },
+                event,
+              );
+            }
+            break;
+          }
+
+          case GeminiEventType.ModelInfo:
+            input.onModelInfo(event.value, event);
+            break;
+
+          case GeminiEventType.ContextWindowWillOverflow: {
+            const limit =
+              tokenLimit(input.turnState?.activeModel ?? input.sessionModel ?? "") ||
+              DEFAULT_GEMINI_CONTEXT_WINDOW;
+            input.onRuntimeWarning(
+              formatGeminiContextWindowOverflowMessage({
+                estimatedRequestTokenCount: event.value.estimatedRequestTokenCount,
+                remainingTokenCount: event.value.remainingTokenCount,
+                limit,
+              }),
+              {
+                geminiEventType: event.type,
+                estimatedRequestTokenCount: event.value.estimatedRequestTokenCount,
+                remainingTokenCount: event.value.remainingTokenCount,
+                limit,
+              },
+              event,
+            );
+            terminalTurnResult = {
+              state: "cancelled",
+              stopReason: "context_window_will_overflow",
+            };
+            break;
+          }
+
+          case GeminiEventType.MaxSessionTurns:
+            input.onRuntimeWarning(
+              "The session has reached the maximum number of turns.",
+              { geminiEventType: event.type },
+              event,
+            );
+            terminalTurnResult = {
+              state: "cancelled",
+              stopReason: "max_session_turns",
+            };
+            break;
+
+          case GeminiEventType.LoopDetected:
+            input.onRuntimeWarning(
+              "A potential loop was detected. The request has been halted.",
+              { geminiEventType: event.type },
+              event,
+            );
+            terminalTurnResult = {
+              state: "interrupted",
+              stopReason: "loop_detected",
+            };
+            break;
+
+          case GeminiEventType.AgentExecutionBlocked:
+            input.onRuntimeWarning(
+              formatGeminiAgentExecutionMessage(
+                "blocked",
+                event.value.reason,
+                event.value.systemMessage,
+              ),
+              {
+                geminiEventType: event.type,
+                reason: event.value.reason,
+                systemMessage: event.value.systemMessage,
+                contextCleared: event.value.contextCleared,
+              },
+              event,
+            );
+            if (event.value.contextCleared) {
+              input.onRuntimeWarning("Conversation context has been cleared.", undefined, event);
+            }
+            break;
+
+          case GeminiEventType.AgentExecutionStopped:
+            input.onRuntimeWarning(
+              formatGeminiAgentExecutionMessage(
+                "stopped",
+                event.value.reason,
+                event.value.systemMessage,
+              ),
+              {
+                geminiEventType: event.type,
+                reason: event.value.reason,
+                systemMessage: event.value.systemMessage,
+                contextCleared: event.value.contextCleared,
+              },
+              event,
+            );
+            if (event.value.contextCleared) {
+              input.onRuntimeWarning("Conversation context has been cleared.", undefined, event);
+            }
+            terminalTurnResult = {
+              state: "completed",
+              stopReason: event.value.reason || "agent_execution_stopped",
+            };
+            break;
+
+          case GeminiEventType.UserCancelled:
+            terminalTurnResult = {
+              state: "interrupted",
+              stopReason: "aborted",
+            };
+            break;
+
+          case GeminiEventType.InvalidStream:
+            input.onRuntimeWarning(
+              "Gemini returned an invalid stream response. The request will stop here.",
+              { geminiEventType: event.type },
+              event,
+            );
+            terminalTurnResult = {
+              state: "failed",
+              stopReason: "invalid_stream",
+              errorMessage: "Gemini returned an invalid stream response.",
+            };
+            break;
+
+          case GeminiEventType.Error:
+            throw event.value.error;
+
+          default: {
+            const exhaustiveCheck: never = event;
+            return exhaustiveCheck;
+          }
         }
-        break;
-      }
+      },
+      catch: toGeminiStreamError,
+    });
 
-      case GeminiEventType.Content:
-        input.onContent(event.value);
-        break;
-
-      case GeminiEventType.ToolCallRequest:
-        toolCallRequests.push(event.value);
-        break;
-
-      case GeminiEventType.ToolCallConfirmation:
-      case GeminiEventType.ToolCallResponse:
-      case GeminiEventType.Retry:
-        break;
-
-      case GeminiEventType.Citation:
-        input.onRuntimeWarning(event.value, { geminiEventType: event.type }, event);
-        break;
-
-      case GeminiEventType.ChatCompressed: {
-        if (event.value) {
-          const limit =
-            tokenLimit(input.turnState?.activeModel ?? input.sessionModel ?? "") ||
-            DEFAULT_GEMINI_CONTEXT_WINDOW;
-          input.onRuntimeWarning(
-            formatGeminiChatCompressionMessage({
-              originalTokenCount: event.value.originalTokenCount,
-              newTokenCount: event.value.newTokenCount,
-              limit,
-            }),
-            {
-              geminiEventType: event.type,
-              originalTokenCount: event.value.originalTokenCount,
-              newTokenCount: event.value.newTokenCount,
-              limit,
-            },
-            event,
-          );
-        }
-        break;
-      }
-
-      case GeminiEventType.Finished: {
-        const usage = event.value.usageMetadata;
-        input.onUsage(usage?.promptTokenCount ?? 0, usage?.candidatesTokenCount ?? 0);
-
-        const finishMessage = formatGeminiFinishReasonMessage(event.value.reason);
-        if (finishMessage) {
-          input.onRuntimeWarning(
-            finishMessage,
-            {
-              geminiEventType: event.type,
-              finishReason: event.value.reason,
-              usageMetadata: usage,
-            },
-            event,
-          );
-        }
-        break;
-      }
-
-      case GeminiEventType.ModelInfo:
-        input.onModelInfo(event.value, event);
-        break;
-
-      case GeminiEventType.ContextWindowWillOverflow: {
-        const limit =
-          tokenLimit(input.turnState?.activeModel ?? input.sessionModel ?? "") ||
-          DEFAULT_GEMINI_CONTEXT_WINDOW;
-        input.onRuntimeWarning(
-          formatGeminiContextWindowOverflowMessage({
-            estimatedRequestTokenCount: event.value.estimatedRequestTokenCount,
-            remainingTokenCount: event.value.remainingTokenCount,
-            limit,
-          }),
-          {
-            geminiEventType: event.type,
-            estimatedRequestTokenCount: event.value.estimatedRequestTokenCount,
-            remainingTokenCount: event.value.remainingTokenCount,
-            limit,
-          },
-          event,
-        );
-        terminalTurnResult = {
-          state: "cancelled",
-          stopReason: "context_window_will_overflow",
-        };
-        break;
-      }
-
-      case GeminiEventType.MaxSessionTurns:
-        input.onRuntimeWarning(
-          "The session has reached the maximum number of turns.",
-          { geminiEventType: event.type },
-          event,
-        );
-        terminalTurnResult = {
-          state: "cancelled",
-          stopReason: "max_session_turns",
-        };
-        break;
-
-      case GeminiEventType.LoopDetected:
-        input.onRuntimeWarning(
-          "A potential loop was detected. The request has been halted.",
-          { geminiEventType: event.type },
-          event,
-        );
-        terminalTurnResult = {
-          state: "interrupted",
-          stopReason: "loop_detected",
-        };
-        break;
-
-      case GeminiEventType.AgentExecutionBlocked:
-        input.onRuntimeWarning(
-          formatGeminiAgentExecutionMessage(
-            "blocked",
-            event.value.reason,
-            event.value.systemMessage,
-          ),
-          {
-            geminiEventType: event.type,
-            reason: event.value.reason,
-            systemMessage: event.value.systemMessage,
-            contextCleared: event.value.contextCleared,
-          },
-          event,
-        );
-        if (event.value.contextCleared) {
-          input.onRuntimeWarning("Conversation context has been cleared.", undefined, event);
-        }
-        break;
-
-      case GeminiEventType.AgentExecutionStopped:
-        input.onRuntimeWarning(
-          formatGeminiAgentExecutionMessage(
-            "stopped",
-            event.value.reason,
-            event.value.systemMessage,
-          ),
-          {
-            geminiEventType: event.type,
-            reason: event.value.reason,
-            systemMessage: event.value.systemMessage,
-            contextCleared: event.value.contextCleared,
-          },
-          event,
-        );
-        if (event.value.contextCleared) {
-          input.onRuntimeWarning("Conversation context has been cleared.", undefined, event);
-        }
-        terminalTurnResult = {
-          state: "completed",
-          stopReason: event.value.reason || "agent_execution_stopped",
-        };
-        break;
-
-      case GeminiEventType.UserCancelled:
-        terminalTurnResult = {
-          state: "interrupted",
-          stopReason: "aborted",
-        };
-        break;
-
-      case GeminiEventType.InvalidStream:
-        input.onRuntimeWarning(
-          "Gemini returned an invalid stream response. The request will stop here.",
-          { geminiEventType: event.type },
-          event,
-        );
-        terminalTurnResult = {
-          state: "failed",
-          stopReason: "invalid_stream",
-          errorMessage: "Gemini returned an invalid stream response.",
-        };
-        break;
-
-      case GeminiEventType.Error:
-        throw event.value.error;
-
-      default: {
-        const exhaustiveCheck: never = event;
-        return exhaustiveCheck;
-      }
-    }
-
-    if (terminalTurnResult) {
-      break;
-    }
-  }
-
-  return {
-    toolCallRequests,
-    ...(terminalTurnResult ? { terminalTurnResult } : {}),
-  };
+  return Stream.fromAsyncIterable(input.stream, toGeminiStreamError).pipe(
+    Stream.takeUntilEffect((event) =>
+      processEvent(event).pipe(Effect.as(terminalTurnResult !== undefined)),
+    ),
+    Stream.runDrain,
+    Effect.flatMap(() =>
+      Effect.sync(() => ({
+        toolCallRequests,
+        ...(terminalTurnResult ? { terminalTurnResult } : {}),
+      })),
+    ),
+  );
 }

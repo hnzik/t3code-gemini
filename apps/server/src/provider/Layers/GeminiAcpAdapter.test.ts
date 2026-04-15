@@ -973,6 +973,130 @@ describe("GeminiAcpAdapter runtime session flow", () => {
     );
   });
 
+  it("reports Gemini context usage from the latest round instead of accumulating prior rounds", async () => {
+    const harness = makeGeminiHarness();
+    vi.spyOn(GeminiToolSchedulerBridge.prototype, "scheduleToolCalls").mockResolvedValue({
+      completedToolCalls: [
+        makeCompletedToolCall({
+          callId: "tool-read-usage-1",
+          name: "read_file",
+          args: { path: "README.md" },
+          resultDisplay: "README loaded",
+          responseParts: [
+            {
+              functionResponse: {
+                id: "tool-read-usage-1",
+                name: "read_file",
+                response: { ok: true },
+              },
+            },
+          ],
+        }),
+      ],
+      responseParts: [
+        {
+          functionResponse: {
+            id: "tool-read-usage-1",
+            name: "read_file",
+            response: { ok: true },
+          },
+        },
+      ],
+      stopExecution: false,
+      fatalError: undefined,
+      allCancelled: false,
+    });
+
+    harness.geminiClient.enqueueEvents([
+      {
+        type: GeminiEventType.ToolCallRequest,
+        value: makeToolCallRequest({
+          callId: "tool-read-usage-1",
+          name: "read_file",
+          args: { path: "README.md" },
+        }),
+      },
+      {
+        type: GeminiEventType.Finished,
+        value: {
+          reason: FinishReason.STOP,
+          usageMetadata: {
+            promptTokenCount: 200,
+            cachedContentTokenCount: 30,
+            candidatesTokenCount: 40,
+            toolUsePromptTokenCount: 20,
+            thoughtsTokenCount: 50,
+            totalTokenCount: 310,
+          },
+        },
+      },
+    ] as Array<ServerGeminiStreamEvent>);
+    harness.geminiClient.enqueueEvents([
+      {
+        type: GeminiEventType.Content,
+        value: "Done",
+      },
+      {
+        type: GeminiEventType.Finished,
+        value: {
+          reason: FinishReason.STOP,
+          usageMetadata: {
+            promptTokenCount: 230,
+            cachedContentTokenCount: 35,
+            candidatesTokenCount: 8,
+            toolUsePromptTokenCount: 18,
+            thoughtsTokenCount: 60,
+            totalTokenCount: 316,
+          },
+        },
+      },
+    ] as Array<ServerGeminiStreamEvent>);
+
+    await runWithGeminiHarnessPromise(harness, (adapter) =>
+      Effect.gen(function* () {
+        yield* startGeminiSession(adapter);
+        yield* adapter.sendTurn({
+          threadId: THREAD_ID,
+          input: "Inspect and continue",
+          attachments: [],
+        });
+
+        const events = yield* collectRuntimeEventsUntil(
+          adapter,
+          (event) => event.type === "turn.completed",
+        );
+
+        const usageEvent = events.find(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "thread.token-usage.updated" }> =>
+            event.type === "thread.token-usage.updated",
+        );
+        assert.equal(usageEvent?.type, "thread.token-usage.updated");
+        if (usageEvent?.type !== "thread.token-usage.updated") {
+          return;
+        }
+
+        assert.equal(
+          (usageEvent.payload.usage.maxTokens ?? 0) > usageEvent.payload.usage.usedTokens,
+          true,
+        );
+        const { maxTokens: _maxTokens, ...usageWithoutMaxTokens } = usageEvent.payload.usage;
+        assert.deepStrictEqual(usageWithoutMaxTokens, {
+          usedTokens: 256,
+          totalProcessedTokens: 626,
+          inputTokens: 248,
+          cachedInputTokens: 35,
+          outputTokens: 8,
+          reasoningOutputTokens: 60,
+          lastUsedTokens: 256,
+          lastInputTokens: 248,
+          lastCachedInputTokens: 35,
+          lastOutputTokens: 8,
+          lastReasoningOutputTokens: 60,
+        });
+      }),
+    );
+  });
+
   it("routes tool confirmations through request.opened and request.resolved", async () => {
     const harness = makeGeminiHarness();
     let confirmationResponse: unknown | undefined;
@@ -1829,6 +1953,44 @@ describe("GeminiAcpAdapter runtime session flow", () => {
         );
         assert.equal(nativeEvents[0]?.event?.provider, "geminiAcp");
         assert.equal(nativeEvents[0]?.event?.providerThreadId, String(THREAD_ID));
+      }),
+    );
+  });
+
+  it("completes the turn as failed when the Gemini stream throws", async () => {
+    const harness = makeGeminiHarness();
+    harness.geminiClient.enqueueFactory(() => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: async () => {
+            throw new Error("kaboom");
+          },
+        };
+      },
+    }));
+
+    await runWithGeminiHarnessPromise(harness, (adapter) =>
+      Effect.gen(function* () {
+        const session = yield* startGeminiSession(adapter);
+        yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "Trigger a stream failure",
+          attachments: [],
+        });
+
+        const completed = yield* waitForRuntimeEvent(
+          adapter,
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+            event.type === "turn.completed",
+        );
+        assert.equal(completed.type, "turn.completed");
+        if (completed.type !== "turn.completed") {
+          return;
+        }
+
+        assert.equal(completed.payload.state, "failed");
+        assert.equal(completed.payload.stopReason, "error");
+        assert.equal(completed.payload.errorMessage, "kaboom");
       }),
     );
   });

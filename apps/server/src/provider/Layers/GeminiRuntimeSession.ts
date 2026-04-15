@@ -34,8 +34,10 @@ import {
   type ToolConfirmationPayload,
   type ToolConfirmationRequest,
 } from "@google/gemini-cli-core";
+import { Cause, Data, Effect, Exit, type Fiber } from "effect";
 import { resolveGeminiApprovalMode } from "./GeminiCoreConfig";
 import {
+  GeminiStreamProcessorError,
   processGeminiStreamEvents,
   type GeminiStreamTerminalTurnResult,
 } from "./GeminiStreamProcessor";
@@ -59,6 +61,7 @@ import {
   type GeminiResumeState,
   type GeminiTrackedTurn,
   type GeminiTurnState,
+  type GeminiUsageCounts,
 } from "./GeminiRuntimeHelpers";
 
 interface GeminiRuntimeSessionInput {
@@ -68,11 +71,14 @@ interface GeminiRuntimeSessionInput {
   readonly resumeState: GeminiResumeState | undefined;
   readonly getPreferredEditor: () => EditorType | undefined;
   readonly emitEvent: (event: ProviderRuntimeEvent) => void;
-  readonly persistBinding: (
-    binding: ReturnType<typeof buildGeminiPersistedBinding>,
-  ) => void;
+  readonly persistBinding: (binding: ReturnType<typeof buildGeminiPersistedBinding>) => void;
   readonly writeNativeRecord?: (record: unknown, threadId: ThreadId) => void;
   readonly getActiveSessions: () => ReadonlyArray<GeminiRuntimeSession>;
+  readonly turnRuntime: {
+    readonly fork: (effect: Effect.Effect<void, never>) => Fiber.Fiber<void, never>;
+    readonly await: (fiber: Fiber.Fiber<void, never>) => Promise<void>;
+    readonly close: () => Promise<void>;
+  };
 }
 
 function toMessage(cause: unknown, fallback: string): string {
@@ -95,6 +101,11 @@ function buildPendingId(prefix: "req" | "user-input"): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+class GeminiToolSchedulingError extends Data.TaggedError("GeminiToolSchedulingError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
 function requestTypeFromConfirmation(
   toolName: string,
   confirmation: Exclude<SerializableConfirmationDetails, { type: "ask_user" }>,
@@ -102,10 +113,7 @@ function requestTypeFromConfirmation(
   if (confirmation.type === "edit") {
     return "file_change_approval" as const;
   }
-  if (
-    confirmation.type === "exec" ||
-    confirmation.type === "sandbox_expansion"
-  ) {
+  if (confirmation.type === "exec" || confirmation.type === "sandbox_expansion") {
     return "exec_command_approval" as const;
   }
   return classifyRequestTypeForTool(toolName);
@@ -121,9 +129,7 @@ function detailFromConfirmation(
     case "exec":
       return confirmation.command || "Execute command";
     case "sandbox_expansion":
-      return (
-        confirmation.command || confirmation.rootCommand || "Expand sandbox"
-      );
+      return confirmation.command || confirmation.rootCommand || "Expand sandbox";
     case "mcp":
       return `MCP: ${confirmation.toolDisplayName || confirmation.toolName || toolName}`;
     case "exit_plan_mode":
@@ -138,15 +144,12 @@ function detailFromConfirmation(
 export class GeminiRuntimeSession {
   private readonly emitEvent: (event: ProviderRuntimeEvent) => void;
   private readonly pendingApprovals = new Map<string, GeminiPendingApproval>();
-  private readonly pendingUserInputs = new Map<
-    string,
-    GeminiPendingUserInput
-  >();
+  private readonly pendingUserInputs = new Map<string, GeminiPendingUserInput>();
   private readonly turns: Array<GeminiTrackedTurn>;
   private readonly messageBusUnsubscribers: Array<() => void> = [];
   private readonly toolBridge: GeminiToolSchedulerBridge;
   private readonly messageBus: MessageBus;
-  private activeStreamPromise: Promise<void> | undefined;
+  private activeTurnFiber: Fiber.Fiber<void, never> | undefined;
   private eventCounter = 0;
   private turnState: GeminiTurnState | undefined = undefined;
   private abortController = new AbortController();
@@ -155,26 +158,21 @@ export class GeminiRuntimeSession {
   private assistantMessageSegment = 0;
   private assistantMessageText = "";
   private assistantItemStarted = false;
-  private cumulativeInputTokens = 0;
-  private cumulativeOutputTokens = 0;
+  private lastKnownUsage: GeminiUsageCounts | undefined;
+  private totalProcessedTokens = 0;
   stopped = false;
 
   constructor(private readonly input: GeminiRuntimeSessionInput) {
     this.emitEvent = input.emitEvent;
-    this.messageBus = patchGeminiMessageBusForScheduler(
-      input.config.getMessageBus(),
-    );
-    this.turns = Array.from(
-      { length: input.resumeState?.turnCount ?? 0 },
-      (_, index) => {
-        const historyLength = input.resumeState?.turnHistoryLengths?.[index];
-        return {
-          id: `restored-turn-${index}`,
-          items: [],
-          ...(historyLength !== undefined ? { historyLength } : {}),
-        };
-      },
-    );
+    this.messageBus = patchGeminiMessageBusForScheduler(input.config.getMessageBus());
+    this.turns = Array.from({ length: input.resumeState?.turnCount ?? 0 }, (_, index) => {
+      const historyLength = input.resumeState?.turnHistoryLengths?.[index];
+      return {
+        id: `restored-turn-${index}`,
+        items: [],
+        ...(historyLength !== undefined ? { historyLength } : {}),
+      };
+    });
     this.updateResumeCursor();
 
     this.toolBridge = new GeminiToolSchedulerBridge({
@@ -195,8 +193,7 @@ export class GeminiRuntimeSession {
         emitEvent: (event) => this.emitEvent(event),
         makeEventBase: () => this.makeEventBase(),
         finalizeAssistantSegment: () => this.finalizeAssistantSegment(),
-        onPlanCaptured: (planMarkdown) =>
-          this.emitProposedPlanCompleted(planMarkdown),
+        onPlanCaptured: (planMarkdown) => this.emitProposedPlanCompleted(planMarkdown),
         onApprovalRequested: (approval) => this.openApprovalRequest(approval),
       },
     });
@@ -210,10 +207,8 @@ export class GeminiRuntimeSession {
   }
 
   startTurn(input: ProviderSendTurnInput): ProviderTurnStartResult {
-    if (this.turnState || this.activeStreamPromise) {
-      throw new Error(
-        `Session "${this.session.threadId}" already has an active turn.`,
-      );
+    if (this.hasActiveTurnExecution()) {
+      throw new Error(`Session "${this.session.threadId}" already has an active turn.`);
     }
 
     restoreGeminiHistoryFromResumeCursor({
@@ -266,10 +261,18 @@ export class GeminiRuntimeSession {
     } as ProviderRuntimeEvent);
 
     const promptText = input.input?.trim() ?? "";
-    this.activeStreamPromise = this.runStreamLoop(promptText).finally(() => {
-      this.activeStreamPromise = undefined;
+    const turnFiber = this.input.turnRuntime.fork(
+      this.runStreamLoop(promptText).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => this.handleTurnExit(exit)),
+      ),
+    );
+    this.activeTurnFiber = turnFiber;
+    turnFiber.addObserver(() => {
+      if (this.activeTurnFiber === turnFiber) {
+        this.activeTurnFiber = undefined;
+      }
     });
-    void this.activeStreamPromise.catch(() => undefined);
 
     return {
       threadId: input.threadId,
@@ -377,7 +380,18 @@ export class GeminiRuntimeSession {
     }
 
     this.cancelPendingInteractions();
-    await this.activeStreamPromise?.catch(() => undefined);
+    if (this.activeTurnFiber) {
+      try {
+        await this.input.turnRuntime.await(this.activeTurnFiber);
+      } catch {
+        // Best-effort shutdown only.
+      }
+    }
+    try {
+      await this.input.turnRuntime.close();
+    } catch {
+      // swallow scoped runtime cleanup failures
+    }
     this.toolBridge.dispose();
 
     try {
@@ -429,36 +443,35 @@ export class GeminiRuntimeSession {
 
   private makeEventBase(): Omit<ProviderRuntimeEvent, "type" | "payload"> {
     return {
-      eventId: EventId.makeUnsafe(
-        `evt-gemini-${Date.now()}-${++this.eventCounter}`,
-      ),
+      eventId: EventId.makeUnsafe(`evt-gemini-${Date.now()}-${++this.eventCounter}`),
       provider: GEMINI_PROVIDER,
       threadId: this.session.threadId,
       createdAt: new Date().toISOString(),
-      ...(this.turnState
-        ? { turnId: TurnIdBrand.makeUnsafe(this.turnState.turnId) }
-        : {}),
+      ...(this.turnState ? { turnId: TurnIdBrand.makeUnsafe(this.turnState.turnId) } : {}),
       providerRefs: {},
     };
   }
 
   private updateResumeCursor(): void {
-    (this.session as { resumeCursor?: unknown }).resumeCursor =
-      createGeminiResumeState({
-        geminiClient: this.input.geminiClient,
-        turns: this.turns,
-      });
+    (this.session as { resumeCursor?: unknown }).resumeCursor = createGeminiResumeState({
+      geminiClient: this.input.geminiClient,
+      turns: this.turns,
+    });
   }
 
   private setupRetryAttemptHandler(): void {
     const onRetryAttempt = (payload: RetryAttemptPayload): void => {
-      if (!this.turnState || !this.activeStreamPromise || this.stopped) {
+      if (!this.hasActiveTurnExecution() || this.stopped) {
+        return;
+      }
+
+      const turnState = this.turnState;
+      if (!turnState) {
         return;
       }
 
       const activeModel =
-        this.turnState.activeModel ??
-        this.input.geminiClient.getCurrentSequenceModel();
+        turnState.activeModel ?? this.input.geminiClient.getCurrentSequenceModel();
       const matchingLabels = new Set<string>();
       if (this.session.model) {
         matchingLabels.add(this.session.model);
@@ -472,36 +485,31 @@ export class GeminiRuntimeSession {
         return;
       }
 
-      const activeMatchingSessions = this.input
-        .getActiveSessions()
-        .filter((candidate) => {
-          if (
-            !candidate.turnState ||
-            !candidate.activeStreamPromise ||
-            candidate.stopped
-          ) {
-            return false;
-          }
+      const activeMatchingSessions = this.input.getActiveSessions().filter((candidate) => {
+        if (!candidate.hasActiveTurnExecution() || candidate.stopped) {
+          return false;
+        }
 
-          const candidateActiveModel =
-            candidate.turnState.activeModel ??
-            candidate.input.geminiClient.getCurrentSequenceModel();
-          const candidateLabels = new Set<string>();
-          if (candidate.session.model) {
-            candidateLabels.add(candidate.session.model);
-            candidateLabels.add(getDisplayString(candidate.session.model));
-          }
-          if (candidateActiveModel) {
-            candidateLabels.add(candidateActiveModel);
-            candidateLabels.add(getDisplayString(candidateActiveModel));
-          }
-          return candidateLabels.has(payload.model);
-        });
+        const candidateTurnState = candidate.turnState;
+        if (!candidateTurnState) {
+          return false;
+        }
 
-      if (
-        activeMatchingSessions.length !== 1 ||
-        activeMatchingSessions[0] !== this
-      ) {
+        const candidateActiveModel =
+          candidateTurnState.activeModel ?? candidate.input.geminiClient.getCurrentSequenceModel();
+        const candidateLabels = new Set<string>();
+        if (candidate.session.model) {
+          candidateLabels.add(candidate.session.model);
+          candidateLabels.add(getDisplayString(candidate.session.model));
+        }
+        if (candidateActiveModel) {
+          candidateLabels.add(candidateActiveModel);
+          candidateLabels.add(getDisplayString(candidateActiveModel));
+        }
+        return candidateLabels.has(payload.model);
+      });
+
+      if (activeMatchingSessions.length !== 1 || activeMatchingSessions[0] !== this) {
         return;
       }
 
@@ -555,10 +563,7 @@ export class GeminiRuntimeSession {
       );
     });
 
-    const handleAskUser = (request: {
-      correlationId: string;
-      questions: unknown;
-    }): void => {
+    const handleAskUser = (request: { correlationId: string; questions: unknown }): void => {
       if (this.stopped || !this.turnState) {
         return;
       }
@@ -570,15 +575,9 @@ export class GeminiRuntimeSession {
       });
     };
 
-    this.messageBus.subscribe(
-      MessageBusType.ASK_USER_REQUEST,
-      handleAskUser as never,
-    );
+    this.messageBus.subscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as never);
     this.messageBusUnsubscribers.push(() => {
-      this.messageBus.unsubscribe(
-        MessageBusType.ASK_USER_REQUEST,
-        handleAskUser as never,
-      );
+      this.messageBus.unsubscribe(MessageBusType.ASK_USER_REQUEST, handleAskUser as never);
     });
   }
 
@@ -606,10 +605,7 @@ export class GeminiRuntimeSession {
       return;
     }
 
-    if (
-      this.userRequestedMode !== "plan" &&
-      this.session.runtimeMode === "full-access"
-    ) {
+    if (this.userRequestedMode !== "plan" && this.session.runtimeMode === "full-access") {
       this.publishDeferredToolConfirmationResponse({
         correlationId: input.correlationId,
         confirmed: true,
@@ -626,10 +622,7 @@ export class GeminiRuntimeSession {
     }
 
     const requestId = buildPendingId("req");
-    const requestType = requestTypeFromConfirmation(
-      input.toolName,
-      input.details,
-    );
+    const requestType = requestTypeFromConfirmation(input.toolName, input.details);
     const detail = detailFromConfirmation(input.toolName, input.details);
     this.pendingApprovals.set(requestId, {
       requestType,
@@ -713,11 +706,7 @@ export class GeminiRuntimeSession {
   }
 
   private ensureAssistantSegmentStarted(): void {
-    if (
-      !this.turnState ||
-      this.assistantItemStarted ||
-      this.planModeTextSuppressed
-    ) {
+    if (!this.turnState || this.assistantItemStarted || this.planModeTextSuppressed) {
       return;
     }
 
@@ -738,10 +727,7 @@ export class GeminiRuntimeSession {
       return;
     }
 
-    const { nextText, delta } = applyGeminiAssistantTextChunk(
-      this.assistantMessageText,
-      text,
-    );
+    const { nextText, delta } = applyGeminiAssistantTextChunk(this.assistantMessageText, text);
     this.assistantMessageText = nextText;
     if (delta.length === 0) {
       return;
@@ -772,9 +758,7 @@ export class GeminiRuntimeSession {
         itemType: "assistant_message",
         status: "completed",
         title: "Assistant message",
-        ...(this.assistantMessageText.length > 0
-          ? { detail: this.assistantMessageText }
-          : {}),
+        ...(this.assistantMessageText.length > 0 ? { detail: this.assistantMessageText } : {}),
       },
     } as ProviderRuntimeEvent);
 
@@ -845,10 +829,7 @@ export class GeminiRuntimeSession {
     } as ProviderRuntimeEvent);
   }
 
-  private handleGeminiModelInfo(
-    model: string,
-    event: ServerGeminiStreamEvent,
-  ): void {
+  private handleGeminiModelInfo(model: string, event: ServerGeminiStreamEvent): void {
     if (!this.turnState) {
       return;
     }
@@ -901,9 +882,7 @@ export class GeminiRuntimeSession {
           createdAt: new Date().toISOString(),
           method: `gemini/${event.type}`,
           providerThreadId: String(this.session.threadId),
-          ...(this.turnState
-            ? { turnId: TurnIdBrand.makeUnsafe(this.turnState.turnId) }
-            : {}),
+          ...(this.turnState ? { turnId: TurnIdBrand.makeUnsafe(this.turnState.turnId) } : {}),
           payload: event,
         },
       },
@@ -911,130 +890,182 @@ export class GeminiRuntimeSession {
     );
   }
 
-  private async runStreamLoop(promptText: string): Promise<void> {
+  private hasActiveTurnExecution(): boolean {
+    return this.turnState !== undefined && this.activeTurnFiber !== undefined;
+  }
+
+  private interruptedTurnResult(): GeminiStreamTerminalTurnResult {
+    return {
+      state: "interrupted",
+      stopReason: "aborted",
+    };
+  }
+
+  private defaultTurnCompletion(): GeminiStreamTerminalTurnResult {
+    return this.abortController.signal.aborted
+      ? this.interruptedTurnResult()
+      : {
+          state: "completed",
+          stopReason: "completed",
+        };
+  }
+
+  private resolveTurnCompletion(
+    exit: Exit.Exit<
+      GeminiStreamTerminalTurnResult | undefined,
+      GeminiStreamProcessorError | GeminiToolSchedulingError
+    >,
+  ): GeminiStreamTerminalTurnResult {
+    if (Exit.isSuccess(exit)) {
+      return exit.value ?? this.defaultTurnCompletion();
+    }
+
+    if (this.abortController.signal.aborted || Cause.hasInterruptsOnly(exit.cause)) {
+      return this.interruptedTurnResult();
+    }
+
+    return {
+      state: "failed",
+      stopReason: "error",
+      errorMessage: toMessage(Cause.squash(exit.cause), "Stream error"),
+    };
+  }
+
+  private completeTurnEffect(result: GeminiStreamTerminalTurnResult): Effect.Effect<void> {
+    return Effect.sync(() => {
+      this.completeTurn(result.state, result.stopReason, result.errorMessage);
+    });
+  }
+
+  private handleTurnExit(
+    exit: Exit.Exit<
+      GeminiStreamTerminalTurnResult | undefined,
+      GeminiStreamProcessorError | GeminiToolSchedulingError
+    >,
+  ): Effect.Effect<void> {
+    return this.completeTurnEffect(this.resolveTurnCompletion(exit));
+  }
+
+  private runStreamLoop(
+    promptText: string,
+  ): Effect.Effect<
+    GeminiStreamTerminalTurnResult | undefined,
+    GeminiStreamProcessorError | GeminiToolSchedulingError
+  > {
     const promptId = `prompt-${Date.now()}`;
     const baseSystemInstruction = getCoreSystemPrompt(
       this.input.config,
       this.input.config.getSystemInstructionMemory(),
     );
-    this.input.geminiClient
-      .getChat()
-      .setSystemInstruction(baseSystemInstruction);
+    this.input.geminiClient.getChat().setSystemInstruction(baseSystemInstruction);
 
-    let nextRequest: PartListUnion | null = [{ text: promptText }];
-    let displayContent: PartListUnion | undefined = promptText;
-    let terminalTurnResult: GeminiStreamTerminalTurnResult | undefined;
+    return this.runStreamRound({
+      promptId,
+      nextRequest: [{ text: promptText }],
+      displayContent: promptText,
+    });
+  }
 
-    try {
-      while (nextRequest !== null && this.turnState && !this.stopped) {
+  private runStreamRound(input: {
+    readonly promptId: string;
+    readonly nextRequest: PartListUnion | null;
+    readonly displayContent?: PartListUnion;
+  }): Effect.Effect<
+    GeminiStreamTerminalTurnResult | undefined,
+    GeminiStreamProcessorError | GeminiToolSchedulingError
+  > {
+    if (input.nextRequest === null || !this.turnState || this.stopped) {
+      return Effect.void.pipe(Effect.as(undefined));
+    }
+
+    if (this.abortController.signal.aborted) {
+      return Effect.succeed(this.interruptedTurnResult());
+    }
+
+    const responseStream = this.input.geminiClient.sendMessageStream(
+      input.nextRequest,
+      this.abortController.signal,
+      input.promptId,
+      undefined,
+      false,
+      input.displayContent,
+    );
+
+    return processGeminiStreamEvents({
+      stream: responseStream,
+      geminiClient: this.input.geminiClient,
+      sessionModel: this.session.model,
+      turnState: this.turnState,
+      onNativeEvent: (event) => this.emitNativeEvent(event),
+      onThought: (text) => this.emitReasoningText(text),
+      onContent: (text) => this.emitAssistantText(text),
+      onModelInfo: (model, event) => this.handleGeminiModelInfo(model, event),
+      onRuntimeWarning: (message, detail, event) => this.emitRuntimeWarning(message, detail, event),
+      onUsage: (usage) => {
+        this.lastKnownUsage = usage;
+        this.totalProcessedTokens += usage.totalTokens;
+      },
+    }).pipe(
+      Effect.flatMap((processed) => {
         if (this.abortController.signal.aborted) {
-          this.completeTurn("interrupted", "aborted");
-          return;
-        }
-
-        const responseStream = this.input.geminiClient.sendMessageStream(
-          nextRequest,
-          this.abortController.signal,
-          promptId,
-          undefined,
-          false,
-          displayContent,
-        );
-        nextRequest = null;
-        displayContent = undefined;
-
-        const processed = await processGeminiStreamEvents({
-          stream: responseStream,
-          geminiClient: this.input.geminiClient,
-          sessionModel: this.session.model,
-          turnState: this.turnState,
-          onNativeEvent: (event) => this.emitNativeEvent(event),
-          onThought: (text) => this.emitReasoningText(text),
-          onContent: (text) => this.emitAssistantText(text),
-          onModelInfo: (model, event) =>
-            this.handleGeminiModelInfo(model, event),
-          onRuntimeWarning: (message, detail, event) =>
-            this.emitRuntimeWarning(message, detail, event),
-          onUsage: (inputTokens, outputTokens) => {
-            this.cumulativeInputTokens += inputTokens;
-            this.cumulativeOutputTokens += outputTokens;
-          },
-        });
-
-        if (this.abortController.signal.aborted) {
-          this.completeTurn("interrupted", "aborted");
-          return;
+          return Effect.succeed(this.interruptedTurnResult());
         }
 
         if (processed.terminalTurnResult) {
-          terminalTurnResult = processed.terminalTurnResult;
-          break;
+          return Effect.succeed(processed.terminalTurnResult);
         }
 
         if (processed.toolCallRequests.length === 0) {
-          break;
+          return Effect.void.pipe(Effect.as(undefined));
         }
 
-        const scheduled = await this.toolBridge.scheduleToolCalls(
-          processed.toolCallRequests,
-          this.abortController.signal,
+        return Effect.tryPromise({
+          try: () =>
+            this.toolBridge.scheduleToolCalls(
+              processed.toolCallRequests,
+              this.abortController.signal,
+            ),
+          catch: (cause) =>
+            new GeminiToolSchedulingError({
+              message: toMessage(cause, "Failed to schedule Gemini tool calls."),
+              cause,
+            }),
+        }).pipe(
+          Effect.flatMap((scheduled) => {
+            if (this.abortController.signal.aborted) {
+              return Effect.succeed(this.interruptedTurnResult());
+            }
+
+            if (scheduled.stopExecution) {
+              return Effect.succeed({
+                state: "completed" as const,
+                stopReason: "tool_requested_stop",
+              });
+            }
+
+            if (scheduled.fatalError) {
+              return Effect.succeed({
+                state: "failed" as const,
+                stopReason: "fatal_tool_error",
+                errorMessage: scheduled.fatalError.message,
+              });
+            }
+
+            if (scheduled.allCancelled) {
+              return Effect.succeed({
+                state: "cancelled" as const,
+                stopReason: "tool_execution_cancelled",
+              });
+            }
+
+            return this.runStreamRound({
+              promptId: input.promptId,
+              nextRequest: [...scheduled.responseParts],
+            });
+          }),
         );
-
-        if (this.abortController.signal.aborted) {
-          this.completeTurn("interrupted", "aborted");
-          return;
-        }
-
-        if (scheduled.stopExecution) {
-          terminalTurnResult = {
-            state: "completed",
-            stopReason: "tool_requested_stop",
-          };
-          break;
-        }
-
-        if (scheduled.fatalError) {
-          terminalTurnResult = {
-            state: "failed",
-            stopReason: "fatal_tool_error",
-            errorMessage: scheduled.fatalError.message,
-          };
-          break;
-        }
-
-        if (scheduled.allCancelled) {
-          terminalTurnResult = {
-            state: "cancelled",
-            stopReason: "tool_execution_cancelled",
-          };
-          break;
-        }
-
-        nextRequest = [...scheduled.responseParts];
-      }
-
-      if (this.turnState) {
-        if (terminalTurnResult) {
-          this.completeTurn(
-            terminalTurnResult.state,
-            terminalTurnResult.stopReason,
-            terminalTurnResult.errorMessage,
-          );
-        } else {
-          this.completeTurn(
-            this.abortController.signal.aborted ? "interrupted" : "completed",
-            this.abortController.signal.aborted ? "aborted" : "completed",
-          );
-        }
-      }
-    } catch (error) {
-      if (this.abortController.signal.aborted) {
-        this.completeTurn("interrupted", "aborted");
-        return;
-      }
-
-      this.completeTurn("failed", "error", toMessage(error, "Stream error"));
-    }
+      }),
+    );
   }
 
   private cancelPendingInteractions(): void {
@@ -1103,17 +1134,22 @@ export class GeminiRuntimeSession {
 
     this.cancelPendingInteractions();
 
-    const tokenUsage = buildTokenUsageSnapshot({
-      cumulativeInputTokens: this.cumulativeInputTokens,
-      cumulativeOutputTokens: this.cumulativeOutputTokens,
-    });
-    this.emitEvent({
-      ...this.makeEventBase(),
-      type: "thread.token-usage.updated",
-      payload: {
-        usage: tokenUsage,
-      },
-    } as ProviderRuntimeEvent);
+    const tokenUsage = this.lastKnownUsage
+      ? buildTokenUsageSnapshot({
+          usage: this.lastKnownUsage,
+          totalProcessedTokens: this.totalProcessedTokens,
+          model: this.turnState?.activeModel ?? this.session.model,
+        })
+      : undefined;
+    if (tokenUsage) {
+      this.emitEvent({
+        ...this.makeEventBase(),
+        type: "thread.token-usage.updated",
+        payload: {
+          usage: tokenUsage,
+        },
+      } as ProviderRuntimeEvent);
+    }
 
     const turnId = this.turnState.turnId;
     if (state === "completed") {
@@ -1132,11 +1168,7 @@ export class GeminiRuntimeSession {
       updatedAt: string;
       lastError?: string;
     };
-    mutableSession.status = this.stopped
-      ? "closed"
-      : state === "failed"
-        ? "error"
-        : "ready";
+    mutableSession.status = this.stopped ? "closed" : state === "failed" ? "error" : "ready";
     mutableSession.activeTurnId = undefined;
     mutableSession.updatedAt = completedAt;
     if (errorMessage) {
@@ -1160,7 +1192,7 @@ export class GeminiRuntimeSession {
       payload: {
         state,
         stopReason,
-        usage: tokenUsage,
+        ...(tokenUsage ? { usage: tokenUsage } : {}),
         ...(errorMessage ? { errorMessage } : {}),
       },
     } as ProviderRuntimeEvent);
@@ -1177,8 +1209,6 @@ export class GeminiRuntimeSession {
   }
 }
 
-export function restoreGeminiResumeHistory(
-  resumeCursor: unknown,
-): GeminiResumeState | undefined {
+export function restoreGeminiResumeHistory(resumeCursor: unknown): GeminiResumeState | undefined {
   return readGeminiResumeState(resumeCursor);
 }

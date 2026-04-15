@@ -10,7 +10,7 @@
 import type { ProviderRuntimeEvent, ProviderSession, ThreadId } from "@t3tools/contracts";
 import { EventId } from "@t3tools/contracts";
 import type { Config } from "@google/gemini-cli-core";
-import { Effect, Layer, Queue, Stream } from "effect";
+import { Effect, Exit, Fiber, Layer, Queue, Scope, Stream } from "effect";
 import {
   installGeminiCliCustomHeaders,
   resolveGeminiApprovalMode,
@@ -118,6 +118,8 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* (
   const sessionDirectory = yield* ProviderSessionDirectory;
   const services = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(services);
+  const runPromise = Effect.runPromiseWith(services);
+  const runSync = Effect.runSyncWith(services);
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const nativeEventLogger =
     options?.nativeEventLogger ??
@@ -128,7 +130,7 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* (
       : undefined);
 
   const emit = (event: ProviderRuntimeEvent): void => {
-    Effect.runSyncWith(services)(Queue.offer(runtimeEventQueue, event));
+    runSync(Queue.offer(runtimeEventQueue, event));
   };
 
   const persistBinding = (binding: ProviderRuntimeBinding): void => {
@@ -318,6 +320,7 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* (
         updatedAt: now,
       };
 
+      const turnScope = yield* Scope.make("sequential");
       const runtimeSession = new GeminiRuntimeSession({
         session,
         config,
@@ -328,6 +331,17 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* (
         persistBinding,
         writeNativeRecord: (record, nativeThreadId) => writeNativeRecord(record, nativeThreadId),
         getActiveSessions: () => Array.from(sessions.values()),
+        turnRuntime: {
+          fork: (effect) =>
+            runSync(
+              effect.pipe(
+                Effect.forkScoped({ startImmediately: true }),
+                Effect.provideService(Scope.Scope, turnScope),
+              ),
+            ),
+          await: (fiber) => runPromise(Fiber.await(fiber).pipe(Effect.asVoid)),
+          close: () => runPromise(Scope.close(turnScope, Exit.void)),
+        },
       });
       sessions.set(threadId, runtimeSession);
 
