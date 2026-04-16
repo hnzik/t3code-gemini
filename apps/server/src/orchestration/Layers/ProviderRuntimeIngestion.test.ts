@@ -1928,6 +1928,9 @@ describe("ProviderRuntimeIngestion", () => {
       threadId: asThreadId("thread-1"),
       turnId: asTurnId("turn-p1"),
       itemId: asItemId("item-p1-tool"),
+      providerRefs: {
+        providerItemId: ProviderItemId.make("provider-tool-1"),
+      },
       payload: {
         itemType: "command_execution",
         status: "in_progress",
@@ -2003,6 +2006,7 @@ describe("ProviderRuntimeIngestion", () => {
     expect(toolUpdate?.kind).toBe("tool.updated");
     expect(toolUpdatePayload?.itemType).toBe("command_execution");
     expect(toolUpdatePayload?.status).toBe("in_progress");
+    expect(toolUpdatePayload?.providerItemId).toBe("provider-tool-1");
 
     const warning = thread.activities.find(
       (activity: ProviderRuntimeTestActivity) => activity.id === "evt-runtime-warning",

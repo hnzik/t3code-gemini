@@ -8,6 +8,7 @@ import {
   hasContextWindowOption,
   hasEffortLevel,
   isClaudeUltrathinkPrompt,
+  normalizeAntigravityModelOptionsWithCapabilities,
   normalizeClaudeModelOptionsWithCapabilities,
   normalizeCodexModelOptionsWithCapabilities,
   normalizeModelSlug,
@@ -281,5 +282,35 @@ describe("normalize*ModelOptionsWithCapabilities", () => {
     ).toEqual({
       thinking: true,
     });
+  });
+
+  it("preserves the default Antigravity context window explicitly", () => {
+    expect(
+      normalizeAntigravityModelOptionsWithCapabilities(
+        {
+          reasoningEffortLevels: [],
+          supportsFastMode: false,
+          supportsThinkingToggle: false,
+          contextWindowOptions: [{ value: "1m", label: "1M", isDefault: true }],
+          promptInjectedEffortLevels: [],
+        },
+        {},
+      ),
+    ).toEqual({ contextWindow: "1m" });
+  });
+
+  it("omits unsupported Antigravity context window options", () => {
+    expect(
+      normalizeAntigravityModelOptionsWithCapabilities(
+        {
+          reasoningEffortLevels: [],
+          supportsFastMode: false,
+          supportsThinkingToggle: false,
+          contextWindowOptions: [],
+          promptInjectedEffortLevels: [],
+        },
+        { contextWindow: "1m" },
+      ),
+    ).toBeUndefined();
   });
 });

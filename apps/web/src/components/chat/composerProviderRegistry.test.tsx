@@ -110,6 +110,21 @@ const CLAUDE_MODELS_WITH_CONTEXT_WINDOW: ReadonlyArray<ServerProviderModel> = [
   },
 ];
 
+const ANTIGRAVITY_MODELS: ReadonlyArray<ServerProviderModel> = [
+  {
+    slug: "gemini-3.1-pro-high",
+    name: "Gemini 3.1 Pro High",
+    isCustom: false,
+    capabilities: {
+      reasoningEffortLevels: [],
+      supportsFastMode: false,
+      supportsThinkingToggle: false,
+      contextWindowOptions: [{ value: "1m", label: "1M", isDefault: true }],
+      promptInjectedEffortLevels: [],
+    },
+  },
+];
+
 describe("getComposerProviderState", () => {
   it("returns codex defaults when no codex draft options exist", () => {
     const state = getComposerProviderState({
@@ -419,6 +434,24 @@ describe("getComposerProviderState", () => {
     });
 
     expect(state.modelOptionsForDispatch).not.toHaveProperty("fastMode");
+  });
+
+  it("preserves the default Antigravity context window explicitly in dispatch options", () => {
+    const state = getComposerProviderState({
+      provider: "antigravity",
+      model: "gemini-3.1-pro-high",
+      models: ANTIGRAVITY_MODELS,
+      prompt: "",
+      modelOptions: undefined,
+    });
+
+    expect(state).toEqual({
+      provider: "antigravity",
+      promptEffort: null,
+      modelOptionsForDispatch: {
+        contextWindow: "1m",
+      },
+    });
   });
 });
 

@@ -23,6 +23,7 @@ const RuntimeEventRawSource = Schema.Literals([
   "codex.eventmsg",
   "claude.sdk.message",
   "claude.sdk.permission",
+  "antigravity.anthropic.stream",
   "codex.sdk.thread-event",
   "gemini.acp.session-update",
 ]);

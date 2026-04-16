@@ -103,6 +103,7 @@ function createBaseServerConfig(): ServerConfig {
       providers: {
         codex: { enabled: true, binaryPath: "", homePath: "", customModels: [] },
         claudeAgent: { enabled: true, binaryPath: "", customModels: [] },
+        antigravity: { enabled: true, baseUrl: "http://127.0.0.1:3117", customModels: [] },
         geminiAcp: { enabled: true, binaryPath: "", customModels: [] },
       },
     },

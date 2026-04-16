@@ -533,7 +533,12 @@ function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
 }
 
 function normalizeProviderKind(value: unknown): ProviderKind | null {
-  return value === "codex" || value === "claudeAgent" || value === "geminiAcp" ? value : null;
+  return value === "codex" ||
+    value === "claudeAgent" ||
+    value === "antigravity" ||
+    value === "geminiAcp"
+    ? value
+    : null;
 }
 
 function normalizeProviderModelOptions(
@@ -591,6 +596,7 @@ function normalizeProviderModelOptions(
     claudeCandidate?.effort === "low" ||
     claudeCandidate?.effort === "medium" ||
     claudeCandidate?.effort === "high" ||
+    claudeCandidate?.effort === "xhigh" ||
     claudeCandidate?.effort === "max" ||
     claudeCandidate?.effort === "ultrathink"
       ? claudeCandidate.effort
@@ -618,12 +624,40 @@ function normalizeProviderModelOptions(
         }
       : undefined;
 
-  if (!codex && !claude) {
+  const antigravityCandidate =
+    candidate?.antigravity && typeof candidate.antigravity === "object"
+      ? (candidate.antigravity as Record<string, unknown>)
+      : null;
+  const antigravityContextWindow =
+    typeof antigravityCandidate?.contextWindow === "string" &&
+    antigravityCandidate.contextWindow.length > 0
+      ? antigravityCandidate.contextWindow
+      : undefined;
+  const antigravity =
+    antigravityContextWindow !== undefined
+      ? { contextWindow: antigravityContextWindow }
+      : undefined;
+
+  const geminiCandidate =
+    candidate?.geminiAcp && typeof candidate.geminiAcp === "object"
+      ? (candidate.geminiAcp as Record<string, unknown>)
+      : null;
+  const geminiMode: "default" | "autoEdit" | "plan" | undefined =
+    geminiCandidate?.mode === "default" ||
+    geminiCandidate?.mode === "autoEdit" ||
+    geminiCandidate?.mode === "plan"
+      ? geminiCandidate.mode
+      : undefined;
+  const gemini = geminiMode !== undefined ? { mode: geminiMode } : undefined;
+
+  if (!codex && !claude && !antigravity && !gemini) {
     return null;
   }
   return {
     ...(codex ? { codex } : {}),
     ...(claude ? { claudeAgent: claude } : {}),
+    ...(antigravity ? { antigravity } : {}),
+    ...(gemini ? { geminiAcp: gemini } : {}),
   };
 }
 
@@ -654,7 +688,7 @@ function normalizeModelSelection(
     provider,
     provider === "codex" ? legacy?.legacyCodex : undefined,
   );
-  const options = provider === "codex" ? modelOptions?.codex : modelOptions?.claudeAgent;
+  const options = modelOptions?.[provider];
   return {
     provider,
     model,
@@ -720,7 +754,7 @@ function legacyToModelSelectionByProvider(
   const result: Partial<Record<ProviderKind, ModelSelection>> = {};
   // Add entries from the options bag (for non-active providers)
   if (modelOptions) {
-    for (const provider of ["codex", "claudeAgent", "geminiAcp"] as const) {
+    for (const provider of ["codex", "claudeAgent", "antigravity", "geminiAcp"] as const) {
       const options = modelOptions[provider];
       if (options && Object.keys(options).length > 0) {
         result[provider] = {
@@ -2258,7 +2292,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             }
             const base = existing ?? createEmptyThreadDraft();
             const nextMap = { ...base.modelSelectionByProvider };
-            for (const provider of ["codex", "claudeAgent", "geminiAcp"] as const) {
+            for (const provider of ["codex", "claudeAgent", "antigravity", "geminiAcp"] as const) {
               // Only touch providers explicitly present in the input
               if (!normalizedOpts || !(provider in normalizedOpts)) continue;
               const opts = normalizedOpts[provider];

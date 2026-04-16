@@ -1,4 +1,5 @@
 import {
+  type AntigravityModelOptions,
   type ClaudeModelOptions,
   type CodexModelOptions,
   type GeminiModelOptions,
@@ -64,8 +65,10 @@ function getRawContextWindow(
   provider: ProviderKind,
   modelOptions: ProviderOptions | null | undefined,
 ): string | null {
-  if (provider === "claudeAgent") {
-    return trimOrNull((modelOptions as ClaudeModelOptions | undefined)?.contextWindow);
+  if (provider === "claudeAgent" || provider === "antigravity") {
+    return trimOrNull(
+      (modelOptions as ClaudeModelOptions | AntigravityModelOptions | undefined)?.contextWindow,
+    );
   }
   return null;
 }
@@ -80,6 +83,12 @@ function buildNextOptions(
   }
   if (provider === "geminiAcp") {
     return { ...(modelOptions as GeminiModelOptions | undefined), ...patch } as GeminiModelOptions;
+  }
+  if (provider === "antigravity") {
+    return {
+      ...(modelOptions as AntigravityModelOptions | undefined),
+      ...patch,
+    } as AntigravityModelOptions;
   }
   return { ...(modelOptions as ClaudeModelOptions | undefined), ...patch } as ClaudeModelOptions;
 }

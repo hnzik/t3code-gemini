@@ -939,13 +939,315 @@ describe("deriveWorkLogEntries", () => {
 
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({
-      id: "tool-complete",
-      createdAt: "2026-02-23T00:00:03.000Z",
+      id: "tool-update-1",
+      createdAt: "2026-02-23T00:00:01.000Z",
       label: "Tool call completed",
       detail: 'Read: {"file_path":"/tmp/app.ts"}',
       command: "sed -n 1,40p /tmp/app.ts",
       itemType: "dynamic_tool_call",
       toolTitle: "Tool call",
+    });
+  });
+
+  it("collapses provider-scoped tool lifecycle rows even when titles and details change", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "tool-rename-update-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: "list_dir",
+          providerItemId: "srvu_123",
+        },
+      }),
+      makeActivity({
+        id: "tool-rename-update-2",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'list_directory: {"directory_path_uri":"file:///repo"}',
+          providerItemId: "srvu_123",
+        },
+      }),
+      makeActivity({
+        id: "tool-rename-complete",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "tool.completed",
+        summary: "Tool call completed",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'list_directory: {"directory_path_uri":"file:///repo"}',
+          providerItemId: "srvu_123",
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      id: "tool-rename-update-1",
+      createdAt: "2026-02-23T00:00:01.000Z",
+      label: "Tool call completed",
+      detail: 'list_directory: {"directory_path_uri":"file:///repo"}',
+    });
+  });
+
+  it("collapses semantically equivalent antigravity tool rows across renamed tools and path shapes", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "ag-tool-update-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'list_dir: {"DirectoryPath":"/Users/hnzik/Documents/GitHub/t3code"}',
+          data: {
+            toolName: "list_dir",
+            input: {
+              DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+            },
+            item: {
+              input: {
+                DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+              },
+            },
+          },
+          providerItemId: "tool-use-1",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-update-2",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail:
+            'list_directory: {"directory_path_uri":"file:///Users/hnzik/Documents/GitHub/t3code"}',
+          data: {
+            toolName: "list_directory",
+            input: {
+              directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+            },
+            item: {
+              input: {
+                directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+              },
+            },
+          },
+          providerItemId: "tool-use-2",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-complete-1",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "tool.completed",
+        summary: "Tool call completed",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail:
+            'list_directory: {"directory_path_uri":"file:///Users/hnzik/Documents/GitHub/t3code"}',
+          data: {
+            toolName: "list_directory",
+            input: {
+              directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+            },
+            item: {
+              input: {
+                directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+              },
+            },
+          },
+          providerItemId: "tool-use-2",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-complete-2",
+        createdAt: "2026-02-23T00:00:04.000Z",
+        kind: "tool.completed",
+        summary: "Tool call completed",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: "list_dir",
+          data: {
+            toolName: "list_dir",
+            input: {
+              DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+            },
+            item: {
+              input: {
+                DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+              },
+            },
+          },
+          providerItemId: "tool-use-1",
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      id: "ag-tool-update-1",
+      createdAt: "2026-02-23T00:00:01.000Z",
+      label: "Tool call completed",
+      detail:
+        'list_directory: {"directory_path_uri":"file:///Users/hnzik/Documents/GitHub/t3code"}',
+    });
+  });
+
+  it("keeps antigravity tool deduplication intact when reasoning events interleave the lifecycle", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "reasoning-progress-1",
+        createdAt: "2026-02-23T00:00:00.500Z",
+        kind: "task.progress",
+        summary: "Reasoning update",
+        tone: "thinking",
+        payload: {
+          detail: "**Prioritizing Tool Usage**",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-update-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail:
+            'list_dir: {"DirectoryPath":"/Users/hnzik/Documents/GitHub/t3code","toolAction":"Listing directory contents","toolSummary":"List directory"}',
+          data: {
+            toolName: "list_dir",
+            input: {
+              DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+              toolAction: "Listing directory contents",
+              toolSummary: "List directory",
+            },
+            item: {
+              input: {
+                DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+                toolAction: "Listing directory contents",
+                toolSummary: "List directory",
+              },
+            },
+          },
+          providerItemId: "toolu_4_0",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-update-2",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail:
+            'list_directory: {"directory_path_uri":"file:///Users/hnzik/Documents/GitHub/t3code"}',
+          data: {
+            toolName: "list_directory",
+            input: {
+              directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+            },
+            item: {
+              input: {
+                directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+              },
+            },
+          },
+          providerItemId: "srvu_5_0",
+        },
+      }),
+      makeActivity({
+        id: "reasoning-progress-2",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "task.progress",
+        summary: "Reasoning update",
+        tone: "thinking",
+        payload: {
+          detail: "**Refining Tool Application**",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-complete-1",
+        createdAt: "2026-02-23T00:00:04.000Z",
+        kind: "tool.completed",
+        summary: "Tool call completed",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail:
+            'list_dir: {"DirectoryPath":"/Users/hnzik/Documents/GitHub/t3code","toolAction":"Listing directory contents","toolSummary":"List directory"}',
+          data: {
+            toolName: "list_dir",
+            input: {
+              DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+              toolAction: "Listing directory contents",
+              toolSummary: "List directory",
+            },
+            item: {
+              input: {
+                DirectoryPath: "/Users/hnzik/Documents/GitHub/t3code",
+                toolAction: "Listing directory contents",
+                toolSummary: "List directory",
+              },
+            },
+          },
+          providerItemId: "toolu_4_0",
+        },
+      }),
+      makeActivity({
+        id: "ag-tool-complete-2",
+        createdAt: "2026-02-23T00:00:05.000Z",
+        kind: "tool.completed",
+        summary: "Tool call completed",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail:
+            'list_directory: {"directory_path_uri":"file:///Users/hnzik/Documents/GitHub/t3code"}',
+          data: {
+            toolName: "list_directory",
+            input: {
+              directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+            },
+            item: {
+              input: {
+                directory_path_uri: "file:///Users/hnzik/Documents/GitHub/t3code",
+              },
+            },
+          },
+          providerItemId: "srvu_5_0",
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+    const toolEntries = entries.filter((entry) => entry.tone === "tool");
+
+    expect(toolEntries).toHaveLength(1);
+    expect(toolEntries[0]).toMatchObject({
+      id: "ag-tool-update-1",
+      createdAt: "2026-02-23T00:00:01.000Z",
+      label: "Tool call completed",
+      detail:
+        'list_dir: {"DirectoryPath":"/Users/hnzik/Documents/GitHub/t3code","toolAction":"Listing directory contents","toolSummary":"List directory"}',
     });
   });
 
@@ -1081,7 +1383,7 @@ describe("deriveWorkLogEntries", () => {
 
     const entries = deriveWorkLogEntries(activities, undefined);
 
-    expect(entries.map((entry) => entry.id)).toEqual(["tool-1-complete", "tool-2-complete"]);
+    expect(entries.map((entry) => entry.id)).toEqual(["tool-1-update", "tool-2-update"]);
   });
 
   it("collapses same-timestamp lifecycle rows even when completed sorts before updated by id", () => {
@@ -1124,7 +1426,7 @@ describe("deriveWorkLogEntries", () => {
     const entries = deriveWorkLogEntries(activities, undefined);
 
     expect(entries).toHaveLength(1);
-    expect(entries[0]?.id).toBe("a-complete-same-timestamp");
+    expect(entries[0]?.id).toBe("z-update-earlier");
   });
 });
 
@@ -1170,6 +1472,31 @@ describe("deriveTimelineEntries", () => {
         implementationThreadId: null,
       },
     });
+  });
+
+  it("places work entries before assistant messages when timestamps tie", () => {
+    const entries = deriveTimelineEntries(
+      [
+        {
+          id: MessageId.make("assistant-1"),
+          role: "assistant",
+          text: "hello",
+          createdAt: "2026-02-23T00:00:01.000Z",
+          streaming: false,
+        },
+      ],
+      [],
+      [
+        {
+          id: "work-1",
+          createdAt: "2026-02-23T00:00:01.000Z",
+          label: "Listed files",
+          tone: "tool",
+        },
+      ],
+    );
+
+    expect(entries.map((entry) => entry.id)).toEqual(["work-1", "assistant-1"]);
   });
 
   it("anchors the completion divider to latestTurn.assistantMessageId before timestamp fallback", () => {
@@ -1369,16 +1696,23 @@ describe("deriveActiveWorkStartedAt", () => {
 describe("PROVIDER_OPTIONS", () => {
   it("advertises Claude as available while keeping Cursor as a placeholder", () => {
     const claude = PROVIDER_OPTIONS.find((option) => option.value === "claudeAgent");
+    const antigravity = PROVIDER_OPTIONS.find((option) => option.value === "antigravity");
     const cursor = PROVIDER_OPTIONS.find((option) => option.value === "cursor");
     expect(PROVIDER_OPTIONS).toEqual([
       { value: "codex", label: "Codex", available: true },
       { value: "claudeAgent", label: "Claude", available: true },
+      { value: "antigravity", label: "Antigravity", available: true },
       { value: "geminiAcp", label: "Gemini", available: true },
       { value: "cursor", label: "Cursor", available: false },
     ]);
     expect(claude).toEqual({
       value: "claudeAgent",
       label: "Claude",
+      available: true,
+    });
+    expect(antigravity).toEqual({
+      value: "antigravity",
+      label: "Antigravity",
       available: true,
     });
     expect(cursor).toEqual({

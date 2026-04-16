@@ -1,6 +1,7 @@
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   MODEL_SLUG_ALIASES_BY_PROVIDER,
+  type AntigravityModelOptions,
   type ClaudeCodeEffort,
   type ClaudeModelOptions,
   type CodexModelOptions,
@@ -124,6 +125,15 @@ export function normalizeGeminiModelOptionsWithCapabilities(
 ): GeminiModelOptions | undefined {
   const mode = modelOptions?.mode;
   const nextOptions: GeminiModelOptions = mode === undefined ? {} : { mode };
+  return Object.keys(nextOptions).length > 0 ? nextOptions : undefined;
+}
+
+export function normalizeAntigravityModelOptionsWithCapabilities(
+  caps: ModelCapabilities,
+  modelOptions: AntigravityModelOptions | null | undefined,
+): AntigravityModelOptions | undefined {
+  const contextWindow = resolveContextWindow(caps, modelOptions?.contextWindow);
+  const nextOptions: AntigravityModelOptions = contextWindow !== undefined ? { contextWindow } : {};
   return Object.keys(nextOptions).length > 0 ? nextOptions : undefined;
 }
 

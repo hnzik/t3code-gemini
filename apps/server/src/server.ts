@@ -19,6 +19,7 @@ import { AnalyticsServiceLayerLive } from "./telemetry/Layers/AnalyticsService";
 import { makeEventNdjsonLogger } from "./provider/Layers/EventNdjsonLogger";
 import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory";
 import { ProviderSessionRuntimeRepositoryLive } from "./persistence/Layers/ProviderSessionRuntime";
+import { makeAntigravityAdapterLive } from "./provider/Layers/AntigravityAdapter";
 import { makeCodexAdapterLive } from "./provider/Layers/CodexAdapter";
 import { makeClaudeAdapterLive } from "./provider/Layers/ClaudeAdapter";
 import { makeGeminiAcpAdapterLive } from "./provider/Layers/GeminiAcpAdapter";
@@ -157,12 +158,14 @@ const ProviderLayerLive = Layer.unwrap(
     const claudeAdapterLayer = makeClaudeAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
     );
+    const antigravityAdapterLayer = makeAntigravityAdapterLive();
     const geminiAcpAdapterLayer = makeGeminiAcpAdapterLive(
       nativeEventLogger ? { nativeEventLogger } : undefined,
     ).pipe(Layer.provideMerge(GeminiAuthLayerLive));
     const adapterRegistryLayer = ProviderAdapterRegistryLive.pipe(
       Layer.provide(codexAdapterLayer),
       Layer.provide(claudeAdapterLayer),
+      Layer.provide(antigravityAdapterLayer),
       Layer.provide(geminiAcpAdapterLayer),
       Layer.provideMerge(providerSessionDirectoryLayer),
     );

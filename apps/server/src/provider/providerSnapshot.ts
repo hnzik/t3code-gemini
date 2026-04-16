@@ -103,11 +103,15 @@ export function providerModelsFromSettings(
   builtInModels: ReadonlyArray<ServerProviderModel>,
   provider: ServerProvider["provider"],
   customModels: ReadonlyArray<string>,
-  customModelCapabilities: ModelCapabilities,
+  customModelCapabilities: ModelCapabilities | ((slug: string) => ModelCapabilities),
 ): ReadonlyArray<ServerProviderModel> {
   const resolvedBuiltInModels = [...builtInModels];
   const seen = new Set(resolvedBuiltInModels.map((model) => model.slug));
   const customEntries: ServerProviderModel[] = [];
+  const resolveCustomModelCapabilities =
+    typeof customModelCapabilities === "function"
+      ? customModelCapabilities
+      : () => customModelCapabilities;
 
   for (const candidate of customModels) {
     const normalized = normalizeModelSlug(candidate, provider);
@@ -119,7 +123,7 @@ export function providerModelsFromSettings(
       slug: normalized,
       name: normalized,
       isCustom: true,
-      capabilities: customModelCapabilities,
+      capabilities: resolveCustomModelCapabilities(normalized),
     });
   }
 

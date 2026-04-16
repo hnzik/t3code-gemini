@@ -10,6 +10,7 @@ import type { DraftId } from "../../composerDraftStore";
 import { getProviderModelCapabilities } from "../../providerModels";
 import { TraitsMenuContent, TraitsPicker } from "./TraitsPicker";
 import {
+  normalizeAntigravityModelOptionsWithCapabilities,
   normalizeClaudeModelOptionsWithCapabilities,
   normalizeCodexModelOptionsWithCapabilities,
   normalizeGeminiModelOptionsWithCapabilities,
@@ -85,6 +86,11 @@ function getProviderStateFromCapabilities(
     normalizedOptions = normalizeCodexModelOptionsWithCapabilities(caps, providerOptions as any);
   } else if (provider === "claudeAgent") {
     normalizedOptions = normalizeClaudeModelOptionsWithCapabilities(caps, providerOptions as any);
+  } else if (provider === "antigravity") {
+    normalizedOptions = normalizeAntigravityModelOptionsWithCapabilities(
+      caps,
+      providerOptions as any,
+    );
   } else if (provider === "geminiAcp") {
     normalizedOptions = normalizeGeminiModelOptionsWithCapabilities(caps, providerOptions as any);
   }
@@ -195,6 +201,11 @@ const composerProviderRegistry: Record<ProviderKind, ProviderRegistryEntry> = {
           onPromptChange={onPromptChange}
         />
       ),
+  },
+  antigravity: {
+    getState: (input) => getProviderStateFromCapabilities(input),
+    renderTraitsMenuContent: () => null,
+    renderTraitsPicker: () => null,
   },
   geminiAcp: {
     getState: (input) => getProviderStateFromCapabilities(input),

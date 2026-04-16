@@ -29,6 +29,7 @@ export const PROVIDER_OPTIONS: Array<{
 }> = [
   { value: "codex", label: "Codex", available: true },
   { value: "claudeAgent", label: "Claude", available: true },
+  { value: "antigravity", label: "Antigravity", available: true },
   { value: "geminiAcp", label: "Gemini", available: true },
   { value: "cursor", label: "Cursor", available: false },
 ];
@@ -50,6 +51,9 @@ export interface WorkLogEntry {
 interface DerivedWorkLogEntry extends WorkLogEntry {
   activityKind: OrchestrationThreadActivity["kind"];
   collapseKey?: string;
+  providerItemId?: string;
+  semanticToolName?: string;
+  semanticInputKey?: string;
 }
 
 export interface PendingApproval {
@@ -479,7 +483,14 @@ export function deriveWorkLogEntries(
     .filter((activity) => !isPlanBoundaryToolActivity(activity))
     .map(toDerivedWorkLogEntry);
   return collapseDerivedWorkLogEntries(entries).map(
-    ({ activityKind: _activityKind, collapseKey: _collapseKey, ...entry }) => entry,
+    ({
+      activityKind: _activityKind,
+      collapseKey: _collapseKey,
+      providerItemId: _providerItemId,
+      semanticToolName: _semanticToolName,
+      semanticInputKey: _semanticInputKey,
+      ...entry
+    }) => entry,
   );
 }
 
@@ -512,6 +523,9 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   };
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
+  const providerItemId = extractWorkLogProviderItemId(payload);
+  const semanticToolName = extractWorkLogSemanticToolName(payload);
+  const semanticInputKey = extractWorkLogSemanticInputKey(payload);
   if (payload && typeof payload.detail === "string" && payload.detail.length > 0) {
     const detail = stripTrailingExitCode(payload.detail).output;
     if (detail) {
@@ -536,6 +550,15 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (requestKind) {
     entry.requestKind = requestKind;
   }
+  if (providerItemId) {
+    entry.providerItemId = providerItemId;
+  }
+  if (semanticToolName) {
+    entry.semanticToolName = semanticToolName;
+  }
+  if (semanticInputKey) {
+    entry.semanticInputKey = semanticInputKey;
+  }
   const collapseKey = deriveWorkLogCollapseKey(entry, payload);
   if (collapseKey) {
     entry.collapseKey = collapseKey;
@@ -546,37 +569,39 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
 function collapseDerivedWorkLogEntries(
   entries: ReadonlyArray<DerivedWorkLogEntry>,
 ): DerivedWorkLogEntry[] {
-  const collapsed: DerivedWorkLogEntry[] = [];
+  const collapsedAdjacentEntries: DerivedWorkLogEntry[] = [];
   for (const entry of entries) {
-    const previous = collapsed.at(-1);
+    const previous = collapsedAdjacentEntries.at(-1);
     if (previous && shouldCollapseWorkLogEntries(previous, entry)) {
-      collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
+      collapsedAdjacentEntries[collapsedAdjacentEntries.length - 1] = mergeDerivedWorkLogEntries(
+        previous,
+        entry,
+      );
       continue;
     }
-    collapsed.push(entry);
+    collapsedAdjacentEntries.push(entry);
   }
-  return collapsed;
+  return collapseInterleavedToolLifecycleEntries(collapsedAdjacentEntries);
 }
 
 function shouldCollapseWorkLogEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
-  if (previous.collapseKey === undefined || previous.collapseKey !== next.collapseKey) {
-    return false;
-  }
-
   if (previous.activityKind === "runtime.warning" && next.activityKind === "runtime.warning") {
-    return true;
+    return previous.collapseKey !== undefined && previous.collapseKey === next.collapseKey;
   }
 
-  if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(previous.activityKind)) {
     return false;
   }
-  if (next.activityKind !== "tool.updated" && next.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(next.activityKind)) {
     return false;
   }
-  return previous.activityKind !== "tool.completed";
+  if (previous.activityKind === "tool.completed") {
+    return next.activityKind === "tool.completed" && hasStrongToolLifecycleIdentity(previous, next);
+  }
+  return hasMatchingToolLifecycleIdentity(previous, next);
 }
 
 function mergeDerivedWorkLogEntries(
@@ -584,16 +609,27 @@ function mergeDerivedWorkLogEntries(
   next: DerivedWorkLogEntry,
 ): DerivedWorkLogEntry {
   const changedFiles = mergeChangedFiles(previous.changedFiles, next.changedFiles);
-  const detail = next.detail ?? previous.detail;
-  const command = next.command ?? previous.command;
-  const rawCommand = next.rawCommand ?? previous.rawCommand;
+  const detail = preferMoreSpecificString(previous.detail, next.detail);
+  const command = preferMoreSpecificString(previous.command, next.command);
+  const rawCommand = preferMoreSpecificString(previous.rawCommand, next.rawCommand);
   const toolTitle = next.toolTitle ?? previous.toolTitle;
   const itemType = next.itemType ?? previous.itemType;
   const requestKind = next.requestKind ?? previous.requestKind;
   const collapseKey = next.collapseKey ?? previous.collapseKey;
+  const providerItemId = next.providerItemId ?? previous.providerItemId;
+  const semanticToolName = next.semanticToolName ?? previous.semanticToolName;
+  const semanticInputKey = next.semanticInputKey ?? previous.semanticInputKey;
+  const preservePreviousAnchor =
+    isToolLifecycleActivityKind(previous.activityKind) &&
+    isToolLifecycleActivityKind(next.activityKind);
   return {
-    ...previous,
     ...next,
+    ...(preservePreviousAnchor
+      ? {
+          id: previous.id,
+          createdAt: previous.createdAt,
+        }
+      : {}),
     ...(detail ? { detail } : {}),
     ...(command ? { command } : {}),
     ...(rawCommand ? { rawCommand } : {}),
@@ -602,6 +638,9 @@ function mergeDerivedWorkLogEntries(
     ...(itemType ? { itemType } : {}),
     ...(requestKind ? { requestKind } : {}),
     ...(collapseKey ? { collapseKey } : {}),
+    ...(providerItemId ? { providerItemId } : {}),
+    ...(semanticToolName ? { semanticToolName } : {}),
+    ...(semanticInputKey ? { semanticInputKey } : {}),
   };
 }
 
@@ -614,6 +653,48 @@ function mergeChangedFiles(
     return [];
   }
   return [...new Set(merged)];
+}
+
+function collapseInterleavedToolLifecycleEntries(
+  entries: ReadonlyArray<DerivedWorkLogEntry>,
+): DerivedWorkLogEntry[] {
+  const collapsed: DerivedWorkLogEntry[] = [];
+  const openToolEntryByIdentity = new Map<string, { index: number; closed: boolean }>();
+
+  for (const entry of entries) {
+    if (!isToolLifecycleActivityKind(entry.activityKind)) {
+      collapsed.push(entry);
+      continue;
+    }
+
+    const strongIdentity = deriveStrongToolLifecycleIdentity(entry);
+    if (!strongIdentity) {
+      collapsed.push(entry);
+      continue;
+    }
+
+    const existing = openToolEntryByIdentity.get(strongIdentity);
+    const shouldMerge =
+      existing !== undefined && (!existing.closed || entry.activityKind === "tool.completed");
+
+    if (!shouldMerge) {
+      collapsed.push(entry);
+      openToolEntryByIdentity.set(strongIdentity, {
+        index: collapsed.length - 1,
+        closed: entry.activityKind === "tool.completed",
+      });
+      continue;
+    }
+
+    const mergedEntry = mergeDerivedWorkLogEntries(collapsed[existing.index]!, entry);
+    collapsed[existing.index] = mergedEntry;
+    openToolEntryByIdentity.set(strongIdentity, {
+      index: existing.index,
+      closed: mergedEntry.activityKind === "tool.completed",
+    });
+  }
+
+  return collapsed;
 }
 
 function deriveWorkLogCollapseKey(
@@ -646,7 +727,7 @@ function deriveRetryWarningCollapseKey(
 }
 
 function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | undefined {
-  if (entry.activityKind !== "tool.updated" && entry.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(entry.activityKind)) {
     return undefined;
   }
   const normalizedLabel = normalizeCompactToolLabel(entry.toolTitle ?? entry.label);
@@ -656,6 +737,109 @@ function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | un
     return undefined;
   }
   return [itemType, normalizedLabel, detail].join("\u001f");
+}
+
+function isToolLifecycleActivityKind(
+  kind: DerivedWorkLogEntry["activityKind"],
+): kind is "tool.updated" | "tool.completed" {
+  return kind === "tool.updated" || kind === "tool.completed";
+}
+
+function hasMatchingToolLifecycleIdentity(
+  previous: DerivedWorkLogEntry,
+  next: DerivedWorkLogEntry,
+): boolean {
+  if (hasStrongToolLifecycleIdentity(previous, next)) {
+    return true;
+  }
+
+  return previous.collapseKey !== undefined && previous.collapseKey === next.collapseKey;
+}
+
+function hasStrongToolLifecycleIdentity(
+  previous: DerivedWorkLogEntry,
+  next: DerivedWorkLogEntry,
+): boolean {
+  if (
+    previous.providerItemId &&
+    next.providerItemId &&
+    previous.providerItemId === next.providerItemId
+  ) {
+    return true;
+  }
+
+  if (previous.itemType && next.itemType && previous.itemType !== next.itemType) {
+    return false;
+  }
+
+  if (
+    previous.semanticToolName &&
+    next.semanticToolName &&
+    previous.semanticToolName === next.semanticToolName
+  ) {
+    if (previous.semanticInputKey && next.semanticInputKey) {
+      return previous.semanticInputKey === next.semanticInputKey;
+    }
+    return true;
+  }
+  return false;
+}
+
+function deriveStrongToolLifecycleIdentity(entry: DerivedWorkLogEntry): string | undefined {
+  if (entry.semanticToolName && entry.semanticInputKey) {
+    return [
+      "semantic",
+      entry.itemType ?? "unknown-item-type",
+      entry.semanticToolName,
+      entry.semanticInputKey,
+    ].join("\u001f");
+  }
+  if (entry.providerItemId) {
+    return ["provider-item", entry.providerItemId].join("\u001f");
+  }
+  if (entry.semanticToolName) {
+    return ["semantic", entry.itemType ?? "unknown-item-type", entry.semanticToolName].join(
+      "\u001f",
+    );
+  }
+  return undefined;
+}
+
+function preferMoreSpecificString(
+  previous: string | undefined,
+  next: string | undefined,
+): string | undefined {
+  const normalizedPrevious = previous?.trim();
+  const normalizedNext = next?.trim();
+  if (!normalizedPrevious) {
+    return normalizedNext || undefined;
+  }
+  if (!normalizedNext) {
+    return normalizedPrevious;
+  }
+  const previousScore = scoreWorkLogStringSpecificity(normalizedPrevious);
+  const nextScore = scoreWorkLogStringSpecificity(normalizedNext);
+  if (nextScore > previousScore) {
+    return normalizedNext;
+  }
+  if (previousScore > nextScore) {
+    return normalizedPrevious;
+  }
+  return normalizedNext.length >= normalizedPrevious.length ? normalizedNext : normalizedPrevious;
+}
+
+function scoreWorkLogStringSpecificity(value: string): number {
+  let score = value.length;
+  if (value.includes(":")) {
+    score += 12;
+  }
+  if (value.includes("{") || value.includes("[")) {
+    score += 24;
+  }
+  if (value.includes("/")) {
+    score += 8;
+  }
+  return score;
 }
 
 function normalizeCompactToolLabel(value: string): string {
@@ -912,6 +1096,152 @@ function extractWorkLogRequestKind(
   return requestKindFromRequestType(payload?.requestType) ?? undefined;
 }
 
+function extractWorkLogProviderItemId(payload: Record<string, unknown> | null): string | undefined {
+  if (typeof payload?.providerItemId !== "string") {
+    return undefined;
+  }
+  const trimmed = payload.providerItemId.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function extractWorkLogSemanticToolName(
+  payload: Record<string, unknown> | null,
+): string | undefined {
+  const data = asRecord(payload?.data);
+  const toolName = asTrimmedString(data?.toolName);
+  return toolName ? normalizeSemanticToolName(toolName) : undefined;
+}
+
+function extractWorkLogSemanticInputKey(
+  payload: Record<string, unknown> | null,
+): string | undefined {
+  const data = asRecord(payload?.data);
+  const item = asRecord(data?.item);
+  const input = asRecord(item?.input) ?? asRecord(data?.input);
+  if (!input) {
+    return undefined;
+  }
+  const normalized = normalizeToolSemanticValue(input);
+  const normalizedRecord = asRecord(normalized);
+  if (!normalizedRecord || Object.keys(normalizedRecord).length === 0) {
+    return undefined;
+  }
+  return JSON.stringify(normalizedRecord);
+}
+
+function normalizeSemanticToolName(value: string): string {
+  const normalized = normalizeSemanticToken(value);
+  return normalizeDirectorySemanticAlias(normalized);
+}
+
+function normalizeSemanticInputFieldName(value: string): string | undefined {
+  const normalized = normalizeDirectorySemanticAlias(normalizeSemanticToken(value));
+  if (normalized === "tool_action" || normalized === "tool_summary") {
+    return undefined;
+  }
+  switch (normalized) {
+    case "dir_path":
+    case "dir_path_uri":
+    case "absolute_path":
+    case "absolute_path_uri":
+    case "target_file":
+    case "target_file_uri":
+    case "file_path":
+    case "filepath":
+      return "path";
+    case "cmd":
+      return "command";
+    default:
+      return normalized.endsWith("_uri") ? normalized.slice(0, -4) : normalized;
+  }
+}
+
+function normalizeToolSemanticValue(value: unknown, keyName?: string): unknown {
+  if (Array.isArray(value)) {
+    const normalizedEntries = value
+      .map((entry) => normalizeToolSemanticValue(entry, keyName))
+      .filter((entry) => entry !== undefined);
+    return normalizedEntries.length > 0 ? normalizedEntries : undefined;
+  }
+
+  const record = asRecord(value);
+  if (record) {
+    const normalizedRecord: Array<[string, unknown]> = [];
+    for (const [entryKey, entryValue] of Object.entries(record)) {
+      const normalizedKey = normalizeSemanticInputFieldName(entryKey);
+      if (!normalizedKey) {
+        continue;
+      }
+      const normalizedValue = normalizeToolSemanticValue(entryValue, normalizedKey);
+      if (normalizedValue === undefined) {
+        continue;
+      }
+      normalizedRecord.push([normalizedKey, normalizedValue]);
+    }
+    normalizedRecord.sort(([left], [right]) => left.localeCompare(right));
+
+    if (normalizedRecord.length === 0) {
+      return undefined;
+    }
+
+    return Object.fromEntries(normalizedRecord);
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      return undefined;
+    }
+    const normalizedPath = normalizeFileUriToPath(trimmed);
+    if (normalizedPath) {
+      return normalizedPath;
+    }
+    if (keyName === "path") {
+      return trimmed.replace(/\\/g, "/");
+    }
+    return trimmed;
+  }
+
+  if (typeof value === "number" || typeof value === "boolean" || value === null) {
+    return value;
+  }
+
+  return undefined;
+}
+
+function normalizeSemanticToken(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .toLowerCase()
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+}
+
+function normalizeDirectorySemanticAlias(value: string): string {
+  return value.replace(/(^|_)directory(?=_|$)/g, "$1dir");
+}
+
+function normalizeFileUriToPath(value: string): string | undefined {
+  if (!value.startsWith("file://")) {
+    return undefined;
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "file:") {
+      return undefined;
+    }
+    const pathname = decodeURIComponent(parsed.pathname);
+    if (parsed.host.length > 0 && parsed.host !== "localhost") {
+      return `//${parsed.host}${pathname}`;
+    }
+    return pathname.length > 0 ? pathname : "/";
+  } catch {
+    return undefined;
+  }
+}
+
 function pushChangedFile(target: string[], seen: Set<string>, value: unknown) {
   const normalized = asTrimmedString(value);
   if (!normalized || seen.has(normalized)) {
@@ -1048,9 +1378,31 @@ export function deriveTimelineEntries(
     createdAt: entry.createdAt,
     entry,
   }));
-  return [...messageRows, ...proposedPlanRows, ...workRows].toSorted((a, b) =>
-    a.createdAt.localeCompare(b.createdAt),
-  );
+  return [...messageRows, ...proposedPlanRows, ...workRows].toSorted(compareTimelineEntriesByOrder);
+}
+
+function compareTimelineEntriesByOrder(left: TimelineEntry, right: TimelineEntry): number {
+  const createdAtComparison = left.createdAt.localeCompare(right.createdAt);
+  if (createdAtComparison !== 0) {
+    return createdAtComparison;
+  }
+
+  const rankComparison = compareTimelineEntryRank(left) - compareTimelineEntryRank(right);
+  if (rankComparison !== 0) {
+    return rankComparison;
+  }
+
+  return left.id.localeCompare(right.id);
+}
+
+function compareTimelineEntryRank(entry: TimelineEntry): number {
+  if (entry.kind === "message") {
+    return entry.message.role === "user" ? 0 : 2;
+  }
+  if (entry.kind === "work") {
+    return 1;
+  }
+  return 3;
 }
 
 export function deriveCompletionDividerBeforeEntryId(

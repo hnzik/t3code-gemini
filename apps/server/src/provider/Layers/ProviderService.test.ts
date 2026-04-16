@@ -229,6 +229,196 @@ function makeFakeCodexAdapter(provider: ProviderKind = "codex") {
   };
 }
 
+function makeDeferredResumeAdapter(provider: ProviderKind = "antigravity") {
+  const sessions = new Map<ThreadId, ProviderSession>();
+  const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+
+  const startSession = vi.fn((input: ProviderSessionStartInput) =>
+    Effect.sync(() => {
+      const now = new Date().toISOString();
+      const session: ProviderSession = {
+        provider,
+        status: "ready",
+        runtimeMode: input.runtimeMode,
+        threadId: input.threadId,
+        ...(input.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+        cwd: input.cwd ?? process.cwd(),
+        createdAt: now,
+        updatedAt: now,
+      };
+      sessions.set(session.threadId, session);
+      return session;
+    }),
+  );
+
+  const sendTurn = vi.fn(
+    (
+      input: ProviderSendTurnInput,
+    ): Effect.Effect<ProviderTurnStartResult, ProviderAdapterError> => {
+      const existing = sessions.get(input.threadId);
+      if (!existing) {
+        return Effect.fail(
+          new ProviderAdapterSessionNotFoundError({
+            provider,
+            threadId: input.threadId,
+          }),
+        );
+      }
+
+      return Effect.sync(() => {
+        const turnId = TurnId.make(`turn-${String(input.threadId)}`);
+        sessions.set(input.threadId, {
+          ...existing,
+          status: "running",
+          activeTurnId: turnId,
+          updatedAt: new Date().toISOString(),
+        });
+
+        const containerId = `container-${String(input.threadId)}`;
+        queueMicrotask(() => {
+          const current = sessions.get(input.threadId);
+          if (!current) {
+            return;
+          }
+
+          sessions.set(input.threadId, {
+            ...current,
+            status: "ready",
+            activeTurnId: undefined,
+            resumeCursor: {
+              containerId,
+            },
+            updatedAt: new Date().toISOString(),
+          });
+
+          Effect.runSync(
+            PubSub.publish(runtimeEventPubSub, {
+              type: "thread.started",
+              eventId: asEventId(`evt-thread-started-${String(input.threadId)}`),
+              provider,
+              createdAt: new Date().toISOString(),
+              threadId: input.threadId,
+              payload: {
+                providerThreadId: containerId,
+              },
+              providerRefs: {},
+            } satisfies ProviderRuntimeEvent),
+          );
+        });
+
+        return {
+          threadId: input.threadId,
+          turnId,
+        };
+      });
+    },
+  );
+
+  const interruptTurn = vi.fn(
+    (_threadId: ThreadId, _turnId?: TurnId): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.void,
+  );
+
+  const respondToRequest = vi.fn(
+    (
+      _threadId: ThreadId,
+      _requestId: string,
+      _decision: ProviderApprovalDecision,
+    ): Effect.Effect<void, ProviderAdapterError> => Effect.void,
+  );
+
+  const respondToUserInput = vi.fn(
+    (
+      _threadId: ThreadId,
+      _requestId: string,
+      _answers: Record<string, unknown>,
+    ): Effect.Effect<void, ProviderAdapterError> => Effect.void,
+  );
+
+  const stopSession = vi.fn(
+    (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.sync(() => {
+        sessions.delete(threadId);
+      }),
+  );
+
+  const listSessions = vi.fn(
+    (): Effect.Effect<ReadonlyArray<ProviderSession>> =>
+      Effect.sync(() => Array.from(sessions.values())),
+  );
+
+  const hasSession = vi.fn(
+    (threadId: ThreadId): Effect.Effect<boolean> => Effect.succeed(sessions.has(threadId)),
+  );
+
+  const readThread = vi.fn(
+    (
+      threadId: ThreadId,
+    ): Effect.Effect<
+      {
+        threadId: ThreadId;
+        turns: ReadonlyArray<{ id: TurnId; items: readonly [] }>;
+      },
+      ProviderAdapterError
+    > =>
+      Effect.succeed({
+        threadId,
+        turns: [{ id: asTurnId("turn-1"), items: [] }],
+      }),
+  );
+
+  const rollbackThread = vi.fn(
+    (
+      threadId: ThreadId,
+      _numTurns: number,
+    ): Effect.Effect<{ threadId: ThreadId; turns: readonly [] }, ProviderAdapterError> =>
+      Effect.succeed({ threadId, turns: [] }),
+  );
+
+  const stopAll = vi.fn(
+    (): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.sync(() => {
+        sessions.clear();
+      }),
+  );
+
+  const adapter: ProviderAdapterShape<ProviderAdapterError> = {
+    provider,
+    capabilities: {
+      sessionModelSwitch: "in-session",
+    },
+    startSession,
+    sendTurn,
+    interruptTurn,
+    respondToRequest,
+    respondToUserInput,
+    stopSession,
+    listSessions,
+    hasSession,
+    readThread,
+    rollbackThread,
+    stopAll,
+    get streamEvents() {
+      return Stream.fromPubSub(runtimeEventPubSub);
+    },
+  };
+
+  return {
+    adapter,
+    startSession,
+    sendTurn,
+    interruptTurn,
+    respondToRequest,
+    respondToUserInput,
+    stopSession,
+    listSessions,
+    hasSession,
+    readThread,
+    rollbackThread,
+    stopAll,
+  };
+}
+
 const sleep = (ms: number) =>
   Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
@@ -905,6 +1095,67 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       fs.rmSync(tempDir, { recursive: true, force: true });
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("persists resume cursors learned from adapter lifecycle events after turn start", () =>
+    (() => {
+      const antigravity = makeDeferredResumeAdapter("antigravity");
+      const registry: typeof ProviderAdapterRegistry.Service = {
+        getByProvider: (provider) =>
+          provider === "antigravity"
+            ? Effect.succeed(antigravity.adapter)
+            : Effect.fail(new ProviderUnsupportedError({ provider })),
+        listProviders: () => Effect.succeed(["antigravity"]),
+      };
+      const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = Layer.mergeAll(
+        makeProviderServiceLive().pipe(
+          Layer.provide(Layer.succeed(ProviderAdapterRegistry, registry)),
+          Layer.provide(directoryLayer),
+          Layer.provide(defaultServerSettingsLayer),
+          Layer.provideMerge(AnalyticsService.layerTest),
+        ),
+        runtimeRepositoryLayer,
+      );
+
+      const testLayer = Layer.mergeAll(providerLayer, NodeServices.layer);
+
+      return Effect.gen(function* () {
+        const provider = yield* ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntimeRepository;
+        yield* sleep(10);
+
+        const session = yield* provider.startSession(asThreadId("thread-antigravity-async"), {
+          provider: "antigravity",
+          threadId: asThreadId("thread-antigravity-async"),
+          cwd: "/tmp/project-antigravity-async",
+          runtimeMode: "full-access",
+        });
+
+        yield* provider.sendTurn({
+          threadId: session.threadId,
+          input: "hello async resume",
+          attachments: [],
+        });
+
+        yield* sleep(25);
+
+        const runtime = yield* runtimeRepository.getByThreadId({
+          threadId: session.threadId,
+        });
+        assert.equal(Option.isSome(runtime), true);
+        if (Option.isSome(runtime)) {
+          assert.deepEqual(runtime.value.resumeCursor, {
+            containerId: `container-${String(session.threadId)}`,
+          });
+        }
+      }).pipe(Effect.provide(testLayer));
+    })(),
   );
 });
 

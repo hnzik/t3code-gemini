@@ -45,6 +45,13 @@ const PROVIDER_CUSTOM_MODEL_CONFIG: Record<ProviderKind, ProviderCustomModelConf
     placeholder: "your-claude-model-slug",
     example: "claude-sonnet-5-0",
   },
+  antigravity: {
+    provider: "antigravity",
+    title: "Antigravity",
+    description: "Save additional Antigravity model slugs for the picker and `/model` command.",
+    placeholder: "your-antigravity-model-slug",
+    example: "gemini-3.1-pro-high",
+  },
   geminiAcp: {
     provider: "geminiAcp",
     title: "Gemini",
@@ -171,6 +178,12 @@ export function getCustomModelOptionsByProvider(
       providers,
       "claudeAgent",
       selectedProvider === "claudeAgent" ? selectedModel : undefined,
+    ),
+    antigravity: getAppModelOptions(
+      settings,
+      providers,
+      "antigravity",
+      selectedProvider === "antigravity" ? selectedModel : undefined,
     ),
     geminiAcp: getAppModelOptions(
       settings,

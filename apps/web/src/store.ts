@@ -113,7 +113,7 @@ function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
 }
 
 function normalizeModelSelection<
-  T extends { provider: "codex" | "claudeAgent" | "geminiAcp"; model: string },
+  T extends { provider: "codex" | "claudeAgent" | "antigravity" | "geminiAcp"; model: string },
 >(selection: T): T {
   return {
     ...selection,
@@ -907,7 +907,12 @@ function toLegacySessionStatus(
 }
 
 function toLegacyProvider(providerName: string | null): ProviderKind {
-  if (providerName === "codex" || providerName === "claudeAgent" || providerName === "geminiAcp") {
+  if (
+    providerName === "codex" ||
+    providerName === "claudeAgent" ||
+    providerName === "antigravity" ||
+    providerName === "geminiAcp"
+  ) {
     return providerName;
   }
   return "codex";

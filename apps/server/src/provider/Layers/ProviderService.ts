@@ -22,7 +22,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSession,
 } from "@t3tools/contracts";
-import { Effect, Layer, Option, PubSub, Schema, SchemaIssue, Stream } from "effect";
+import { Cause, Effect, Layer, Option, PubSub, Schema, SchemaIssue, Stream } from "effect";
 
 import {
   increment,
@@ -141,6 +141,22 @@ function readPersistedCwd(
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function shouldRefreshPersistedBindingFromRuntimeEvent(event: ProviderRuntimeEvent): boolean {
+  switch (event.type) {
+    case "session.started":
+    case "session.configured":
+    case "session.state.changed":
+    case "session.exited":
+    case "thread.started":
+    case "turn.started":
+    case "turn.completed":
+    case "turn.aborted":
+      return true;
+    default:
+      return false;
+  }
+}
+
 const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
@@ -185,13 +201,62 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       runtimePayload: toRuntimePayloadFromSession(session, extra),
     });
 
+  const refreshPersistedBindingFromRuntimeEvent = Effect.fn(
+    "refreshPersistedBindingFromRuntimeEvent",
+  )(function* (event: ProviderRuntimeEvent) {
+    if (!shouldRefreshPersistedBindingFromRuntimeEvent(event)) {
+      return;
+    }
+
+    const adapter = yield* registry.getByProvider(event.provider);
+    const activeSession = yield* adapter
+      .listSessions()
+      .pipe(
+        Effect.map((sessions) => sessions.find((session) => session.threadId === event.threadId)),
+      );
+
+    if (activeSession) {
+      yield* upsertSessionBinding(activeSession, event.threadId, {
+        lastRuntimeEvent: event.type,
+        lastRuntimeEventAt: event.createdAt,
+      });
+      return;
+    }
+
+    if (event.type === "session.exited") {
+      yield* directory.upsert({
+        threadId: event.threadId,
+        provider: event.provider,
+        status: "stopped",
+        runtimePayload: {
+          lastRuntimeEvent: event.type,
+          lastRuntimeEventAt: event.createdAt,
+        },
+      });
+    }
+  });
+
   const providers = yield* registry.listProviders();
   const adapters = yield* Effect.forEach(providers, (provider) => registry.getByProvider(provider));
   const processRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     increment(providerRuntimeEventsTotal, {
       provider: event.provider,
       eventType: event.type,
-    }).pipe(Effect.andThen(publishRuntimeEvent(event)));
+    }).pipe(
+      Effect.andThen(
+        refreshPersistedBindingFromRuntimeEvent(event).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("failed to refresh provider session runtime from event", {
+              provider: event.provider,
+              threadId: event.threadId,
+              eventType: event.type,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        ),
+      ),
+      Effect.andThen(publishRuntimeEvent(event)),
+    );
 
   yield* Effect.forEach(adapters, (adapter) =>
     Stream.runForEach(adapter.streamEvents, processRuntimeEvent).pipe(Effect.forkScoped),

@@ -101,8 +101,10 @@ const TIMESTAMP_FORMAT_LABELS = {
 type InstallProviderSettings = {
   provider: ProviderKind;
   title: string;
-  binaryPlaceholder: string;
-  binaryDescription: ReactNode;
+  connectionFieldKey: "binaryPath" | "baseUrl";
+  connectionFieldLabel: string;
+  connectionPlaceholder: string;
+  connectionDescription: ReactNode;
   homePathKey?: "codexHomePath";
   homePlaceholder?: string;
   homeDescription?: ReactNode;
@@ -112,8 +114,10 @@ const PROVIDER_SETTINGS: readonly InstallProviderSettings[] = [
   {
     provider: "codex",
     title: "Codex",
-    binaryPlaceholder: "Codex binary path",
-    binaryDescription: "Path to the Codex binary",
+    connectionFieldKey: "binaryPath",
+    connectionFieldLabel: "Codex binary path",
+    connectionPlaceholder: "Codex binary path",
+    connectionDescription: "Path to the Codex binary",
     homePathKey: "codexHomePath",
     homePlaceholder: "CODEX_HOME",
     homeDescription: "Optional custom Codex home and config directory.",
@@ -121,16 +125,41 @@ const PROVIDER_SETTINGS: readonly InstallProviderSettings[] = [
   {
     provider: "claudeAgent",
     title: "Claude",
-    binaryPlaceholder: "Claude binary path",
-    binaryDescription: "Path to the Claude binary",
+    connectionFieldKey: "binaryPath",
+    connectionFieldLabel: "Claude binary path",
+    connectionPlaceholder: "Claude binary path",
+    connectionDescription: "Path to the Claude binary",
+  },
+  {
+    provider: "antigravity",
+    title: "Antigravity",
+    connectionFieldKey: "baseUrl",
+    connectionFieldLabel: "Antigravity base URL",
+    connectionPlaceholder: "http://127.0.0.1:3117",
+    connectionDescription: "Base URL for the Antigravity proxy endpoint.",
   },
   {
     provider: "geminiAcp",
     title: "Gemini",
-    binaryPlaceholder: "Gemini binary path",
-    binaryDescription: "Path to the Gemini CLI binary",
+    connectionFieldKey: "binaryPath",
+    connectionFieldLabel: "Gemini binary path",
+    connectionPlaceholder: "Gemini binary path",
+    connectionDescription: "Path to the Gemini CLI binary",
   },
 ] as const;
+
+function getProviderConnectionFieldValue(
+  providerConfig: (typeof DEFAULT_UNIFIED_SETTINGS.providers)[ProviderKind],
+  connectionFieldKey: InstallProviderSettings["connectionFieldKey"],
+): string {
+  return connectionFieldKey === "baseUrl"
+    ? "baseUrl" in providerConfig
+      ? providerConfig.baseUrl
+      : ""
+    : "binaryPath" in providerConfig
+      ? providerConfig.binaryPath
+      : "";
+}
 
 const PROVIDER_STATUS_STYLES = {
   disabled: {
@@ -468,6 +497,11 @@ export function GeneralSettingsPanel() {
         DEFAULT_UNIFIED_SETTINGS.providers.claudeAgent.binaryPath ||
       settings.providers.claudeAgent.customModels.length > 0,
     ),
+    antigravity: Boolean(
+      settings.providers.antigravity.baseUrl !==
+        DEFAULT_UNIFIED_SETTINGS.providers.antigravity.baseUrl ||
+      settings.providers.antigravity.customModels.length > 0,
+    ),
     geminiAcp: Boolean(
       settings.providers.geminiAcp.binaryPath !==
         DEFAULT_UNIFIED_SETTINGS.providers.geminiAcp.binaryPath ||
@@ -479,6 +513,7 @@ export function GeneralSettingsPanel() {
   >({
     codex: "",
     claudeAgent: "",
+    antigravity: "",
     geminiAcp: "",
   });
   const [customModelErrorByProvider, setCustomModelErrorByProvider] = useState<
@@ -690,12 +725,17 @@ export function GeneralSettingsPanel() {
     return {
       provider: providerSettings.provider,
       title: providerSettings.title,
-      binaryPlaceholder: providerSettings.binaryPlaceholder,
-      binaryDescription: providerSettings.binaryDescription,
+      connectionFieldKey: providerSettings.connectionFieldKey,
+      connectionFieldLabel: providerSettings.connectionFieldLabel,
+      connectionPlaceholder: providerSettings.connectionPlaceholder,
+      connectionDescription: providerSettings.connectionDescription,
       homePathKey: providerSettings.homePathKey,
       homePlaceholder: providerSettings.homePlaceholder,
       homeDescription: providerSettings.homeDescription,
-      binaryPathValue: providerConfig.binaryPath,
+      connectionValue: getProviderConnectionFieldValue(
+        providerConfig,
+        providerSettings.connectionFieldKey,
+      ),
       isDirty: !Equal.equals(providerConfig, defaultProviderConfig),
       liveProvider,
       models,
@@ -1167,32 +1207,39 @@ export function GeneralSettingsPanel() {
                   <div className="space-y-0">
                     <div className="border-t border-border/60 px-4 py-3 sm:px-5">
                       <label
-                        htmlFor={`provider-install-${providerCard.provider}-binary-path`}
+                        htmlFor={`provider-install-${providerCard.provider}-${providerCard.connectionFieldKey}`}
                         className="block"
                       >
                         <span className="text-xs font-medium text-foreground">
-                          {providerDisplayName} binary path
+                          {providerCard.connectionFieldLabel}
                         </span>
                         <Input
-                          id={`provider-install-${providerCard.provider}-binary-path`}
+                          id={`provider-install-${providerCard.provider}-${providerCard.connectionFieldKey}`}
                           className="mt-1.5"
-                          value={providerCard.binaryPathValue}
-                          onChange={(event) =>
+                          value={providerCard.connectionValue}
+                          onChange={(event) => {
+                            const nextProviderConfig =
+                              providerCard.connectionFieldKey === "baseUrl"
+                                ? {
+                                    ...settings.providers[providerCard.provider],
+                                    baseUrl: event.target.value,
+                                  }
+                                : {
+                                    ...settings.providers[providerCard.provider],
+                                    binaryPath: event.target.value,
+                                  };
                             updateSettings({
                               providers: {
                                 ...settings.providers,
-                                [providerCard.provider]: {
-                                  ...settings.providers[providerCard.provider],
-                                  binaryPath: event.target.value,
-                                },
+                                [providerCard.provider]: nextProviderConfig,
                               },
-                            })
-                          }
-                          placeholder={providerCard.binaryPlaceholder}
+                            });
+                          }}
+                          placeholder={providerCard.connectionPlaceholder}
                           spellCheck={false}
                         />
                         <span className="mt-1 block text-xs text-muted-foreground">
-                          {providerCard.binaryDescription}
+                          {providerCard.connectionDescription}
                         </span>
                       </label>
                     </div>

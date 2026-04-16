@@ -1,5 +1,10 @@
 import { Effect, Option, Schema, SchemaIssue, Struct } from "effect";
-import { ClaudeModelOptions, CodexModelOptions, GeminiModelOptions } from "./model";
+import {
+  AntigravityModelOptions,
+  ClaudeModelOptions,
+  CodexModelOptions,
+  GeminiModelOptions,
+} from "./model";
 import { RepositoryIdentity } from "./environment";
 import {
   ApprovalRequestId,
@@ -24,7 +29,7 @@ export const ORCHESTRATION_WS_METHODS = {
   replayEvents: "orchestration.replayEvents",
 } as const;
 
-export const ProviderKind = Schema.Literals(["codex", "claudeAgent", "geminiAcp"]);
+export const ProviderKind = Schema.Literals(["codex", "claudeAgent", "antigravity", "geminiAcp"]);
 export type ProviderKind = typeof ProviderKind.Type;
 export const ProviderApprovalPolicy = Schema.Literals([
   "untrusted",
@@ -63,9 +68,17 @@ export const GeminiModelSelection = Schema.Struct({
 });
 export type GeminiModelSelection = typeof GeminiModelSelection.Type;
 
+export const AntigravityModelSelection = Schema.Struct({
+  provider: Schema.Literal("antigravity"),
+  model: TrimmedNonEmptyString,
+  options: Schema.optionalKey(AntigravityModelOptions),
+});
+export type AntigravityModelSelection = typeof AntigravityModelSelection.Type;
+
 export const ModelSelection = Schema.Union([
   CodexModelSelection,
   ClaudeModelSelection,
+  AntigravityModelSelection,
   GeminiModelSelection,
 ]);
 export type ModelSelection = typeof ModelSelection.Type;

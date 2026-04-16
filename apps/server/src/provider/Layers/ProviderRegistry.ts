@@ -6,9 +6,12 @@
 import type { ProviderKind, ServerProvider } from "@t3tools/contracts";
 import { Effect, Equal, Layer, PubSub, Ref, Stream } from "effect";
 
+import { AntigravityProviderLive } from "./AntigravityProvider";
 import { ClaudeProviderLive } from "./ClaudeProvider";
 import { CodexProviderLive } from "./CodexProvider";
 import { GeminiAcpProviderLive } from "./GeminiAcpProvider";
+import type { AntigravityProviderShape } from "../Services/AntigravityProvider";
+import { AntigravityProvider } from "../Services/AntigravityProvider";
 import type { ClaudeProviderShape } from "../Services/ClaudeProvider";
 import { ClaudeProvider } from "../Services/ClaudeProvider";
 import type { CodexProviderShape } from "../Services/CodexProvider";
@@ -20,10 +23,16 @@ import { ProviderRegistry, type ProviderRegistryShape } from "../Services/Provid
 const loadProviders = (
   codexProvider: CodexProviderShape,
   claudeProvider: ClaudeProviderShape,
+  antigravityProvider: AntigravityProviderShape,
   geminiAcpProvider: GeminiAcpProviderShape,
-): Effect.Effect<readonly [ServerProvider, ServerProvider, ServerProvider]> =>
+): Effect.Effect<readonly [ServerProvider, ServerProvider, ServerProvider, ServerProvider]> =>
   Effect.all(
-    [codexProvider.getSnapshot, claudeProvider.getSnapshot, geminiAcpProvider.getSnapshot],
+    [
+      codexProvider.getSnapshot,
+      claudeProvider.getSnapshot,
+      antigravityProvider.getSnapshot,
+      geminiAcpProvider.getSnapshot,
+    ],
     {
       concurrency: "unbounded",
     },
@@ -39,20 +48,26 @@ export const ProviderRegistryLive = Layer.effect(
   Effect.gen(function* () {
     const codexProvider = yield* CodexProvider;
     const claudeProvider = yield* ClaudeProvider;
+    const antigravityProvider = yield* AntigravityProvider;
     const geminiAcpProvider = yield* GeminiAcpProvider;
     const changesPubSub = yield* Effect.acquireRelease(
       PubSub.unbounded<ReadonlyArray<ServerProvider>>(),
       PubSub.shutdown,
     );
     const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(
-      yield* loadProviders(codexProvider, claudeProvider, geminiAcpProvider),
+      yield* loadProviders(codexProvider, claudeProvider, antigravityProvider, geminiAcpProvider),
     );
 
     const syncProviders = Effect.fn("syncProviders")(function* (options?: {
       readonly publish?: boolean;
     }) {
       const previousProviders = yield* Ref.get(providersRef);
-      const providers = yield* loadProviders(codexProvider, claudeProvider, geminiAcpProvider);
+      const providers = yield* loadProviders(
+        codexProvider,
+        claudeProvider,
+        antigravityProvider,
+        geminiAcpProvider,
+      );
       yield* Ref.set(providersRef, providers);
 
       if (options?.publish !== false && haveProvidersChanged(previousProviders, providers)) {
@@ -68,6 +83,9 @@ export const ProviderRegistryLive = Layer.effect(
     yield* Stream.runForEach(claudeProvider.streamChanges, () => syncProviders()).pipe(
       Effect.forkScoped,
     );
+    yield* Stream.runForEach(antigravityProvider.streamChanges, () => syncProviders()).pipe(
+      Effect.forkScoped,
+    );
     yield* Stream.runForEach(geminiAcpProvider.streamChanges, () => syncProviders()).pipe(
       Effect.forkScoped,
     );
@@ -80,12 +98,20 @@ export const ProviderRegistryLive = Layer.effect(
         case "claudeAgent":
           yield* claudeProvider.refresh;
           break;
+        case "antigravity":
+          yield* antigravityProvider.refresh;
+          break;
         case "geminiAcp":
           yield* geminiAcpProvider.refresh;
           break;
         default:
           yield* Effect.all(
-            [codexProvider.refresh, claudeProvider.refresh, geminiAcpProvider.refresh],
+            [
+              codexProvider.refresh,
+              claudeProvider.refresh,
+              antigravityProvider.refresh,
+              geminiAcpProvider.refresh,
+            ],
             {
               concurrency: "unbounded",
             },
@@ -113,5 +139,6 @@ export const ProviderRegistryLive = Layer.effect(
 ).pipe(
   Layer.provideMerge(CodexProviderLive),
   Layer.provideMerge(ClaudeProviderLive),
+  Layer.provideMerge(AntigravityProviderLive),
   Layer.provideMerge(GeminiAcpProviderLive),
 );

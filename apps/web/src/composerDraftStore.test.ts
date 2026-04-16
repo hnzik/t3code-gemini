@@ -91,7 +91,7 @@ function resetComposerDraftStore() {
 }
 
 function modelSelection(
-  provider: "codex" | "claudeAgent",
+  provider: "codex" | "claudeAgent" | "antigravity",
   model: string,
   options?: ModelSelection["options"],
 ): ModelSelection {
@@ -1002,6 +1002,22 @@ describe("composerDraftStore modelSelection", () => {
     const draft = draftFor(threadId, TEST_ENVIRONMENT_ID);
     expect(draft?.modelSelectionByProvider.codex?.options).toEqual({ reasoningEffort: "xhigh" });
     expect(draft?.modelSelectionByProvider.claudeAgent?.options).toEqual({ effort: "max" });
+  });
+
+  it("stores Antigravity context window options when setting provider model options", () => {
+    const store = useComposerDraftStore.getState();
+
+    store.setModelOptions(
+      threadRef,
+      providerModelOptions({
+        antigravity: { contextWindow: "1m" },
+      }),
+    );
+
+    const draft = draftFor(threadId, TEST_ENVIRONMENT_ID);
+    expect(draft?.modelSelectionByProvider.antigravity).toEqual(
+      modelSelection("antigravity", "gemini-3.1-pro-high", { contextWindow: "1m" }),
+    );
   });
 
   it("preserves other provider options when switching the active model selection", () => {
