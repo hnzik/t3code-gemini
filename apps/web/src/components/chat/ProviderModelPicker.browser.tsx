@@ -120,6 +120,8 @@ const TEST_PROVIDERS: ReadonlyArray<ServerProvider> = [
     status: "ready",
     auth: { status: "authenticated" },
     checkedAt: new Date().toISOString(),
+    slashCommands: [],
+    skills: [],
     models: [
       {
         slug: "gemini-2.5-pro",

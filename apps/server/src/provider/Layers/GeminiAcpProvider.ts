@@ -372,6 +372,46 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
   },
 );
 
+const makePendingGeminiAcpProvider = (geminiSettings: GeminiSettings): ServerProvider => {
+  const checkedAt = new Date().toISOString();
+  const models = providerModelsFromSettings(
+    BUILT_IN_MODELS,
+    PROVIDER,
+    geminiSettings.customModels,
+    GEMINI_MODEL_CAPABILITIES,
+  );
+
+  if (!geminiSettings.enabled) {
+    return buildServerProvider({
+      provider: PROVIDER,
+      enabled: false,
+      checkedAt,
+      models,
+      probe: {
+        installed: false,
+        version: null,
+        status: "warning",
+        auth: { status: "unknown" },
+        message: "Gemini ACP is disabled in T3 Code settings.",
+      },
+    });
+  }
+
+  return buildServerProvider({
+    provider: PROVIDER,
+    enabled: true,
+    checkedAt,
+    models,
+    probe: {
+      installed: false,
+      version: null,
+      status: "warning",
+      auth: { status: "unknown" },
+      message: "Gemini ACP provider status has not been checked in this session yet.",
+    },
+  });
+};
+
 export const GeminiAcpProviderLive = Layer.effect(
   GeminiAcpProvider,
   Effect.gen(function* () {
@@ -394,6 +434,7 @@ export const GeminiAcpProviderLive = Layer.effect(
         prev.enabled !== next.enabled ||
         prev.binaryPath !== next.binaryPath ||
         !Equal.equals(prev.customModels, next.customModels),
+      initialSnapshot: makePendingGeminiAcpProvider,
       checkProvider,
       refreshTriggers: authRuntimeState.streamChanges,
     });

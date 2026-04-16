@@ -52,10 +52,10 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
             props.onToggleInteractionMode();
           }}
         >
-          <MenuRadioItem value="default" disabled={props.modeChangeDisabled}>
+          <MenuRadioItem value="default">
             Chat
           </MenuRadioItem>
-          <MenuRadioItem value="plan" disabled={props.modeChangeDisabled}>
+          <MenuRadioItem value="plan">
             Plan
           </MenuRadioItem>
         </MenuRadioGroup>
@@ -68,10 +68,10 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
             props.onRuntimeModeChange(value as RuntimeMode);
           }}
         >
-          <MenuRadioItem value="approval-required" disabled={props.modeChangeDisabled}>
+          <MenuRadioItem value="approval-required">
             Supervised
           </MenuRadioItem>
-          <MenuRadioItem value="full-access" disabled={props.modeChangeDisabled}>
+          <MenuRadioItem value="full-access">
             Full access
           </MenuRadioItem>
         </MenuRadioGroup>

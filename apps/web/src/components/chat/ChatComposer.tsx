@@ -649,11 +649,9 @@ export const ChatComposer = memo(
       () => customSkillsState?.skills.filter((skill) => skill.enabled) ?? [],
       [customSkillsState],
     );
-    const enableSkillMentions = enabledCustomSkills.length > 0;
     const detectComposerMenuTrigger = useCallback(
-      (text: string, cursor: number) =>
-        detectComposerTrigger(text, cursor, { enableSkillMentions }),
-      [enableSkillMentions],
+      (text: string, cursor: number) => detectComposerTrigger(text, cursor),
+      [],
     );
 
     // ------------------------------------------------------------------
@@ -736,7 +734,7 @@ export const ChatComposer = memo(
       }
       if (composerTrigger.kind === "skill") {
         const query = skillTriggerQuery.trim().toLowerCase();
-        return enabledCustomSkills
+        const customSkillItems: ComposerCommandItem[] = enabledCustomSkills
           .filter((skill) => {
             if (!query) return true;
             return (
@@ -746,13 +744,28 @@ export const ChatComposer = memo(
             );
           })
           .map((skill) => ({
-            id: `skill:${skill.slug}`,
-            type: "skill" as const,
+            id: `custom-skill:${skill.slug}`,
+            type: "custom-skill" as const,
             slug: skill.slug,
             label: `$${skill.slug}`,
             name: skill.name,
             description: skill.description ?? "",
           }));
+        const providerSkillItems: ComposerCommandItem[] = searchProviderSkills(
+          selectedProviderStatus?.skills ?? [],
+          composerTrigger.query,
+        ).map((skill) => ({
+          id: `skill:${selectedProvider}:${skill.name}`,
+          type: "skill" as const,
+          provider: selectedProvider,
+          skill,
+          label: formatProviderSkillDisplayName(skill),
+          description:
+            skill.shortDescription ??
+            skill.description ??
+            (skill.scope ? `${skill.scope} skill` : "Run provider skill"),
+        }));
+        return [...customSkillItems, ...providerSkillItems];
       }
       if (composerTrigger.kind === "slash-command") {
         const builtInSlashCommandItems = [
@@ -794,22 +807,6 @@ export const ChatComposer = memo(
           return slashCommandItems;
         }
         return searchSlashCommandItems(slashCommandItems, query);
-      }
-      if (composerTrigger.kind === "skill") {
-        return searchProviderSkills(
-          selectedProviderStatus?.skills ?? [],
-          composerTrigger.query,
-        ).map((skill) => ({
-          id: `skill:${selectedProvider}:${skill.name}`,
-          type: "skill" as const,
-          provider: selectedProvider,
-          skill,
-          label: formatProviderSkillDisplayName(skill),
-          description:
-            skill.shortDescription ??
-            skill.description ??
-            (skill.scope ? `${skill.scope} skill` : "Run provider skill"),
-        }));
       }
       return searchableModelOptions
         .filter(({ searchSlug, searchName, searchProvider }) => {
@@ -1414,7 +1411,7 @@ export const ChatComposer = memo(
           }
           return;
         }
-        if (item.type === "skill") {
+        if (item.type === "custom-skill") {
           const replacement = `$${item.slug} `;
           const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
             snapshot.value,

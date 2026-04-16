@@ -588,6 +588,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsService.layerTest()))(
           yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
           const providerRegistryLayer = ProviderRegistryLive.pipe(
             Layer.provideMerge(Layer.succeed(ServerSettingsService, serverSettings)),
+            Layer.provideMerge(geminiAuthRuntimeStateLayer),
             Layer.provideMerge(
               ServerConfig.layerTest(process.cwd(), {
                 prefix: "t3-provider-registry-",

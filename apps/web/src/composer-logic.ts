@@ -218,9 +218,6 @@ export const isCollapsedCursorAdjacentToMention = isCollapsedCursorAdjacentToInl
 export function detectComposerTrigger(
   text: string,
   cursorInput: number,
-  options?: {
-    readonly enableSkillMentions?: boolean;
-  },
 ): ComposerTrigger | null {
   const cursor = clampCursor(text, cursorInput);
   const lineStart = text.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
@@ -270,15 +267,12 @@ export function detectComposerTrigger(
   if (!token.startsWith("@")) {
     return null;
   }
-  if (options?.enableSkillMentions && token.startsWith("$")) {
-    return {
-      kind: "skill",
-      query: token.slice(1),
-      rangeStart: tokenStart,
-      rangeEnd: cursor,
-    };
-  }
-  return null;
+  return {
+    kind: "path",
+    query: token.slice(1),
+    rangeStart: tokenStart,
+    rangeEnd: cursor,
+  };
 }
 
 export function parseStandaloneComposerSlashCommand(

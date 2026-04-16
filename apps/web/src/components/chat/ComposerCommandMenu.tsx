@@ -4,7 +4,7 @@ import {
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
-import { BotIcon } from "lucide-react";
+import { BotIcon, PuzzleIcon } from "lucide-react";
 import { memo, useLayoutEffect, useMemo, useRef } from "react";
 
 import { type ComposerSlashCommand, type ComposerTriggerKind } from "../../composer-logic";
@@ -58,6 +58,14 @@ export type ComposerCommandItem =
       type: "skill";
       provider: ProviderKind;
       skill: ServerProviderSkill;
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "custom-skill";
+      slug: string;
+      name: string;
       label: string;
       description: string;
     };
@@ -255,7 +263,7 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
           <SkillGlyph className="size-3.5" />
         </span>
       ) : null}
-      {props.item.type === "skill" ? (
+      {props.item.type === "custom-skill" ? (
         <PuzzleIcon className="size-4 text-muted-foreground/80" />
       ) : null}
       {props.item.type === "model" ? (

@@ -1,6 +1,7 @@
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   MODEL_SLUG_ALIASES_BY_PROVIDER,
+  type AntigravityModelOptions,
   type ClaudeAgentEffort,
   type ClaudeModelOptions,
   type CodexModelOptions,

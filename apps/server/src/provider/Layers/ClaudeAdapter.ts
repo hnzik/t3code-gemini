@@ -221,12 +221,7 @@ function getEffectiveClaudeAgentEffort(
   if (!effort) {
     return null;
   }
-  // "ultrathink" is injected via prompt prefix, not the SDK effort parameter.
-  if (effort === "ultrathink") return null;
-  // The Claude Agent SDK accepts only "low" | "medium" | "high" | "max" — map
-  // our UI-only "xhigh" tier to the closest supported level.
-  if (effort === "xhigh") return "max";
-  return effort;
+  return effort === "ultrathink" ? null : effort;
 }
 
 function isClaudeInterruptedMessage(message: string): boolean {

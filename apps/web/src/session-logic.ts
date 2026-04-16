@@ -548,6 +548,9 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   };
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
+  const providerItemId = extractWorkLogProviderItemId(payload);
+  const semanticToolName = extractWorkLogSemanticToolName(payload);
+  const semanticInputKey = extractWorkLogSemanticInputKey(payload);
   if (
     !taskDetailAsLabel &&
     payload &&

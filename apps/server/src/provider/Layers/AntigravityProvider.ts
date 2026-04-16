@@ -167,6 +167,46 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
   },
 );
 
+const makePendingAntigravityProvider = (antigravitySettings: AntigravitySettings): ServerProvider => {
+  const checkedAt = new Date().toISOString();
+  const models = providerModelsFromSettings(
+    ANTIGRAVITY_BUILT_IN_MODELS,
+    PROVIDER,
+    antigravitySettings.customModels,
+    getAntigravityModelCapabilities,
+  );
+
+  if (!antigravitySettings.enabled) {
+    return buildServerProvider({
+      provider: PROVIDER,
+      enabled: false,
+      checkedAt,
+      models,
+      probe: {
+        installed: true,
+        version: null,
+        status: "warning",
+        auth: { status: "unknown" },
+        message: "Antigravity is disabled in T3 Code settings.",
+      },
+    });
+  }
+
+  return buildServerProvider({
+    provider: PROVIDER,
+    enabled: true,
+    checkedAt,
+    models,
+    probe: {
+      installed: true,
+      version: null,
+      status: "warning",
+      auth: { status: "unknown" },
+      message: "Antigravity provider status has not been checked in this session yet.",
+    },
+  });
+};
+
 export const AntigravityProviderLive = Layer.effect(
   AntigravityProvider,
   Effect.gen(function* () {
@@ -184,6 +224,7 @@ export const AntigravityProviderLive = Layer.effect(
         Stream.map((settings) => settings.providers.antigravity),
       ),
       haveSettingsChanged: (previous, next) => !Equal.equals(previous, next),
+      initialSnapshot: makePendingAntigravityProvider,
       checkProvider,
     });
   }),

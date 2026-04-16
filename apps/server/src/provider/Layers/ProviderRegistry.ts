@@ -7,6 +7,7 @@ import type { ProviderKind, ServerProvider } from "@t3tools/contracts";
 import { Effect, Equal, FileSystem, Layer, Path, PubSub, Ref, Stream } from "effect";
 
 import { ServerConfig } from "../../config";
+import { AntigravityProviderLive } from "./AntigravityProvider";
 import { ClaudeProviderLive } from "./ClaudeProvider";
 import { CodexProviderLive } from "./CodexProvider";
 import { GeminiAcpProviderLive } from "./GeminiAcpProvider";
@@ -56,6 +57,8 @@ export const ProviderRegistryLive = Layer.effect(
   Effect.gen(function* () {
     const codexProvider = yield* CodexProvider;
     const claudeProvider = yield* ClaudeProvider;
+    const antigravityProvider = yield* AntigravityProvider;
+    const geminiAcpProvider = yield* GeminiAcpProvider;
     const config = yield* ServerConfig;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -63,7 +66,12 @@ export const ProviderRegistryLive = Layer.effect(
       PubSub.unbounded<ReadonlyArray<ServerProvider>>(),
       PubSub.shutdown,
     );
-    const fallbackProviders = yield* loadProviders(codexProvider, claudeProvider);
+    const fallbackProviders = yield* loadProviders(
+      codexProvider,
+      claudeProvider,
+      antigravityProvider,
+      geminiAcpProvider,
+    );
     const cachePathByProvider = new Map(
       PROVIDER_CACHE_IDS.map(
         (provider) =>
@@ -171,6 +179,14 @@ export const ProviderRegistryLive = Layer.effect(
           return yield* claudeProvider.refresh.pipe(
             Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
           );
+        case "antigravity":
+          return yield* antigravityProvider.refresh.pipe(
+            Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+          );
+        case "geminiAcp":
+          return yield* geminiAcpProvider.refresh.pipe(
+            Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+          );
         default:
           return yield* Effect.all(
             [
@@ -178,6 +194,12 @@ export const ProviderRegistryLive = Layer.effect(
                 Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
               ),
               claudeProvider.refresh.pipe(
+                Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+              ),
+              antigravityProvider.refresh.pipe(
+                Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
+              ),
+              geminiAcpProvider.refresh.pipe(
                 Effect.flatMap((nextProvider) => syncProvider(nextProvider)),
               ),
             ],
@@ -193,6 +215,12 @@ export const ProviderRegistryLive = Layer.effect(
       syncProvider(provider),
     ).pipe(Effect.forkScoped);
     yield* Stream.runForEach(claudeProvider.streamChanges, (provider) =>
+      syncProvider(provider),
+    ).pipe(Effect.forkScoped);
+    yield* Stream.runForEach(antigravityProvider.streamChanges, (provider) =>
+      syncProvider(provider),
+    ).pipe(Effect.forkScoped);
+    yield* Stream.runForEach(geminiAcpProvider.streamChanges, (provider) =>
       syncProvider(provider),
     ).pipe(Effect.forkScoped);
 
