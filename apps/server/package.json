@@ -1,6 +1,6 @@
 {
   "name": "t3",
-  "version": "0.0.15",
+  "version": "0.0.17",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -23,8 +23,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.98",
-    "@anthropic-ai/sdk": "^0.80.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.111",
     "@effect/platform-bun": "catalog:",
     "@effect/platform-node": "catalog:",
     "@effect/platform-node-shared": "catalog:",

@@ -497,9 +497,6 @@ function runtimeEventToActivities(
             itemType: event.payload.itemType,
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
             ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
-            ...(event.providerRefs?.providerItemId
-              ? { providerItemId: event.providerRefs.providerItemId }
-              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
