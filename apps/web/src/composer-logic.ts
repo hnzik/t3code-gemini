@@ -215,10 +215,7 @@ export function isCollapsedCursorAdjacentToInlineToken(
 
 export const isCollapsedCursorAdjacentToMention = isCollapsedCursorAdjacentToInlineToken;
 
-export function detectComposerTrigger(
-  text: string,
-  cursorInput: number,
-): ComposerTrigger | null {
+export function detectComposerTrigger(text: string, cursorInput: number): ComposerTrigger | null {
   const cursor = clampCursor(text, cursorInput);
   const lineStart = text.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
   const linePrefix = text.slice(lineStart, cursor);

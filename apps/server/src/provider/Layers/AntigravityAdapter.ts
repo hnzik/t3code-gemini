@@ -5,6 +5,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   EventId,
   ProviderItemId,
+  type ProviderInteractionMode,
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
   type ProviderSendTurnInput,
@@ -51,6 +52,122 @@ import {
 
 const PROVIDER = "antigravity" as const;
 const SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+
+const PLAN_MODE_OPEN_TAG = "<prop_plan>";
+const PLAN_MODE_CLOSE_TAG = "</prop_plan>";
+const PLAN_MODE_SYSTEM_PROMPT = [
+  "You are in PLAN MODE.",
+  "",
+  "Rules:",
+  "- Use only read-only tools (grep, list directory, view file, web fetch). Do NOT write files, edit files, run mutating shell commands, install packages, or commit code. If any step would require a mutation, describe it in the plan rather than performing it.",
+  `- Once you have enough information, output your final plan wrapped in ${PLAN_MODE_OPEN_TAG}...${PLAN_MODE_CLOSE_TAG} as GitHub-flavored markdown. Everything inside the tags will be shown to the user as the proposed plan. Nothing else should appear between the tags.`,
+  `- End the turn immediately after ${PLAN_MODE_CLOSE_TAG}.`,
+].join("\n");
+
+interface PlanTagParserState {
+  phase: "before-open" | "inside" | "after-close";
+  buffer: string;
+  accumulated: string;
+  planEmitted: boolean;
+}
+
+function createPlanTagParserState(): PlanTagParserState {
+  return {
+    phase: "before-open",
+    buffer: "",
+    accumulated: "",
+    planEmitted: false,
+  };
+}
+
+function lastIndexOfPartialTagPrefix(input: string, tag: string): number {
+  for (let k = Math.min(input.length, tag.length - 1); k > 0; k -= 1) {
+    if (input.endsWith(tag.slice(0, k))) {
+      return input.length - k;
+    }
+  }
+  return -1;
+}
+
+function feedPlanTagParser(
+  state: PlanTagParserState,
+  chunk: string,
+): { passthrough: string; planMarkdownComplete?: string } {
+  let passthrough = "";
+  let input = state.buffer + chunk;
+  state.buffer = "";
+  let justCompleted = false;
+
+  while (input.length > 0) {
+    if (state.phase === "before-open") {
+      const openIdx = input.indexOf(PLAN_MODE_OPEN_TAG);
+      if (openIdx !== -1) {
+        passthrough += input.slice(0, openIdx);
+        input = input.slice(openIdx + PLAN_MODE_OPEN_TAG.length);
+        state.phase = "inside";
+        continue;
+      }
+      const partialStart = lastIndexOfPartialTagPrefix(input, PLAN_MODE_OPEN_TAG);
+      if (partialStart !== -1) {
+        passthrough += input.slice(0, partialStart);
+        state.buffer = input.slice(partialStart);
+      } else {
+        passthrough += input;
+      }
+      input = "";
+      continue;
+    }
+
+    if (state.phase === "inside") {
+      const closeIdx = input.indexOf(PLAN_MODE_CLOSE_TAG);
+      if (closeIdx !== -1) {
+        state.accumulated += input.slice(0, closeIdx);
+        input = input.slice(closeIdx + PLAN_MODE_CLOSE_TAG.length);
+        state.phase = "after-close";
+        justCompleted = true;
+        continue;
+      }
+      const partialStart = lastIndexOfPartialTagPrefix(input, PLAN_MODE_CLOSE_TAG);
+      if (partialStart !== -1) {
+        state.accumulated += input.slice(0, partialStart);
+        state.buffer = input.slice(partialStart);
+      } else {
+        state.accumulated += input;
+      }
+      input = "";
+      continue;
+    }
+
+    passthrough += input;
+    input = "";
+  }
+
+  if (justCompleted && !state.planEmitted) {
+    const planMarkdown = state.accumulated.trim();
+    if (planMarkdown.length > 0) {
+      state.planEmitted = true;
+      return { passthrough, planMarkdownComplete: planMarkdown };
+    }
+  }
+
+  return { passthrough };
+}
+
+function flushPlanTagParser(state: PlanTagParserState): string | undefined {
+  if (state.planEmitted) {
+    return undefined;
+  }
+  if (state.phase !== "inside") {
+    return undefined;
+  }
+  const planMarkdown = (state.accumulated + state.buffer).trim();
+  state.buffer = "";
+  if (planMarkdown.length === 0) {
+    return undefined;
+  }
+  state.planEmitted = true;
+  return planMarkdown;
+}
 
 type AntigravityToolKind = "tool_use" | "server_tool_use" | "mcp_tool_use";
 type AntigravityToolResultKind = "tool_result" | "mcp_tool_result";
@@ -224,6 +341,7 @@ interface AntigravityTurnState {
       }
     | undefined;
   replayState: AntigravityReplayState | undefined;
+  planParser: PlanTagParserState | undefined;
 }
 
 interface AntigravityResumeCursor {
@@ -242,6 +360,7 @@ interface AntigravitySessionContext {
   requestFiber: Fiber.Fiber<void, never> | undefined;
   requestAbortController: AbortController | undefined;
   containerId: string | undefined;
+  interactionMode: ProviderInteractionMode;
   stopped: boolean;
 }
 
@@ -1033,6 +1152,12 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
       return;
     }
 
+    if (!block.emittedTextDelta && block.fallbackText.length === 0) {
+      block.completionEmitted = true;
+      context.turnState.assistantTextBlocks.delete(block.blockIndex);
+      return;
+    }
+
     if (!block.emittedTextDelta && block.fallbackText.length > 0) {
       const deltaStamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({
@@ -1118,6 +1243,30 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
       payload: {
         message,
         ...(detail !== undefined ? { detail } : {}),
+      },
+      providerRefs: {},
+    });
+  });
+
+  const emitProposedPlanCompleted = Effect.fn("emitProposedPlanCompleted")(function* (
+    context: AntigravitySessionContext,
+    planMarkdown: string,
+  ) {
+    const turnState = context.turnState;
+    const trimmed = planMarkdown.trim();
+    if (!turnState || trimmed.length === 0) {
+      return;
+    }
+    const stamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "turn.proposed.completed",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: context.session.threadId,
+      turnId: turnState.turnId,
+      payload: {
+        planMarkdown: trimmed,
       },
       providerRefs: {},
     });
@@ -1290,7 +1439,18 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
     context: AntigravitySessionContext,
   ) {
     const turnState = context.turnState;
-    if (!turnState || turnState.responseBlocks.size === 0) {
+    if (!turnState) {
+      return;
+    }
+
+    if (turnState.planParser) {
+      const leftover = flushPlanTagParser(turnState.planParser);
+      if (leftover) {
+        yield* emitProposedPlanCompleted(context, leftover);
+      }
+    }
+
+    if (turnState.responseBlocks.size === 0) {
       return;
     }
 
@@ -1625,6 +1785,19 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
     }
     const data = isRecord(event.data) ? event.data : {};
     console.log("event", event);
+
+    // Once the proposed plan has been captured in plan mode, swallow any
+    // further content_block_start / content_block_delta events so the model's
+    // post-plan ruminations (extra thinking, trailing assistant text, tool
+    // calls) don't leak into the timeline below the plan. content_block_stop
+    // is still allowed through so any block already opened before the plan
+    // (e.g. the assistant text block that held the tag) finalizes cleanly.
+    if (turnState.planParser?.planEmitted) {
+      if (event.event === "content_block_start" || event.event === "content_block_delta") {
+        return;
+      }
+    }
+
     switch (event.event) {
       case "message_start": {
         const message = isRecord(data.message) ? data.message : undefined;
@@ -1801,38 +1974,51 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
         }
         if (delta.type === "text_delta") {
           const block = turnState.responseBlocks.get(index);
-          const text = typeof delta.text === "string" ? delta.text : "";
-          if (block?.kind === "text") {
-            block.text += text;
+          const rawText = typeof delta.text === "string" ? delta.text : "";
+
+          let visibleText = rawText;
+          let planCompletion: string | undefined;
+          if (turnState.planParser && rawText.length > 0) {
+            const parsed = feedPlanTagParser(turnState.planParser, rawText);
+            visibleText = parsed.passthrough;
+            planCompletion = parsed.planMarkdownComplete;
+          }
+
+          if (block?.kind === "text" && visibleText.length > 0) {
+            block.text += visibleText;
           }
           const assistantBlock = yield* ensureAssistantTextBlock(context, index);
-          if (assistantBlock) {
+          if (assistantBlock && visibleText.length > 0) {
             assistantBlock.emittedTextDelta = true;
-            assistantBlock.fallbackText += text;
+            assistantBlock.fallbackText += visibleText;
           }
-          if (text.length === 0) {
-            return;
+
+          if (visibleText.length > 0) {
+            const stamp = yield* makeEventStamp();
+            yield* offerRuntimeEvent({
+              type: "content.delta",
+              eventId: stamp.eventId,
+              provider: PROVIDER,
+              createdAt: stamp.createdAt,
+              threadId: context.session.threadId,
+              turnId: turnState.turnId,
+              ...(assistantBlock ? { itemId: asRuntimeItemId(assistantBlock.itemId) } : {}),
+              payload: {
+                streamKind: "assistant_text",
+                delta: visibleText,
+              },
+              providerRefs: {},
+              raw: {
+                source: "antigravity.anthropic.stream",
+                method: "antigravity/content_block_delta/text_delta",
+                payload: event.data,
+              },
+            });
           }
-          const stamp = yield* makeEventStamp();
-          yield* offerRuntimeEvent({
-            type: "content.delta",
-            eventId: stamp.eventId,
-            provider: PROVIDER,
-            createdAt: stamp.createdAt,
-            threadId: context.session.threadId,
-            turnId: turnState.turnId,
-            ...(assistantBlock ? { itemId: asRuntimeItemId(assistantBlock.itemId) } : {}),
-            payload: {
-              streamKind: "assistant_text",
-              delta: text,
-            },
-            providerRefs: {},
-            raw: {
-              source: "antigravity.anthropic.stream",
-              method: "antigravity/content_block_delta/text_delta",
-              payload: event.data,
-            },
-          });
+
+          if (planCompletion) {
+            yield* emitProposedPlanCompleted(context, planCompletion);
+          }
           return;
         }
 
@@ -2125,6 +2311,7 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
       max_tokens: ANTIGRAVITY_DEFAULT_MAX_TOKENS,
       messages: useContainer ? requestMessages : context.messages,
       ...(useContainer && context.containerId ? { container: context.containerId } : {}),
+      ...(context.interactionMode === "plan" ? { system: PLAN_MODE_SYSTEM_PROMPT } : {}),
     };
 
     const controller = new AbortController();
@@ -2297,6 +2484,7 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
         requestFiber: undefined,
         requestAbortController: undefined,
         containerId: resumeCursor?.containerId,
+        interactionMode: "default",
         stopped: false,
       };
       sessions.set(input.threadId, context);
@@ -2345,6 +2533,8 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
       });
     }
 
+    context.interactionMode = input.interactionMode ?? "default";
+
     const modelSelection =
       input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
     const model = resolveModelSlugForProvider(
@@ -2371,6 +2561,7 @@ const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
       stopReason: null,
       usage: undefined,
       replayState: undefined,
+      planParser: context.interactionMode === "plan" ? createPlanTagParserState() : undefined,
     };
     context.session = {
       ...context.session,

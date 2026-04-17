@@ -167,7 +167,9 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
   },
 );
 
-const makePendingAntigravityProvider = (antigravitySettings: AntigravitySettings): ServerProvider => {
+const makePendingAntigravityProvider = (
+  antigravitySettings: AntigravitySettings,
+): ServerProvider => {
   const checkedAt = new Date().toISOString();
   const models = providerModelsFromSettings(
     ANTIGRAVITY_BUILT_IN_MODELS,

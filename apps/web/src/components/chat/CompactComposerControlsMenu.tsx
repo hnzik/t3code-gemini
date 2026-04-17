@@ -52,12 +52,8 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
             props.onToggleInteractionMode();
           }}
         >
-          <MenuRadioItem value="default">
-            Chat
-          </MenuRadioItem>
-          <MenuRadioItem value="plan">
-            Plan
-          </MenuRadioItem>
+          <MenuRadioItem value="default">Chat</MenuRadioItem>
+          <MenuRadioItem value="plan">Plan</MenuRadioItem>
         </MenuRadioGroup>
         <MenuDivider />
         <div className="px-2 py-1.5 font-medium text-muted-foreground text-xs">Access</div>
@@ -68,12 +64,8 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
             props.onRuntimeModeChange(value as RuntimeMode);
           }}
         >
-          <MenuRadioItem value="approval-required">
-            Supervised
-          </MenuRadioItem>
-          <MenuRadioItem value="full-access">
-            Full access
-          </MenuRadioItem>
+          <MenuRadioItem value="approval-required">Supervised</MenuRadioItem>
+          <MenuRadioItem value="full-access">Full access</MenuRadioItem>
         </MenuRadioGroup>
         {props.activePlan ? (
           <>
