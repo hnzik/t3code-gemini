@@ -14,7 +14,7 @@ import {
   createGeminiCoreAuthHeaders,
   mergeGeminiCliCustomHeaders,
   resolveGeminiApprovalMode,
-} from "./GeminiCoreConfig";
+} from "./GeminiCoreConfig.ts";
 
 const originalGetGlobalGeminiDir = Storage.getGlobalGeminiDir;
 const originalGetUserPoliciesDir = Storage.getUserPoliciesDir;

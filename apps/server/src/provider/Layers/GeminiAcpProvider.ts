@@ -11,10 +11,10 @@ import type {
 import { ServerSettingsError } from "@t3tools/contracts";
 import { Effect, Equal, Layer, Option, Result, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { makeManagedServerProvider } from "../makeManagedServerProvider";
-import { GeminiAcpProvider } from "../Services/GeminiAcpProvider";
-import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState";
-import { ServerSettingsService } from "../../serverSettings";
+import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
+import { GeminiAcpProvider } from "../Services/GeminiAcpProvider.ts";
+import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   buildServerProvider,
   DEFAULT_TIMEOUT_MS,
@@ -23,8 +23,8 @@ import {
   parseGenericCliVersion,
   providerModelsFromSettings,
   spawnAndCollect,
-} from "../providerSnapshot";
-import { resolveGeminiAuthType } from "./GeminiCoreConfig";
+} from "../providerSnapshot.ts";
+import { resolveGeminiAuthType } from "./GeminiCoreConfig.ts";
 
 const PROVIDER = "geminiAcp" as const;
 const GEMINI_GOOGLE_AUTH_MESSAGE =

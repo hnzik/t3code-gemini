@@ -7,6 +7,8 @@ export const PROVIDER_CACHE_IDS = [
   "claudeAgent",
   "antigravity",
   "geminiAcp",
+  "opencode",
+  "cursor",
 ] as const satisfies ReadonlyArray<ServerProvider["provider"]>;
 
 const decodeProviderStatusCache = Schema.decodeUnknownEffect(
@@ -16,6 +18,14 @@ const decodeProviderStatusCache = Schema.decodeUnknownEffect(
 const providerOrderRank = (provider: ServerProvider["provider"]): number => {
   const rank = PROVIDER_CACHE_IDS.indexOf(provider);
   return rank === -1 ? Number.MAX_SAFE_INTEGER : rank;
+};
+
+const mergeProviderModels = (
+  fallbackModels: ReadonlyArray<ServerProvider["models"][number]>,
+  cachedModels: ReadonlyArray<ServerProvider["models"][number]>,
+): ReadonlyArray<ServerProvider["models"][number]> => {
+  const fallbackSlugs = new Set(fallbackModels.map((model) => model.slug));
+  return [...fallbackModels, ...cachedModels.filter((model) => !fallbackSlugs.has(model.slug))];
 };
 
 export const orderProviderSnapshots = (
@@ -39,6 +49,7 @@ export const hydrateCachedProvider = (input: {
   const { message: _fallbackMessage, ...fallbackWithoutMessage } = input.fallbackProvider;
   const hydratedProvider: ServerProvider = {
     ...fallbackWithoutMessage,
+    models: mergeProviderModels(input.fallbackProvider.models, input.cachedProvider.models),
     installed: input.cachedProvider.installed,
     version: input.cachedProvider.version,
     status: input.cachedProvider.status,

@@ -3,9 +3,11 @@ import {
   AntigravityModelOptions,
   ClaudeModelOptions,
   CodexModelOptions,
+  CursorModelOptions,
   GeminiModelOptions,
-} from "./model";
-import { RepositoryIdentity } from "./environment";
+  OpenCodeModelOptions,
+} from "./model.ts";
+import { RepositoryIdentity } from "./environment.ts";
 import {
   ApprovalRequestId,
   CheckpointRef,
@@ -19,7 +21,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
-} from "./baseSchemas";
+} from "./baseSchemas.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -30,7 +32,14 @@ export const ORCHESTRATION_WS_METHODS = {
   subscribeThread: "orchestration.subscribeThread",
 } as const;
 
-export const ProviderKind = Schema.Literals(["codex", "claudeAgent", "antigravity", "geminiAcp"]);
+export const ProviderKind = Schema.Literals([
+  "codex",
+  "claudeAgent",
+  "antigravity",
+  "geminiAcp",
+  "cursor",
+  "opencode",
+]);
 export type ProviderKind = typeof ProviderKind.Type;
 export const ProviderApprovalPolicy = Schema.Literals([
   "untrusted",
@@ -76,11 +85,27 @@ export const AntigravityModelSelection = Schema.Struct({
 });
 export type AntigravityModelSelection = typeof AntigravityModelSelection.Type;
 
+export const CursorModelSelection = Schema.Struct({
+  provider: Schema.Literal("cursor"),
+  model: TrimmedNonEmptyString,
+  options: Schema.optionalKey(CursorModelOptions),
+});
+export type CursorModelSelection = typeof CursorModelSelection.Type;
+
+export const OpenCodeModelSelection = Schema.Struct({
+  provider: Schema.Literal("opencode"),
+  model: TrimmedNonEmptyString,
+  options: Schema.optionalKey(OpenCodeModelOptions),
+});
+export type OpenCodeModelSelection = typeof OpenCodeModelSelection.Type;
+
 export const ModelSelection = Schema.Union([
   CodexModelSelection,
   ClaudeModelSelection,
   AntigravityModelSelection,
   GeminiModelSelection,
+  CursorModelSelection,
+  OpenCodeModelSelection,
 ]);
 export type ModelSelection = typeof ModelSelection.Type;
 
@@ -446,6 +471,7 @@ const ProjectDeleteCommand = Schema.Struct({
   type: Schema.Literal("project.delete"),
   commandId: CommandId,
   projectId: ProjectId,
+  force: Schema.optional(Schema.Boolean),
 });
 
 const ThreadCreateCommand = Schema.Struct({

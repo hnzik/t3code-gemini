@@ -1,9 +1,9 @@
 import * as Schema from "effect/Schema";
 
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas";
+import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
-export const CustomSkillSlug = TrimmedNonEmptyString.pipe(
-  Schema.check(Schema.isPattern(/^[a-z0-9][a-z0-9-]*$/)),
+export const CustomSkillSlug = TrimmedNonEmptyString.check(
+  Schema.isPattern(/^[a-z0-9][a-z0-9-]*$/),
 );
 export type CustomSkillSlug = typeof CustomSkillSlug.Type;
 

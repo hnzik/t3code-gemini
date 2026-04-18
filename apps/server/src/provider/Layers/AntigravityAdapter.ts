@@ -44,7 +44,7 @@ import {
   ProviderAdapterValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import { ANTIGRAVITY_DEFAULT_BASE_URL, ANTIGRAVITY_DEFAULT_MAX_TOKENS } from "../antigravity";
+import { ANTIGRAVITY_DEFAULT_BASE_URL, ANTIGRAVITY_DEFAULT_MAX_TOKENS } from "../antigravity.ts";
 import {
   AntigravityAdapter,
   type AntigravityAdapterShape,

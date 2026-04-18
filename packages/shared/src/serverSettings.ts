@@ -1,7 +1,16 @@
-import { ServerSettings, type ServerSettingsPatch } from "@t3tools/contracts";
+import {
+  ServerSettings,
+  type AntigravityModelOptions,
+  type ClaudeModelOptions,
+  type CodexModelOptions,
+  type CursorModelOptions,
+  type GeminiModelOptions,
+  type OpenCodeModelOptions,
+  type ServerSettingsPatch,
+} from "@t3tools/contracts";
 import { Schema } from "effect";
-import { deepMerge } from "./Struct";
-import { fromLenientJson } from "./schemaJson";
+import { deepMerge } from "./Struct.ts";
+import { fromLenientJson } from "./schemaJson.ts";
 
 const ServerSettingsJson = fromLenientJson(ServerSettings);
 
@@ -46,6 +55,9 @@ function shouldReplaceTextGenerationModelSelection(
   return Boolean(patch && (patch.provider !== undefined || patch.model !== undefined));
 }
 
+const withModelSelectionOptions = <Options>(options: Options | undefined) =>
+  options ? { options } : {};
+
 /**
  * Applies a server settings patch while treating textGenerationModelSelection as
  * replace-on-provider/model updates. This prevents stale nested options from
@@ -61,12 +73,60 @@ export function applyServerSettingsPatch(
     return next;
   }
 
+  const provider = selectionPatch.provider ?? current.textGenerationModelSelection.provider;
+  const model = selectionPatch.model ?? current.textGenerationModelSelection.model;
+
   return {
     ...next,
-    textGenerationModelSelection: {
-      provider: selectionPatch.provider ?? current.textGenerationModelSelection.provider,
-      model: selectionPatch.model ?? current.textGenerationModelSelection.model,
-      ...(selectionPatch.options ? { options: selectionPatch.options } : {}),
-    } as ServerSettings["textGenerationModelSelection"],
+    textGenerationModelSelection: buildTextGenerationSelection(
+      provider,
+      model,
+      selectionPatch.options,
+    ),
   };
+}
+
+function buildTextGenerationSelection(
+  provider: ServerSettings["textGenerationModelSelection"]["provider"],
+  model: string,
+  options: unknown,
+): ServerSettings["textGenerationModelSelection"] {
+  switch (provider) {
+    case "codex":
+      return {
+        provider,
+        model,
+        ...withModelSelectionOptions(options as CodexModelOptions | undefined),
+      };
+    case "claudeAgent":
+      return {
+        provider,
+        model,
+        ...withModelSelectionOptions(options as ClaudeModelOptions | undefined),
+      };
+    case "antigravity":
+      return {
+        provider,
+        model,
+        ...withModelSelectionOptions(options as AntigravityModelOptions | undefined),
+      };
+    case "geminiAcp":
+      return {
+        provider,
+        model,
+        ...withModelSelectionOptions(options as GeminiModelOptions | undefined),
+      };
+    case "cursor":
+      return {
+        provider,
+        model,
+        ...withModelSelectionOptions(options as CursorModelOptions | undefined),
+      };
+    case "opencode":
+      return {
+        provider,
+        model,
+        ...withModelSelectionOptions(options as OpenCodeModelOptions | undefined),
+      };
+  }
 }

@@ -33,7 +33,7 @@ import {
   summarizeGeminiToolResultDisplay,
   titleForGeminiToolType,
   type GeminiToolInFlight,
-} from "./GeminiRuntimeHelpers";
+} from "./GeminiRuntimeHelpers.ts";
 
 interface ToolBridgeCallbacks {
   readonly emitEvent: (event: ProviderRuntimeEvent) => void;
@@ -148,15 +148,22 @@ export class GeminiToolSchedulerBridge {
   private readonly toolStates = new Map<string, ToolBridgeState>();
   private readonly unsubscribers: Array<() => void> = [];
 
-  constructor(
-    private readonly input: {
-      readonly config: Config;
-      readonly geminiClient: GeminiClient;
-      readonly getPreferredEditor: () => EditorType | undefined;
-      readonly context: AgentLoopContext;
-      readonly callbacks: ToolBridgeCallbacks;
-    },
-  ) {
+  private readonly input: {
+    readonly config: Config;
+    readonly geminiClient: GeminiClient;
+    readonly getPreferredEditor: () => EditorType | undefined;
+    readonly context: AgentLoopContext;
+    readonly callbacks: ToolBridgeCallbacks;
+  };
+
+  constructor(input: {
+    readonly config: Config;
+    readonly geminiClient: GeminiClient;
+    readonly getPreferredEditor: () => EditorType | undefined;
+    readonly context: AgentLoopContext;
+    readonly callbacks: ToolBridgeCallbacks;
+  }) {
+    this.input = input;
     this.messageBus = input.context.messageBus;
     this.scheduler = new Scheduler({
       context: input.context,

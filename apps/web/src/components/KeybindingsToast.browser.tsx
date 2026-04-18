@@ -107,6 +107,14 @@ function createBaseServerConfig(): ServerConfig {
         claudeAgent: { enabled: true, binaryPath: "", customModels: [], launchArgs: "" },
         antigravity: { enabled: false, baseUrl: "", customModels: [] },
         geminiAcp: { enabled: false, binaryPath: "", customModels: [] },
+        cursor: { enabled: true, binaryPath: "", apiEndpoint: "", customModels: [] },
+        opencode: {
+          enabled: true,
+          binaryPath: "",
+          serverUrl: "",
+          serverPassword: "",
+          customModels: [],
+        },
       },
     },
   };

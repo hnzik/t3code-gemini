@@ -10,7 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { Cause, Context, Effect, Exit, FileSystem, Layer, Path, PubSub, Ref, Stream } from "effect";
 
-import { ServerConfig } from "./config";
+import { ServerConfig } from "./config.ts";
 
 const SKILLS_DIR_NAME = "custom-skills";
 const DISABLED_SKILLS_DIR_NAME = "custom-skills.disabled";

@@ -16,7 +16,7 @@ import {
   formatGeminiThoughtSummary,
   type GeminiUsageCounts,
   type GeminiTurnState,
-} from "./GeminiRuntimeHelpers";
+} from "./GeminiRuntimeHelpers.ts";
 
 export interface GeminiStreamTerminalTurnResult {
   readonly state: "completed" | "failed" | "interrupted" | "cancelled";

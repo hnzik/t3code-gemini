@@ -17,32 +17,32 @@ import {
   resolveGeminiAuthType,
   createGeminiCoreConfig,
   DEFAULT_GEMINI_MODEL,
-} from "./GeminiCoreConfig";
+} from "./GeminiCoreConfig.ts";
 import {
   buildGeminiManualAuthRequiredMessage,
   resolveGeminiAuthProbeResult,
-} from "./GeminiAcpProvider";
+} from "./GeminiAcpProvider.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
   type ProviderAdapterError,
-} from "../Errors";
-import { GeminiAcpAdapter, type GeminiAcpAdapterShape } from "../Services/GeminiAcpAdapter";
-import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState";
+} from "../Errors.ts";
+import { GeminiAcpAdapter, type GeminiAcpAdapterShape } from "../Services/GeminiAcpAdapter.ts";
+import { GeminiAuthRuntimeState } from "../Services/GeminiAuthRuntimeState.ts";
 import {
   ProviderSessionDirectory,
   type ProviderRuntimeBinding,
-} from "../Services/ProviderSessionDirectory";
-import { ServerSettingsService } from "../../serverSettings";
-import { makeEventNdjsonLogger, type EventNdjsonLogger } from "./EventNdjsonLogger";
-import { GeminiRuntimeSession } from "./GeminiRuntimeSession";
+} from "../Services/ProviderSessionDirectory.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
+import { makeEventNdjsonLogger, type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { GeminiRuntimeSession } from "./GeminiRuntimeSession.ts";
 import {
   GEMINI_PROVIDER,
   buildGeminiPersistedBinding,
   readGeminiResumeState,
-} from "./GeminiRuntimeHelpers";
+} from "./GeminiRuntimeHelpers.ts";
 
 export {
   applyGeminiAssistantTextChunk,
@@ -60,7 +60,7 @@ export {
   normalizeGeminiAskUserQuestions,
   readGeminiPlanMarkdownFromFile,
   readGeminiResumeState,
-} from "./GeminiRuntimeHelpers";
+} from "./GeminiRuntimeHelpers.ts";
 
 export interface GeminiAcpAdapterLiveOptions {
   readonly createConfig?: (input: {
@@ -480,7 +480,7 @@ const makeGeminiAcpAdapter = Effect.fn("makeGeminiAcpAdapter")(function* (
   return {
     provider: GEMINI_PROVIDER,
     capabilities: {
-      sessionModelSwitch: "restart-session",
+      sessionModelSwitch: "unsupported",
     },
     startSession,
     sendTurn,

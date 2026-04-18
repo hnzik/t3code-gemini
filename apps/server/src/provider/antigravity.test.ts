@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { providerModelsFromSettings } from "./providerSnapshot";
+import { providerModelsFromSettings } from "./providerSnapshot.ts";
 import {
   ANTIGRAVITY_BUILT_IN_MODELS,
   ANTIGRAVITY_GEMINI_MODEL_CAPABILITIES,
   ANTIGRAVITY_MODEL_CAPABILITIES,
   getAntigravityModelCapabilities,
-} from "./antigravity";
+} from "./antigravity.ts";
 
 describe("Antigravity model capabilities", () => {
   it("maps built-in Gemini models to a default 1M context window", () => {

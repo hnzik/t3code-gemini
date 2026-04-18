@@ -53,7 +53,7 @@ import {
   makeGeminiAcpAdapterLive,
 } from "./GeminiAcpAdapter.ts";
 import { GeminiAuthRuntimeStateLive } from "./GeminiAuthRuntimeState.ts";
-import { resolveGeminiAuthType } from "./GeminiCoreConfig";
+import { resolveGeminiAuthType } from "./GeminiCoreConfig.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import { GeminiToolSchedulerBridge } from "./GeminiToolSchedulerBridge.ts";
 

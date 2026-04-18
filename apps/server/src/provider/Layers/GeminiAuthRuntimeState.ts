@@ -1,6 +1,9 @@
 import { Effect, Layer, PubSub, Ref, Stream } from "effect";
 
-import { GeminiAuthRuntimeState, type GeminiAuthFailure } from "../Services/GeminiAuthRuntimeState";
+import {
+  GeminiAuthRuntimeState,
+  type GeminiAuthFailure,
+} from "../Services/GeminiAuthRuntimeState.ts";
 
 export const GeminiAuthRuntimeStateLive = Layer.effect(
   GeminiAuthRuntimeState,

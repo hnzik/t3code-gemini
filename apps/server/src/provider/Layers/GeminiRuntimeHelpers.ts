@@ -19,7 +19,7 @@ import {
   type ThoughtSummary,
   tokenLimit,
 } from "@google/gemini-cli-core";
-import type { ProviderRuntimeBinding } from "../Services/ProviderSessionDirectory";
+import type { ProviderRuntimeBinding } from "../Services/ProviderSessionDirectory.ts";
 
 export const GEMINI_PROVIDER = "geminiAcp" as const;
 export const DEFAULT_GEMINI_CONTEXT_WINDOW = 1_000_000;

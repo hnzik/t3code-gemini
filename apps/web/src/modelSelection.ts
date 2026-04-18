@@ -4,7 +4,11 @@ import {
   type ProviderKind,
   type ServerProvider,
 } from "@t3tools/contracts";
-import { normalizeModelSlug, resolveSelectableModel } from "@t3tools/shared/model";
+import {
+  createModelSelection,
+  normalizeModelSlug,
+  resolveSelectableModel,
+} from "@t3tools/shared/model";
 import { getComposerProviderState } from "./components/chat/composerProviderRegistry";
 import { UnifiedSettings } from "@t3tools/contracts/settings";
 import {
@@ -58,6 +62,20 @@ const PROVIDER_CUSTOM_MODEL_CONFIG: Record<ProviderKind, ProviderCustomModelConf
     description: "Save additional Gemini model slugs for the picker and `/model` command.",
     placeholder: "your-gemini-model-slug",
     example: "gemini-2.5-flash",
+  },
+  cursor: {
+    provider: "cursor",
+    title: "Cursor",
+    description: "Save additional Cursor model slugs for the picker and `/model` command.",
+    placeholder: "your-cursor-model-slug",
+    example: "claude-sonnet-4-6",
+  },
+  opencode: {
+    provider: "opencode",
+    title: "OpenCode",
+    description: "Save additional OpenCode model slugs in `provider/model` format.",
+    placeholder: "openai/gpt-5",
+    example: "anthropic/claude-sonnet-4-5-20250929",
   },
 };
 
@@ -191,6 +209,18 @@ export function getCustomModelOptionsByProvider(
       "geminiAcp",
       selectedProvider === "geminiAcp" ? selectedModel : undefined,
     ),
+    cursor: getAppModelOptions(
+      settings,
+      providers,
+      "cursor",
+      selectedProvider === "cursor" ? selectedModel : undefined,
+    ),
+    opencode: getAppModelOptions(
+      settings,
+      providers,
+      "opencode",
+      selectedProvider === "opencode" ? selectedModel : undefined,
+    ),
   };
 }
 
@@ -218,9 +248,5 @@ export function resolveAppModelSelectionState(
     },
   });
 
-  return {
-    provider,
-    model,
-    ...(modelOptionsForDispatch ? { options: modelOptionsForDispatch } : {}),
-  } as ModelSelection;
+  return createModelSelection(provider, model, modelOptionsForDispatch);
 }

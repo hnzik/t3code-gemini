@@ -1,6 +1,6 @@
-import type { ProviderAdapterShape } from "./ProviderAdapter";
+import type { ProviderAdapterShape } from "./ProviderAdapter.ts";
 import { Context } from "effect";
-import type { ProviderAdapterError } from "../Errors";
+import type { ProviderAdapterError } from "../Errors.ts";
 
 export interface GeminiAcpAdapterShape extends ProviderAdapterShape<ProviderAdapterError> {}
 

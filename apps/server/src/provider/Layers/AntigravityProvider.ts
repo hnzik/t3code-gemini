@@ -2,27 +2,26 @@ import type { AntigravitySettings, ServerProvider } from "@t3tools/contracts";
 import { ServerSettingsError } from "@t3tools/contracts";
 import { Effect, Equal, Layer, Stream } from "effect";
 
-import { ServerSettingsService } from "../../serverSettings";
-import { buildServerProvider, providerModelsFromSettings } from "../providerSnapshot";
-import { makeManagedServerProvider } from "../makeManagedServerProvider";
+import { ServerSettingsService } from "../../serverSettings.ts";
+import { buildServerProvider, providerModelsFromSettings } from "../providerSnapshot.ts";
+import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   ANTIGRAVITY_BUILT_IN_MODELS,
   ANTIGRAVITY_DEFAULT_BASE_URL,
   getAntigravityModelCapabilities,
-} from "../antigravity";
-import { AntigravityProvider } from "../Services/AntigravityProvider";
+} from "../antigravity.ts";
+import { AntigravityProvider } from "../Services/AntigravityProvider.ts";
 
 const PROVIDER = "antigravity" as const;
 const HEALTHCHECK_TIMEOUT_MS = 4_000;
 
 class AntigravityHealthcheckError extends Error {
   readonly _tag = "AntigravityHealthcheckError";
+  override readonly cause: unknown;
 
-  constructor(
-    message: string,
-    override readonly cause: unknown,
-  ) {
+  constructor(message: string, cause: unknown) {
     super(message);
+    this.cause = cause;
   }
 }
 

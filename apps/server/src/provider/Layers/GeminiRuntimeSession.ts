@@ -35,13 +35,13 @@ import {
   type ToolConfirmationRequest,
 } from "@google/gemini-cli-core";
 import { Cause, Data, Effect, Exit, type Fiber } from "effect";
-import { resolveGeminiApprovalMode } from "./GeminiCoreConfig";
+import { resolveGeminiApprovalMode } from "./GeminiCoreConfig.ts";
 import {
   GeminiStreamProcessorError,
   processGeminiStreamEvents,
   type GeminiStreamTerminalTurnResult,
-} from "./GeminiStreamProcessor";
-import { GeminiToolSchedulerBridge } from "./GeminiToolSchedulerBridge";
+} from "./GeminiStreamProcessor.ts";
+import { GeminiToolSchedulerBridge } from "./GeminiToolSchedulerBridge.ts";
 import {
   GEMINI_PROVIDER,
   applyGeminiAssistantTextChunk,
@@ -62,7 +62,7 @@ import {
   type GeminiTrackedTurn,
   type GeminiTurnState,
   type GeminiUsageCounts,
-} from "./GeminiRuntimeHelpers";
+} from "./GeminiRuntimeHelpers.ts";
 
 interface GeminiRuntimeSessionInput {
   readonly session: ProviderSession;
@@ -162,7 +162,10 @@ export class GeminiRuntimeSession {
   private totalProcessedTokens = 0;
   stopped = false;
 
-  constructor(private readonly input: GeminiRuntimeSessionInput) {
+  private readonly input: GeminiRuntimeSessionInput;
+
+  constructor(input: GeminiRuntimeSessionInput) {
+    this.input = input;
     this.emitEvent = input.emitEvent;
     this.messageBus = patchGeminiMessageBusForScheduler(input.config.getMessageBus());
     this.turns = Array.from({ length: input.resumeState?.turnCount ?? 0 }, (_, index) => {

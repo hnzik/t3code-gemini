@@ -11,21 +11,24 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
   TurnId,
-} from "./baseSchemas";
-import { ProviderKind } from "./orchestration";
+} from "./baseSchemas.ts";
+import { ProviderKind } from "./orchestration.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
 
-const RuntimeEventRawSource = Schema.Literals([
-  "codex.app-server.notification",
-  "codex.app-server.request",
-  "codex.eventmsg",
-  "claude.sdk.message",
-  "claude.sdk.permission",
-  "antigravity.anthropic.stream",
-  "codex.sdk.thread-event",
-  "gemini.acp.session-update",
+const RuntimeEventRawSource = Schema.Union([
+  Schema.Literal("codex.app-server.notification"),
+  Schema.Literal("codex.app-server.request"),
+  Schema.Literal("codex.eventmsg"),
+  Schema.Literal("claude.sdk.message"),
+  Schema.Literal("claude.sdk.permission"),
+  Schema.Literal("antigravity.anthropic.stream"),
+  Schema.Literal("codex.sdk.thread-event"),
+  Schema.Literal("gemini.acp.session-update"),
+  Schema.Literal("opencode.sdk.event"),
+  Schema.Literal("acp.jsonrpc"),
+  Schema.TemplateLiteral(["acp.", Schema.String, ".extension"]),
 ]);
 export type RuntimeEventRawSource = typeof RuntimeEventRawSource.Type;
 
