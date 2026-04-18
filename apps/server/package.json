@@ -28,7 +28,7 @@
     "@effect/platform-node": "catalog:",
     "@effect/platform-node-shared": "catalog:",
     "@effect/sql-sqlite-bun": "catalog:",
-    "@google/gemini-cli-core": "^0.37.1",
+    "@google/gemini-cli-core": "^0.38.2",
     "@google/genai": "1.30.0",
     "@pierre/diffs": "^1.1.13",
     "effect": "catalog:",
