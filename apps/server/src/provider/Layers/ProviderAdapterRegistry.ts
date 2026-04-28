@@ -21,6 +21,7 @@ import { CodexAdapter } from "../Services/CodexAdapter.ts";
 import { CursorAdapter } from "../Services/CursorAdapter.ts";
 import { GeminiAcpAdapter } from "../Services/GeminiAcpAdapter.ts";
 import { OpenCodeAdapter } from "../Services/OpenCodeAdapter.ts";
+import { createBuiltInAdapterList } from "../builtInProviderCatalog.ts";
 
 export interface ProviderAdapterRegistryLiveOptions {
   readonly adapters?: ReadonlyArray<ProviderAdapterShape<ProviderAdapterError>>;
@@ -33,14 +34,14 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
   const adapters =
     options?.adapters !== undefined
       ? options.adapters
-      : [
-          yield* CodexAdapter,
-          yield* ClaudeAdapter,
-          yield* AntigravityAdapter,
-          yield* GeminiAcpAdapter,
-          yield* OpenCodeAdapter,
-          ...(cursorAdapterOption._tag === "Some" ? [cursorAdapterOption.value] : []),
-        ];
+      : createBuiltInAdapterList({
+          codex: yield* CodexAdapter,
+          claudeAgent: yield* ClaudeAdapter,
+          antigravity: yield* AntigravityAdapter,
+          geminiAcp: yield* GeminiAcpAdapter,
+          opencode: yield* OpenCodeAdapter,
+          ...(cursorAdapterOption._tag === "Some" ? { cursor: cursorAdapterOption.value } : {}),
+        });
   const byProvider = new Map(adapters.map((adapter) => [adapter.provider, adapter]));
 
   const getByProvider: ProviderAdapterRegistryShape["getByProvider"] = (provider) => {

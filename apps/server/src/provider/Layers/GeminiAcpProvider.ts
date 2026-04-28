@@ -9,6 +9,7 @@ import type {
   ServerProviderState,
 } from "@t3tools/contracts";
 import { ServerSettingsError } from "@t3tools/contracts";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import { Effect, Equal, Layer, Option, Result, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
@@ -27,18 +28,18 @@ import {
 import { resolveGeminiAuthType } from "./GeminiCoreConfig.ts";
 
 const PROVIDER = "geminiAcp" as const;
+const GEMINI_ACP_PRESENTATION = {
+  displayName: "Gemini",
+  showInteractionModeToggle: true,
+} as const;
 const GEMINI_GOOGLE_AUTH_MESSAGE =
   "Gemini Google OAuth could not be verified from stored CLI state during background refresh. T3 Code will retry authentication when a chat session starts.";
 const GEMINI_ADC_AUTH_MESSAGE =
   "Gemini Google ADC could not be verified during background refresh. T3 Code will retry authentication when a chat session starts.";
 
-const GEMINI_MODEL_CAPABILITIES = {
-  reasoningEffortLevels: [],
-  supportsFastMode: false,
-  supportsThinkingToggle: false,
-  contextWindowOptions: [],
-  promptInjectedEffortLevels: [],
-} as const;
+const GEMINI_MODEL_CAPABILITIES = createModelCapabilities({
+  optionDescriptors: [],
+});
 
 const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
@@ -260,6 +261,7 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
     if (!geminiSettings.enabled) {
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: GEMINI_ACP_PRESENTATION,
         enabled: false,
         checkedAt,
         models,
@@ -282,6 +284,7 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
       const error = versionProbe.failure;
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: GEMINI_ACP_PRESENTATION,
         enabled: geminiSettings.enabled,
         checkedAt,
         models,
@@ -300,6 +303,7 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
     if (Option.isNone(versionProbe.success)) {
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: GEMINI_ACP_PRESENTATION,
         enabled: geminiSettings.enabled,
         checkedAt,
         models,
@@ -320,6 +324,7 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
       const detail = detailFromResult(version);
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: GEMINI_ACP_PRESENTATION,
         enabled: geminiSettings.enabled,
         checkedAt,
         models,
@@ -358,6 +363,7 @@ export const checkGeminiAcpProviderStatus = Effect.fn("checkGeminiAcpProviderSta
 
     return buildServerProvider({
       provider: PROVIDER,
+      presentation: GEMINI_ACP_PRESENTATION,
       enabled: geminiSettings.enabled,
       checkedAt,
       models,
@@ -384,6 +390,7 @@ const makePendingGeminiAcpProvider = (geminiSettings: GeminiSettings): ServerPro
   if (!geminiSettings.enabled) {
     return buildServerProvider({
       provider: PROVIDER,
+      presentation: GEMINI_ACP_PRESENTATION,
       enabled: false,
       checkedAt,
       models,
@@ -399,6 +406,7 @@ const makePendingGeminiAcpProvider = (geminiSettings: GeminiSettings): ServerPro
 
   return buildServerProvider({
     provider: PROVIDER,
+    presentation: GEMINI_ACP_PRESENTATION,
     enabled: true,
     checkedAt,
     models,

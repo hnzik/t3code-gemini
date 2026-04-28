@@ -25,6 +25,7 @@ const workspaceFiles = [
   "packages/contracts/package.json",
   "packages/shared/package.json",
   "packages/effect-acp/package.json",
+  "packages/effect-codex-app-server/package.json",
   "scripts/package.json",
 ] as const;
 
@@ -220,7 +221,7 @@ try {
   );
   assertContains(
     nightlyReleaseMetadata,
-    "tag=nightly-v9.9.10-nightly.20260413.321",
+    "tag=v9.9.10-nightly.20260413.321",
     "Expected nightly metadata to contain the derived nightly tag.",
   );
   assertContains(
@@ -291,7 +292,7 @@ try {
           fi
 
           found_windows_manifest=true
-          node ${JSON.stringify(resolve(repoRoot, "scripts/merge-update-manifests.ts"))} --platform win \
+          ${JSON.stringify(process.execPath)} ${JSON.stringify(resolve(repoRoot, "scripts/merge-update-manifests.ts"))} --platform win \
             "$arm64_manifest" \
             "$x64_manifest" \
             "$output_manifest"

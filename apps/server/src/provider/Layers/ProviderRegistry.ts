@@ -20,6 +20,7 @@ import { CursorProvider } from "../Services/CursorProvider.ts";
 import { GeminiAcpProvider } from "../Services/GeminiAcpProvider.ts";
 import { OpenCodeProvider } from "../Services/OpenCodeProvider.ts";
 import { ProviderRegistry, type ProviderRegistryShape } from "../Services/ProviderRegistry.ts";
+import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
 import {
   hydrateCachedProvider,
   PROVIDER_CACHE_IDS,
@@ -28,13 +29,8 @@ import {
   resolveProviderStatusCachePath,
   writeProviderStatusCache,
 } from "../providerStatusCache.ts";
-
-type ProviderSnapshotSource = {
-  readonly provider: ProviderKind;
-  readonly getSnapshot: Effect.Effect<ServerProvider>;
-  readonly refresh: Effect.Effect<ServerProvider>;
-  readonly streamChanges: Stream.Stream<ServerProvider>;
-};
+import { createBuiltInProviderSources } from "../builtInProviderCatalog.ts";
+import type { ProviderSnapshotSource } from "../builtInProviderCatalog.ts";
 
 const loadProviders = (
   providerSources: ReadonlyArray<ProviderSnapshotSource>,
@@ -44,11 +40,7 @@ const loadProviders = (
   });
 
 const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean =>
-  (model.capabilities?.reasoningEffortLevels.length ?? 0) > 0 ||
-  model.capabilities?.supportsFastMode === true ||
-  model.capabilities?.supportsThinkingToggle === true ||
-  (model.capabilities?.contextWindowOptions.length ?? 0) > 0 ||
-  (model.capabilities?.promptInjectedEffortLevels.length ?? 0) > 0;
+  (model.capabilities?.optionDescriptors?.length ?? 0) > 0;
 
 const mergeProviderModels = (
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
@@ -102,44 +94,14 @@ const ProviderRegistryLiveBase = Layer.effect(
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
 
-    const providerSources = [
-      {
-        provider: "codex",
-        getSnapshot: codexProvider.getSnapshot,
-        refresh: codexProvider.refresh,
-        streamChanges: codexProvider.streamChanges,
-      },
-      {
-        provider: "claudeAgent",
-        getSnapshot: claudeProvider.getSnapshot,
-        refresh: claudeProvider.refresh,
-        streamChanges: claudeProvider.streamChanges,
-      },
-      {
-        provider: "antigravity",
-        getSnapshot: antigravityProvider.getSnapshot,
-        refresh: antigravityProvider.refresh,
-        streamChanges: antigravityProvider.streamChanges,
-      },
-      {
-        provider: "geminiAcp",
-        getSnapshot: geminiAcpProvider.getSnapshot,
-        refresh: geminiAcpProvider.refresh,
-        streamChanges: geminiAcpProvider.streamChanges,
-      },
-      {
-        provider: "opencode",
-        getSnapshot: openCodeProvider.getSnapshot,
-        refresh: openCodeProvider.refresh,
-        streamChanges: openCodeProvider.streamChanges,
-      },
-      {
-        provider: "cursor",
-        getSnapshot: cursorProvider.getSnapshot,
-        refresh: cursorProvider.refresh,
-        streamChanges: cursorProvider.streamChanges,
-      },
-    ] satisfies ReadonlyArray<ProviderSnapshotSource>;
+    const providerSources = createBuiltInProviderSources({
+      codex: codexProvider,
+      claudeAgent: claudeProvider,
+      antigravity: antigravityProvider,
+      geminiAcp: geminiAcpProvider,
+      opencode: openCodeProvider,
+      cursor: cursorProvider,
+    }) satisfies ReadonlyArray<ProviderSnapshotSource>;
     const activeProviders = PROVIDER_CACHE_IDS;
     const changesPubSub = yield* Effect.acquireRelease(
       PubSub.unbounded<ReadonlyArray<ServerProvider>>(),
@@ -306,6 +268,7 @@ export const ProviderRegistryLive = Layer.unwrap(
       Layer.provideMerge(AntigravityProviderLive),
       Layer.provideMerge(GeminiAcpProviderLive),
       Layer.provideMerge(OpenCodeProviderLive),
+      Layer.provideMerge(OpenCodeRuntimeLive),
     ),
   ),
 );

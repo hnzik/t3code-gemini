@@ -1,20 +1,24 @@
 import type { ModelCapabilities, ServerProviderModel } from "@t3tools/contracts";
+import { createModelCapabilities } from "@t3tools/shared/model";
 
 export const ANTIGRAVITY_DEFAULT_BASE_URL = "http://127.0.0.1:3117";
 export const ANTIGRAVITY_DEFAULT_MAX_TOKENS = 8_192;
 
-export const ANTIGRAVITY_MODEL_CAPABILITIES: ModelCapabilities = {
-  reasoningEffortLevels: [],
-  supportsFastMode: false,
-  supportsThinkingToggle: false,
-  contextWindowOptions: [],
-  promptInjectedEffortLevels: [],
-};
+export const ANTIGRAVITY_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+  optionDescriptors: [],
+});
 
-export const ANTIGRAVITY_GEMINI_MODEL_CAPABILITIES: ModelCapabilities = {
-  ...ANTIGRAVITY_MODEL_CAPABILITIES,
-  contextWindowOptions: [{ value: "1m", label: "1M", isDefault: true }],
-};
+export const ANTIGRAVITY_GEMINI_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+  optionDescriptors: [
+    {
+      id: "contextWindow",
+      label: "Context Window",
+      type: "select",
+      options: [{ id: "1m", label: "1M", isDefault: true }],
+      currentValue: "1m",
+    },
+  ],
+});
 
 const ANTIGRAVITY_MODEL_SLUGS = [
   "chat_20706",

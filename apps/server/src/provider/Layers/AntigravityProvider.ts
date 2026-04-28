@@ -13,6 +13,10 @@ import {
 import { AntigravityProvider } from "../Services/AntigravityProvider.ts";
 
 const PROVIDER = "antigravity" as const;
+const ANTIGRAVITY_PRESENTATION = {
+  displayName: "Antigravity",
+  showInteractionModeToggle: true,
+} as const;
 const HEALTHCHECK_TIMEOUT_MS = 4_000;
 
 class AntigravityHealthcheckError extends Error {
@@ -61,6 +65,7 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
     if (!antigravitySettings.enabled) {
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: ANTIGRAVITY_PRESENTATION,
         enabled: false,
         checkedAt,
         models,
@@ -79,6 +84,7 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
     if (!healthUrl) {
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: ANTIGRAVITY_PRESENTATION,
         enabled: true,
         checkedAt,
         models,
@@ -116,6 +122,7 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
       const message = toMessage(healthcheck.failure, "Failed to reach Antigravity proxy.");
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: ANTIGRAVITY_PRESENTATION,
         enabled: true,
         checkedAt,
         models,
@@ -133,6 +140,7 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
     if (!response.ok) {
       return buildServerProvider({
         provider: PROVIDER,
+        presentation: ANTIGRAVITY_PRESENTATION,
         enabled: true,
         checkedAt,
         models,
@@ -148,6 +156,7 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
 
     return buildServerProvider({
       provider: PROVIDER,
+      presentation: ANTIGRAVITY_PRESENTATION,
       enabled: true,
       checkedAt,
       models,
@@ -180,6 +189,7 @@ const makePendingAntigravityProvider = (
   if (!antigravitySettings.enabled) {
     return buildServerProvider({
       provider: PROVIDER,
+      presentation: ANTIGRAVITY_PRESENTATION,
       enabled: false,
       checkedAt,
       models,
@@ -195,6 +205,7 @@ const makePendingAntigravityProvider = (
 
   return buildServerProvider({
     provider: PROVIDER,
+    presentation: ANTIGRAVITY_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
